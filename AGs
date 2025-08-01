@@ -1,0 +1,60 @@
+import pandas as pd
+import os
+
+# --- File paths ---
+BASE_DIR = "/mnt/c/Users/kmor6669/OneDrive - Sysco Corporation/Desktop/Project/FY2026 plan/ML Project"
+INPUT_FILE = "CTX AGs.csv"  # Change to your actual filename
+OUTPUT_FILE = f"customer_ag_breadth_{os.path.splitext(INPUT_FILE)[0]}.csv"
+
+# Load data
+df = pd.read_csv(os.path.join(BASE_DIR, INPUT_FILE), dtype=str)
+
+# Ensure proper types
+df["Fiscal Week ID"] = pd.to_numeric(df["Fiscal Week ID"], errors="coerce")
+df["Attribute Group ID"] = df["Attribute Group ID"].astype(str)
+df = df.dropna(subset=["Company Customer Number", "Fiscal Week ID", "Attribute Group ID"])
+
+# Distinct AGs per week per customer
+weekly_ag = (
+    df.groupby(["Company Customer Number", "Fiscal Week ID"])["Attribute Group ID"]
+    .nunique()
+    .reset_index(name="Distinct_AGs_This_Week")
+)
+
+# Avg AGs per week
+avg_ag_per_week = (
+    weekly_ag.groupby("Company Customer Number")["Distinct_AGs_This_Week"]
+    .mean()
+    .reset_index(name="Avg_Distinct_AGs_Per_Week")
+)
+
+# Total AGs across time
+total_ag = (
+    df.groupby("Company Customer Number")["Attribute Group ID"]
+    .nunique()
+    .reset_index(name="Total_Distinct_AGs_All_Weeks")
+)
+
+# Distinct weeks purchased (based on Fiscal Week ID)
+weeks_purchased = (
+    df.groupby("Company Customer Number")["Fiscal Week ID"]
+    .nunique()
+    .reset_index(name="Weeks_Purchased_Out_of_33")
+)
+
+
+
+# Merge all metrics
+final_df = avg_ag_per_week.merge(total_ag, on="Company Customer Number")
+final_df = final_df.merge(weeks_purchased, on="Company Customer Number")
+
+final_df["Avg_Distinct_AGs_Per_Week"] = final_df["Avg_Distinct_AGs_Per_Week"].round(2)
+
+# Optional sort
+final_df = final_df.sort_values(by="Avg_Distinct_AGs_Per_Week", ascending=False)
+
+# Export
+final_df.to_csv(os.path.join(BASE_DIR, OUTPUT_FILE), index=False)
+print(final_df.describe())
+print(f"✅ Final AG Breadth file saved: {OUTPUT_FILE}")
+
