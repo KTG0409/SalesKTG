@@ -1,0 +1,114 @@
+import pandas as pd
+import numpy as np
+import os
+from datetime import datetime
+
+# --- CONFIGURATION: SET THESE VALUES --- #
+FILENAME = "550.csv"
+SOURCE_FOLDER = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Project\FY2026 plan\Stats Tests"
+OUTPUT_FILENAME = "NPD_Company_Zone_Performance.csv"
+
+# Define weights for your Optimal_Score. Sum should be 1.0.
+WEIGHTS = {
+    'Volume': 0.4,
+    'Profit': 0.2, 
+    'Customers': 0.2,
+    'Efficiency': 0.2
+}
+
+# Columns needed for the analysis
+WANTED_COLS = [
+    "Company Customer Number", "NPD Cuisine Type", "Company Name",
+    "Price Zone ID", "Pounds CY", "Computer Margin Ext $ CY", 
+    "Stops CY", "Delta Pounds YoY"
+]
+# -------------------------------------------------------- #
+
+def load_and_prepare_data(source_file, wanted_cols):
+    """Loads, filters, and prepares the dataset."""
+    print("📂 Loading data...")
+    try:
+        df = pd.read_csv(source_file, usecols=wanted_cols)
+        df.columns = df.columns.str.strip()
+        print(f"✅ Data loaded successfully. Rows: {len(df):,}")
+    except Exception as e:
+        print(f"❌ Error loading data: {e}")
+        return None
+
+    # No need to coerce data types here, as the cleaning script already did it.
+    
+    # Drop rows with missing values in key columns
+    df.dropna(subset=wanted_cols, inplace=True)
+
+    # Derive Zone Suffix from Price Zone ID if not already present
+    if 'Price Zone ID' in df.columns:
+        df['Zone Suffix'] = df['Price Zone ID'].astype(str).str.split("-", n=1, expand=True)[1]
+    
+    print(f"✅ Data prepared. Rows: {len(df):,}")
+    return df
+
+def analyze_performance(df, weights):
+    """Aggregates metrics and finds the best Zone Suffix for each combo."""
+    print("📈 Analyzing performance by Combo Key and Zone Suffix...")
+    
+    # Create the high-level Combo Key
+    df['Combo Key'] = df['NPD Cuisine Type'].astype(str) + '|' + df['Company Name'].astype(str)
+
+    # Group by the Combo Key and Zone Suffix to get metrics for each combination
+    analysis_df = df.groupby(['Combo Key', 'Zone Suffix']).agg(
+        Total_Volume=('Pounds CY', 'sum'),
+        Total_Profit=('Computer Margin Ext $ CY', 'sum'),
+        Distinct_Customers=('Company Customer Number', 'nunique'),
+        Total_Stops=('Stops CY', 'sum'),
+        Total_Delta_Pounds_YoY=('Delta Pounds YoY', 'sum') # <-- Added this line
+    ).reset_index()
+
+    # Calculate Volume Per Stop
+    analysis_df['Volume_Per_Stop'] = analysis_df['Total_Volume'] / analysis_df['Total_Stops']
+    analysis_df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    analysis_df.fillna(0, inplace=True)
+
+    # Normalize metrics to calculate the Optimal_Score
+    df_norm = analysis_df.copy()
+    for col in ['Total_Volume', 'Total_Profit', 'Distinct_Customers', 'Volume_Per_Stop']:
+        max_val = df_norm[col].max()
+        min_val = df_norm[col].min()
+        if max_val == min_val:
+            df_norm[col] = 0
+        else:
+            df_norm[col] = (df_norm[col] - min_val) / (max_val - min_val)
+    
+    # Create the Optimal_Score for each row
+    df_norm['Optimal_Score'] = (
+        weights['Volume'] * df_norm['Total_Volume'] +
+        weights['Profit'] * df_norm['Total_Profit'] +
+        weights['Customers'] * df_norm['Distinct_Customers'] +
+        weights['Efficiency'] * df_norm['Volume_Per_Stop']
+    )
+
+    # Find the best Zone Suffix for each Combo Key
+    best_zones = df_norm.loc[df_norm.groupby('Combo Key')['Optimal_Score'].idxmax()]
+    
+    # --- ADDED: Merge the raw metrics back in for the final report ---
+    raw_metrics_to_add = analysis_df[['Combo Key', 'Zone Suffix', 'Total_Volume', 'Total_Profit', 'Distinct_Customers', 'Total_Delta_Pounds_YoY']]
+    best_zones = best_zones.merge(raw_metrics_to_add, on=['Combo Key', 'Zone Suffix'], how='left')
+    
+    print("✅ Analysis complete.")
+    return best_zones
+
+def main():
+    source_file = os.path.join(SOURCE_FOLDER, FILENAME)
+    output_file_path = os.path.join(SOURCE_FOLDER, OUTPUT_FILENAME)
+
+    df = load_and_prepare_data(source_file, WANTED_COLS)
+    if df is None:
+        return
+
+    report = analyze_performance(df, WEIGHTS)
+    
+    report.to_csv(output_file_path, index=False)
+    print(f"\n📁 Report with best Zone Suffixes saved to: {output_file_path}")
+    print("🎯 Analysis complete.")
+
+if __name__ == "__main__":
+    main()
