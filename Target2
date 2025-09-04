@@ -1,0 +1,231 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy.stats import chi2_contingency, entropy
+from colorama import Fore, init; init(autoreset=True)
+
+# ---------------------- USER CONFIG ---------------------- #
+FILENAME = "L16wks.csv"
+SOURCE_FOLDER = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Project\FY2026 plan\Stats Tests"
+# 🔁 Optional: Set a Business Center name to filter to
+FILTER_BUSINESS_CENTER_NAME = "SEAFOOD" # Example: "DAIRY"
+TOP_N_TO_ANALYZE = 10 # 🔁 Number of top negative performers to analyze (only used if FILTER_BUSINESS_CENTER_NAME is None)
+MIN_ROWS_PER_KEY = 20 # 🔁 Rare-key collapse threshold for chi-square stability
+CHUNKSIZE = 500_000   # 🔁 Adjust if memory allows
+LOG_TO_FILE = True
+
+# Columns needed for both triage and validation
+WANTED_COLS = [
+    "Business Center Name", "Item Group Name", "Attribute Group Name",
+    "Price Zone ID", "Delta Pounds YoY", "Pounds CY", "Price Source Type",
+    "Zone Suffix", "NPD Cuisine Type"
+]
+# -------------------------------------------------------- #
+
+# ---------- Logging (safe tee to console + file) -------- #
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+base_name = os.path.splitext(FILENAME)[0]
+log_path = os.path.join(SOURCE_FOLDER, f"{base_name}_unified_analysis_{timestamp}.txt")
+
+class Tee:
+    def __init__(self, *targets): self.targets = targets
+    def write(self, s):
+        for t in self.targets:
+            try: t.write(s)
+            except Exception: pass
+    def flush(self, *args, **kwargs):
+        for t in self.targets:
+            try: t.flush()
+            except Exception: pass
+
+def start_logging():
+    if not LOG_TO_FILE:
+        return sys.stdout, None
+    lf = open(log_path, "w", encoding="utf-8")
+    orig = sys.stdout
+    sys.stdout = Tee(orig, lf)
+    return orig, lf
+
+def stop_logging(orig_stdout, log_file):
+    if LOG_TO_FILE and log_file:
+        try: log_file.flush(); log_file.close()
+        except Exception: pass
+    sys.stdout = orig_stdout
+
+# ---------------- Utility / Stats helpers ---------------- #
+def safe_chi2(ct, min_expected=5):
+    """Run chi-square, flag if any expected cell < min_expected."""
+    try:
+        chi2, p, dof, expected = chi2_contingency(ct)
+        if (expected < min_expected).any():
+            return None, None, None
+        return chi2, p, dof
+    except ValueError:
+        return None, None, None
+
+def cramers_v_from_ct(ct):
+    try:
+        chi2, _, _, _ = chi2_contingency(ct)
+        n = ct.values.sum()
+        r, k = ct.shape
+        denom = min(k - 1, r - 1)
+        return np.sqrt((chi2 / n) / denom) if denom > 0 and n > 0 else 0.0
+    except ValueError:
+        return 0.0
+
+def collapse_rare_keys(df, key_col, min_rows):
+    vc = df[key_col].value_counts()
+    keep = set(vc[vc >= min_rows].index)
+    out = df.copy()
+    out[key_col] = out[key_col].astype('category')
+    if "OTHER" not in out[key_col].cat.categories:
+        out[key_col] = out[key_col].cat.add_categories("OTHER")
+    out.loc[~out[key_col].isin(keep), key_col] = "OTHER"
+    return out
+
+# -------------------- Read + Prepare --------------------- #
+def read_csv_smart(path, chunksize, wanted_cols):
+    print(f"📂 Loading {os.path.basename(path)}...")
+    header = pd.read_csv(path, nrows=0)
+    cols = [c.strip() for c in header.columns]
+    usecols = [c for c in wanted_cols if c in cols]
+    if not usecols:
+        print("⚠️ None of WANTED_COLS matched; reading all columns.")
+        usecols = None
+    else:
+        print(f"✅ Using columns: {usecols}")
+    
+    chunks = []
+    for ch in pd.read_csv(path, chunksize=chunksize, dtype=str, usecols=usecols, low_memory=False):
+        ch.columns = ch.columns.str.strip()
+        chunks.append(ch)
+    df = pd.concat(chunks, ignore_index=True)
+    print(f"✅ Loaded {len(df):,} rows.")
+    return df
+
+def derive_zone_fields(df):
+    if "Price Zone ID" in df.columns:
+        pz = df["Price Zone ID"].astype(str).str.split("-", n=1, expand=True)
+        if pz.shape[1] > 1:
+            df["Zone Suffix"] = pz[1]
+    return df
+
+def coerce_targets(df):
+    for col in ["Pounds CY", "Delta Pounds YoY"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# -------------------- Triage Function -------------------- #
+def run_triage(df):
+    print("\n🔹 Running Triage Analysis...")
+    df_triage = df.copy()
+    
+    triage_cols = ["Business Center Name", "Item Group Name", "Attribute Group Name"]
+    if not all(col in df_triage.columns for col in triage_cols):
+        print("🚫 Missing columns for Triage Analysis. Skipping.")
+        return None, None
+        
+    df_triage["Triage_Key"] = df_triage[triage_cols].astype(str).agg("|".join, axis=1)
+    
+    triage_summary = df_triage.groupby("Triage_Key").agg(
+        Total_Delta_Pounds_YoY=('Delta Pounds YoY', 'sum'),
+        Total_Pounds_CY=('Pounds CY', 'sum')
+    ).reset_index()
+    
+    # Sort by the largest drop in pounds
+    top_losers = triage_summary.sort_values(by='Total_Delta_Pounds_YoY', ascending=True).head(TOP_N_TO_ANALYZE)
+    
+    print("📈 Top performers to analyze based on a drop in Delta Pounds YoY:")
+    print(top_losers.to_string())
+    
+    top_loser_keys = top_losers["Triage_Key"].tolist()
+    
+    return df_triage, top_loser_keys
+
+# ----------------- Validation Function ------------------- #
+def run_validation(df, triage_key):
+    print(f"\n✅ Running statistical validation for Triage Key: {triage_key}")
+    df_subset = df[df["Triage_Key"] == triage_key].copy()
+    
+    combo_parts = ["Price Zone ID", "NPD Cuisine Type", "Attribute Group Name", "Zone Suffix"]
+    if not all(col in df_subset.columns for col in combo_parts):
+        print("🚫 Missing columns for validation. Skipping.")
+        return
+        
+    df_subset["YoY_Change"] = (df_subset["Delta Pounds YoY"] > 0).astype(int)
+    
+    df_subset["Validation_Combo_Key"] = df_subset["Price Zone ID"].astype(str) + "|" + \
+                                      df_subset["NPD Cuisine Type"].astype(str) + "|" + \
+                                      df_subset["Attribute Group Name"].astype(str)
+
+    df_subset = collapse_rare_keys(df_subset, "Validation_Combo_Key", MIN_ROWS_PER_KEY)
+    
+    ct = pd.crosstab(df_subset["Validation_Combo_Key"], df_subset["YoY_Change"])
+    if ct.shape[0] <= 1 or ct.shape[1] != 2:
+        print("🚫 Not enough variation to test. Skipping validation.")
+        return
+        
+    chi2, p, dof = safe_chi2(ct)
+    v = cramers_v_from_ct(ct)
+    
+    print(f"\n📈 Statistical Results for this group:")
+    print(f"• Chi-squared = {chi2:.2f}")
+    print(f"• p-value     = {p:.6f}")
+    print(f"• Cramér’s V  = {v:.4f}")
+    print("✅ Statistically significant." if p < 0.05 else "⛔ Likely random/noise.")
+    
+    if p < 0.05 and v >= 0.15:
+        print(Fore.GREEN + "✅ GO: Significant and meaningfully structured signal.")
+    else:
+        print(Fore.RED + "⛔ NO-GO: Not statistically significant.")
+
+# ------------------------ Main --------------------------- #
+def main():
+    path = os.path.join(SOURCE_FOLDER, FILENAME)
+    df = read_csv_smart(path, CHUNKSIZE, WANTED_COLS)
+    df = coerce_targets(df)
+    df = derive_zone_fields(df)
+    
+    # Step 1: Filter data by a single Business Center if specified
+    if FILTER_BUSINESS_CENTER_NAME:
+        print(f"\n⚙️ Filtering to Business Center: {FILTER_BUSINESS_CENTER_NAME}")
+        df_filtered = df[df["Business Center Name"] == FILTER_BUSINESS_CENTER_NAME].copy()
+        if len(df_filtered) == 0:
+            print(f"🚫 No data found for '{FILTER_BUSINESS_CENTER_NAME}'. Exiting.")
+            return
+
+        # Perform analysis on all combos within the filtered business center
+        df_with_triage_key = df_filtered.copy()
+        triage_cols = ["Item Group Name", "Attribute Group Name"]
+        df_with_triage_key["Triage_Key"] = df_with_triage_key[triage_cols].astype(str).agg("|".join, axis=1)
+        
+        all_combos = df_with_triage_key["Triage_Key"].unique().tolist()
+        
+        print(f"--- Starting Detailed Validation for All Combos in '{FILTER_BUSINESS_CENTER_NAME}' ---")
+        for key in all_combos:
+            run_validation(df_with_triage_key, key)
+            
+    else:
+        # Step 2: Run the normal triage and validation for the top N losers
+        df_with_triage_key, top_loser_keys = run_triage(df)
+        
+        if df_with_triage_key is None or not top_loser_keys:
+            print("No groups found for validation. Exiting.")
+            return
+
+        print("\n--- Starting Detailed Validation for Top Performers ---")
+        for key in top_loser_keys:
+            run_validation(df_with_triage_key, key)
+    
+    print("\n🎯 All analyses complete.")
+
+# --------------- Entrypoint with logging ---------------- #
+if __name__ == "__main__":
+    orig, lf = start_logging()
+    try:
+        main()
+    finally:
+        stop_logging(orig, lf)
