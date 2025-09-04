@@ -1,0 +1,259 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy.stats import chi2_contingency, entropy
+from colorama import Fore, init; init(autoreset=True)
+
+# ---------------------- USER CONFIG ---------------------- #
+FILENAME = "L16wks.csv"
+SOURCE_FOLDER = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Project\FY2026 plan\Stats Tests"
+# 🔁 Optional: Set a Business Center name to filter to
+FILTER_BUSINESS_CENTER_NAME = "" # Example: "DAIRY"
+TOP_N_TO_ANALYZE = 25 # 🔁 Number of top negative performers to analyze
+MIN_ROWS_PER_KEY = 20 # 🔁 Rare-key collapse threshold for chi-square stability
+CHUNKSIZE = 500_000   # 🔁 Adjust if memory allows
+LOG_TO_FILE = True
+# 🔁 Output file for the top performers
+TOP_PERFORMERS_OUTPUT = "top_25_triage_report_with_validation.csv"
+# 🔁 Set to True to run a separate CPA analysis
+FILTER_CPA_ONLY = True
+
+# Columns needed for both triage and validation
+WANTED_COLS = [
+    "Business Center Name", "Item Group Name", "Attribute Group Name",
+    "Price Zone ID", "Delta Pounds YoY", "Pounds CY", "Price Source Type",
+    "Zone Suffix", "NPD Cuisine Type"
+]
+# -------------------------------------------------------- #
+
+# ---------- Logging (safe tee to console + file) -------- #
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+base_name = os.path.splitext(FILENAME)[0]
+log_path = os.path.join(SOURCE_FOLDER, f"{base_name}_unified_analysis_{timestamp}.txt")
+
+class Tee:
+    def __init__(self, *targets): self.targets = targets
+    def write(self, s):
+        for t in self.targets:
+            try: t.write(s)
+            except Exception: pass
+    def flush(self, *args, **kwargs):
+        for t in self.targets:
+            try: t.flush()
+            except Exception: pass
+
+def start_logging():
+    if not LOG_TO_FILE:
+        return sys.stdout, None
+    lf = open(log_path, "w", encoding="utf-8")
+    orig = sys.stdout
+    sys.stdout = Tee(orig, lf)
+    return orig, lf
+
+def stop_logging(orig_stdout, log_file):
+    if LOG_TO_FILE and log_file:
+        try: log_file.flush(); log_file.close()
+        except Exception: pass
+    sys.stdout = orig_stdout
+
+# ---------------- Utility / Stats helpers ---------------- #
+def safe_chi2(ct, min_expected=5):
+    """Run chi-square, flag if any expected cell < min_expected."""
+    try:
+        chi2, p, dof, expected = chi2_contingency(ct)
+        if (expected < min_expected).any():
+            return None, None, None
+        return chi2, p, dof
+    except ValueError:
+        return None, None, None
+
+def cramers_v_from_ct(ct):
+    try:
+        chi2, _, _, _ = chi2_contingency(ct)
+        n = ct.values.sum()
+        r, k = ct.shape
+        denom = min(k - 1, r - 1)
+        return np.sqrt((chi2 / n) / denom) if denom > 0 and n > 0 else 0.0
+    except ValueError:
+        return 0.0
+
+def collapse_rare_keys(df, key_col, min_rows):
+    vc = df[key_col].value_counts()
+    keep = set(vc[vc >= min_rows].index)
+    out = df.copy()
+    out[key_col] = out[key_col].astype('category')
+    if "OTHER" not in out[key_col].cat.categories:
+        out[key_col] = out[key_col].cat.add_categories("OTHER")
+    out.loc[~out[key_col].isin(keep), key_col] = "OTHER"
+    return out
+
+# -------------------- Read + Prepare --------------------- #
+def read_csv_smart(path, chunksize, wanted_cols):
+    print(f"📂 Loading {os.path.basename(path)}...")
+    header = pd.read_csv(path, nrows=0)
+    cols = [c.strip() for c in header.columns]
+    usecols = [c for c in wanted_cols if c in cols]
+    if not usecols:
+        print("⚠️ None of WANTED_COLS matched; reading all columns.")
+        usecols = None
+    else:
+        print(f"✅ Using columns: {usecols}")
+    
+    chunks = []
+    for ch in pd.read_csv(path, chunksize=chunksize, dtype=str, usecols=usecols, low_memory=False):
+        ch.columns = ch.columns.str.strip()
+        chunks.append(ch)
+    df = pd.concat(chunks, ignore_index=True)
+    print(f"✅ Loaded {len(df):,} rows.")
+    return df
+
+def derive_zone_fields(df):
+    if "Price Zone ID" in df.columns:
+        pz = df["Price Zone ID"].astype(str).str.split("-", n=1, expand=True)
+        if pz.shape[1] > 1:
+            df["Zone Suffix"] = pz[1]
+    return df
+
+def coerce_targets(df):
+    for col in ["Pounds CY", "Delta Pounds YoY"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# -------------------- Triage Function -------------------- #
+def run_triage(df):
+    print("\n🔹 Running Triage Analysis...")
+    df_triage = df.copy()
+    
+    triage_cols = ["Business Center Name", "Item Group Name", "Attribute Group Name"]
+    if not all(col in df_triage.columns for col in triage_cols):
+        print("🚫 Missing columns for Triage Analysis. Skipping.")
+        return None, None, None
+        
+    df_triage["Triage_Key"] = df_triage[triage_cols].astype(str).agg("|".join, axis=1)
+    
+    triage_summary = df_triage.groupby("Triage_Key").agg(
+        Total_Delta_Pounds_YoY=('Delta Pounds YoY', 'sum'),
+        Total_Pounds_CY=('Pounds CY', 'sum')
+    ).reset_index()
+    
+    top_losers = triage_summary.sort_values(by='Total_Delta_Pounds_YoY', ascending=True).head(TOP_N_TO_ANALYZE)
+    
+    print("📈 Top performers to analyze based on a drop in Delta Pounds YoY:")
+    print(top_losers.to_string())
+
+    top_loser_keys = top_losers["Triage_Key"].tolist()
+    
+    return df_triage, top_losers, top_loser_keys
+
+# ----------------- Validation Function ------------------- #
+def run_validation(df_with_triage_key, triage_results, analysis_type="Overall"):
+    validation_output_path = os.path.join(SOURCE_FOLDER, f"{base_name}_{analysis_type.lower()}_validation.csv")
+    
+    validation_results = []
+
+    for key in triage_results['Triage_Key']:
+        print(f"\n✅ Running statistical validation for Triage Key: {key}")
+        df_subset = df_with_triage_key[df_with_triage_key["Triage_Key"] == key].copy()
+        
+        combo_parts = ["Price Zone ID", "NPD Cuisine Type", "Attribute Group Name", "Zone Suffix"]
+        if not all(col in df_subset.columns for col in combo_parts):
+            print("🚫 Missing columns for validation. Skipping.")
+            continue
+            
+        df_subset["YoY_Change"] = (df_subset["Delta Pounds YoY"] > 0).astype(int)
+        
+        df_subset["Validation_Combo_Key"] = df_subset["Price Zone ID"].astype(str) + "|" + \
+                                          df_subset["NPD Cuisine Type"].astype(str) + "|" + \
+                                          df_subset["Attribute Group Name"].astype(str)
+
+        df_subset = collapse_rare_keys(df_subset, "Validation_Combo_Key", MIN_ROWS_PER_KEY)
+        
+        ct = pd.crosstab(df_subset["Validation_Combo_Key"], df_subset["YoY_Change"])
+        if ct.shape[0] <= 1 or ct.shape[1] != 2:
+            print("🚫 Not enough variation to test. Skipping validation.")
+            continue
+            
+        chi2, p, dof = safe_chi2(ct)
+        v = cramers_v_from_ct(ct)
+        
+        validation_results.append({
+            'Triage_Key': key,
+            'Chi2': chi2,
+            'p-value': p,
+            'Cramers_V': v
+        })
+        
+        print(f"\n📈 Statistical Results for this group:")
+        print(f"• Chi-squared = {chi2:.2f}")
+        print(f"• p-value     = {p:.6f}")
+        print(f"• Cramér’s V  = {v:.4f}")
+        print("✅ Statistically significant." if p < 0.05 else "⛔ Likely random/noise.")
+        
+        if p < 0.05 and v >= 0.15:
+            print(Fore.GREEN + "✅ GO: Significant and meaningfully structured signal.")
+        else:
+            print(Fore.RED + "⛔ NO-GO: Not statistically significant.")
+    
+    validation_df = pd.DataFrame(validation_results)
+    final_report = triage_results.merge(validation_df, on='Triage_Key', how='left')
+    
+    final_report.to_csv(validation_output_path, index=False)
+    print(f"\n✅ Final combined report saved to: {validation_output_path}")
+
+# ------------------------ Main --------------------------- #
+def main():
+    path = os.path.join(SOURCE_FOLDER, FILENAME)
+    df = read_csv_smart(path, CHUNKSIZE, WANTED_COLS)
+    df = coerce_targets(df)
+    df = derive_zone_fields(df)
+    
+    if FILTER_BUSINESS_CENTER_NAME:
+        print(f"\n⚙️ Filtering to Business Center: {FILTER_BUSINESS_CENTER_NAME}")
+        df_filtered = df[df["Business Center Name"] == FILTER_BUSINESS_CENTER_NAME].copy()
+        if len(df_filtered) == 0:
+            print(f"🚫 No data found for '{FILTER_BUSINESS_CENTER_NAME}'. Exiting.")
+            return
+
+        df_with_triage_key = df_filtered.copy()
+        triage_cols = ["Item Group Name", "Attribute Group Name"]
+        df_with_triage_key["Triage_Key"] = df_with_triage_key[triage_cols].astype(str).agg("|".join, axis=1)
+        
+        triage_results = df_with_triage_key.groupby('Triage_Key').agg(
+            Total_Delta_Pounds_YoY=('Delta Pounds YoY', 'sum'),
+            Total_Pounds_CY=('Pounds CY', 'sum')
+        ).reset_index().sort_values(by='Total_Delta_Pounds_YoY', ascending=True)
+
+        run_validation(df_with_triage_key, triage_results)
+            
+    else:
+        df_with_triage_key, triage_results, top_loser_keys = run_triage(df)
+        
+        if df_with_triage_key is None or top_loser_keys is None:
+            print("No groups found for validation. Exiting.")
+            return
+
+        run_validation(df_with_triage_key, triage_results)
+    
+    if FILTER_CPA_ONLY and 'Price Source Type' in df.columns:
+        print("\n" + "-"*40)
+        print("--- Starting Focused CPA Analysis ---")
+        df_cpa = df[df['Price Source Type'] == 'CPA'].copy()
+        if not df_cpa.empty:
+            df_with_cpa_triage_key, cpa_triage_results, cpa_top_loser_keys = run_triage(df_cpa)
+            if df_with_cpa_triage_key is not None:
+                run_validation(df_with_cpa_triage_key, cpa_triage_results, analysis_type="CPA_Only")
+        else:
+            print("\n🚫 No CPA data found. Skipping CPA analysis.")
+    
+    print("\n🎯 All analyses complete.")
+
+# --------------- Entrypoint with logging ---------------- #
+if __name__ == "__main__":
+    orig, lf = start_logging()
+    try:
+        main()
+    finally:
+        stop_logging(orig, lf)
