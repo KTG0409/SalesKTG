@@ -1,0 +1,1467 @@
+#!/usr/bin/env python3
+# category_status_and_leads.py
+# Build: Status (YoY) + Brand split + Sites/Items tables + Weekly combo charts (+12w forecast) + Sales/Vendor leads
+# Usage example:
+#   python category_status_and_leads.py --groundfish groundfish.csv --alignment alignment.csv --outdir out --company "55" --attr-groups 538,550 --vendors 4074,1260 --forecast linear
+
+import argparse, os, sys, math
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import smtplib
+from email.message import EmailMessage
+from pathlib import Path
+
+
+# Triggered by file addition
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from threading import Timer
+
+# CHANGED: add bar charts and combo chart support
+from openpyxl.chart import LineChart, BarChart, Reference  # type: ignore
+from openpyxl.utils.dataframe import dataframe_to_rows  # type: ignore
+from openpyxl.styles import Font  # type: ignore
+from openpyxl.styles import numbers  # type: ignore
+from openpyxl.chart import LineChart, BarChart, Reference
+from openpyxl.worksheet.dimensions import RowDimension
+
+# Load .env configuration for email message
+from dotenv import load_dotenv
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+load_dotenv()  # fallback if the above path isn't found
+
+
+# ---------- Email config ----------
+def _as_bool(val) -> bool:
+    return str(val).strip().lower() in {"1","true","yes","y","on"}
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
+# allow comma or semicolon lists
+MAIL_TO = [x.strip() for x in os.getenv("MAIL_TO", "").replace(",", ";").split(";") if x.strip()]
+MAIL_CC = [x.strip() for x in os.getenv("MAIL_CC", "").replace(",", ";").split(";") if x.strip()]
+MAIL_SUBJECT = os.getenv("MAIL_SUBJECT", "[Auto] Category Report")
+
+# Accept many truthy values; default to enabled if unspecified
+_raw_enabled = os.getenv("EMAIL_ENABLED", "").strip()
+EMAIL_ENABLED = _as_bool(_raw_enabled) if _raw_enabled else True
+FORCE_EMAIL   = _as_bool(os.getenv("FORCE_EMAIL", "0"))  # overrides EMAIL_ENABLED if set
+
+def send_email_with_attachments(subject: str, body: str, attachments: list[str]) -> None:
+    # quick visibility (no secrets)
+    print(f"    [email] enabled={EMAIL_ENABLED} force={FORCE_EMAIL} "
+          f"user={'set' if SMTP_USER else 'missing'} to={len(MAIL_TO)} cc={len(MAIL_CC)}")
+    if not (EMAIL_ENABLED or FORCE_EMAIL):
+        print("    ⛔ Email disabled by EMAIL_ENABLED (set to 1/true/yes or use FORCE_EMAIL=1). Skipping.")
+        return
+    if not (SMTP_USER and SMTP_PASS and MAIL_TO):
+        print("    ⚠ Email not configured (need SMTP_USER, SMTP_PASS, MAIL_TO). Skipping.")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = MAIL_FROM or SMTP_USER
+    msg["To"] = ", ".join(MAIL_TO)
+    if MAIL_CC:
+        msg["Cc"] = ", ".join(MAIL_CC)
+    msg.set_content(body)
+
+    for apath in attachments or []:
+        try:
+            with open(apath, "rb") as f:
+                data = f.read()
+            name = os.path.basename(apath)
+            ext = os.path.splitext(name)[1].lower()
+            maintype, subtype = ("application", "octet-stream")
+            if ext == ".xlsx":
+                maintype, subtype = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            elif ext == ".csv":
+                maintype, subtype = ("text", "csv")
+            elif ext == ".pdf":
+                maintype, subtype = ("application", "pdf")
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+        except Exception as e:
+            print(f"    ⚠ Could not attach {apath}: {e}")
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        print(f"    ✓ Email sent to {len(MAIL_TO)} recipient(s).")
+    except Exception as e:
+        print(f"    ❌ Email send failed: {e}")
+
+# ================= USER CONFIG =================
+# CLI args still override these if provided.
+DEFAULTS = {
+    "source": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\groundfish.csv",
+    "alignment":  r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Alignment.csv",
+    "outdir":     r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\output",
+    "company": None,              # e.g. "55" or "Jackson" (matches Company Number OR Company Name, see filter below)
+    "attr_groups": None,          # e.g. "538,550"
+    "vendors": None,              # e.g. "4074,1260"
+    "forecast_method": "linear",  # or "runrate"
+
+    # NEW: Leads controls
+    "leads_company": "67",        # e.g. '"55","Jackson"' -> ONLY build Sales Leads for these sites (Number or Name)
+    "leads_acct_types": 'TRS,LCC',# Sales Leads only for these Customer Account Types (csv list)
+    "vendor_leads_active": "Y",   # "Y" or "N" — when Y, create vendor-specific leads CSVs (TRS accounts ONLY)
+    "min_ytd_per_week": 20,       # <-- NEW: gentler threshold for leads (vs 50)
+    "vendor_leads_respect_site_filter": "N",  # <-- NEW: vendor leads ignore --leads-company by default
+
+}
+
+# ---------------------------- Email via .env ----------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+
+# Recipients can be comma or semicolon separated in .env
+def _split_recipients(s: str) -> list[str]:
+    return [e.strip() for e in (s or "").replace(",", ";").split(";") if e.strip()]
+
+MAIL_TO = _split_recipients(os.getenv("MAIL_TO", ""))
+MAIL_CC = _split_recipients(os.getenv("MAIL_CC", ""))
+MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
+MAIL_SUBJECT = os.getenv("MAIL_SUBJECT", "[Auto] Category Report")
+EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "1") == "1"
+
+def send_email_with_attachments(subject: str, body: str, attachments: list[str]) -> None:
+    if not EMAIL_ENABLED:
+        print("    ⛔ Email disabled by EMAIL_ENABLED in .env — skipping.")
+        return
+    if not (SMTP_USER and SMTP_PASS and MAIL_TO):
+        print("    ⚠ Email not configured (need SMTP_USER, SMTP_PASS, MAIL_TO). Skipping.")
+        return
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["From"] = MAIL_FROM or SMTP_USER
+        msg["To"] = ", ".join(MAIL_TO)
+        if MAIL_CC:
+            msg["Cc"] = ", ".join(MAIL_CC)
+        msg.set_content(body or "")
+
+        for ap in attachments or []:
+            p = Path(ap)
+            if not p.exists():
+                continue
+            data = p.read_bytes()
+            ext = p.suffix.lower()
+            maintype, subtype = ("application", "octet-stream")
+            if ext == ".pdf":
+                maintype, subtype = ("application", "pdf")
+            elif ext == ".csv":
+                maintype, subtype = ("text", "csv")
+            elif ext == ".xlsx":
+                maintype, subtype = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=p.name)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+
+        print(f"    ✓ Email sent to {len(MAIL_TO)} recipient(s){' + CC' if MAIL_CC else ''}.")
+    except Exception as e:
+        print(f"    ❌ Email sending failed: {e}")
+
+
+# ---------------------------- Helpers ----------------------------
+def _clean_str(x):
+    if pd.isna(x): return ""
+    s = str(x).strip()
+    if s.isdigit():  # normalize number-like IDs, drop leading zeros
+        return s.lstrip("0") or "0"
+    return s
+
+def concat_address(addr1, addr2):
+    a1 = str(addr1).strip() if pd.notna(addr1) else ""
+    a2 = str(addr2).strip() if pd.notna(addr2) else ""
+    return (a1 + " " + a2).strip()
+
+def pct(n, d):
+    if d == 0 or pd.isna(d): return np.nan
+    return n / d
+
+def safe_div(n, d):
+    try:
+        return float(n) / float(d) if float(d) != 0 else np.nan
+    except Exception:
+        return np.nan
+    
+     # Helper that starts watcher
+def start_watcher(watch_dir: str, alignment_path: str, outdir_path: str,
+                  quiet_seconds: int = 8, forecast_method: str = "linear"):
+    os.makedirs(watch_dir, exist_ok=True)
+    os.makedirs(outdir_path, exist_ok=True)
+
+    print("🔍 Starting file watcher service…")
+    print(f"👀 Watching: {watch_dir}")
+    print(f"📤 Output:  {outdir_path}")
+    print(f"📎 File types: {', '.join(sorted(ALLOW_EXT))}")
+    print(f"⏱ Debounce: {quiet_seconds} seconds")
+    print("🟢 Waiting for files (Ctrl+C to stop)…")
+
+    observer = Observer()
+    handler = DebouncedHandler(alignment_path, outdir_path, quiet_seconds, forecast_method)
+    observer.schedule(handler, watch_dir, recursive=False)
+    observer.start()
+    try:
+        while True:
+            import time as _t; _t.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 Stopping watcher…")
+        observer.stop()
+    observer.join()
+    print("✅ Watcher stopped.")
+
+# ---------------------------- Core (your originals, kept) ----------------------------
+def load_and_prepare(source_path, alignment_path, company=None, attr_groups=None, vendors=None):
+    g = pd.read_csv(source_path, dtype=str)
+    a = pd.read_csv(alignment_path, dtype=str)
+
+    def _clean_headers(df):
+        cols = df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
+        df.columns = cols
+        return df
+
+    g = _clean_headers(g).fillna("")
+    a = _clean_headers(a).fillna("")
+
+    # numerics used downstream
+    for col in ["Pounds CY", "Pounds PY", "Fiscal Week Number"]:
+        if col in g.columns:
+            g[col] = pd.to_numeric(g[col], errors="coerce").fillna(0)
+
+    # clean key IDs
+    for col in ["Company Number", "Lot Number", "Item Number", "True Vendor Number"]:
+        if col in g.columns:
+            g[col] = g[col].map(_clean_str)
+
+    # Alignment key in alignment
+    if "Alignment Key" not in a.columns:
+        raise SystemExit("Alignment file must contain 'Alignment Key'.")
+    a["Alignment Key"] = a["Alignment Key"].astype(str).str.strip()
+
+    for col in ["SUPC", "SUVC"]:
+        if col not in a.columns:
+            raise SystemExit(f"Alignment file missing required column '{col}'.")
+        a[col] = a[col].map(_clean_str)
+
+    # source alignment key
+    if "Alignment Key" in g.columns and g["Alignment Key"].astype(str).str.len().gt(0).any():
+        g["Alignment Key"] = g["Alignment Key"].astype(str).str.strip()
+    else:
+        need = [c for c in ["Company Number", "Lot Number"] if c not in g.columns]
+        if need:
+            raise SystemExit(f"Source missing columns to build Alignment Key: {need}")
+        g["Alignment Key"] = g["Company Number"].map(_clean_str) + g["Lot Number"].map(_clean_str)
+
+    # optional site filter (accepts number or name)
+    if company:
+        key = _clean_str(company).lower()
+        if "Company Number" in g.columns:
+            g = g[(g["Company Number"].map(_clean_str).str.lower() == key) | 
+                  (g.get("Company Name","").astype(str).str.strip().str.lower() == key)]
+    if attr_groups and "Attribute Group ID" in g.columns:
+        keep_ag = set(_clean_str(x) for x in attr_groups.split(","))
+        g = g[g["Attribute Group ID"].map(_clean_str).isin(keep_ag)]
+
+    # address concat for leads routing
+    g["Customer Street Address"] = g.apply(
+        lambda r: concat_address(r.get("Customer Address", ""), r.get("Customer Address 2", "")),
+        axis=1
+    )
+
+    align_keep = [c for c in [
+        "Alignment Key", "Lot Number", "Lot Description",
+        "Supplier Name", "SUPC", "SUVC",
+        "Product Category", "Next events", "OPCO Name", "Award Volume Annualized" 
+    ] if c in a.columns]
+    for req in ["Alignment Key", "SUPC", "SUVC", "Supplier Name"]:
+        if req not in align_keep:
+            raise SystemExit(f"Alignment join cannot proceed; missing '{req}'.")
+
+    align = a[align_keep].drop_duplicates("Alignment Key")
+    g = g.merge(align, on="Alignment Key", how="left", suffixes=("", "_ALN"))
+
+    if "SUPC" not in g.columns or g["SUPC"].isna().all():
+        raise SystemExit("No Alignment matches found (all SUPC null). Check keys between files.")
+
+    for req in ["SUPC", "SUVC", "Supplier Name"]:
+        if req not in g.columns:
+            raise SystemExit(f"Post-join missing required column '{req}'.")
+
+    g["IsAlignedItem"] = (g.get("Item Number", "").map(_clean_str) == g["SUPC"].map(_clean_str)).astype(int)
+    g["IsAlignedVendor"] = (g.get("True Vendor Number", "").map(_clean_str) == g["SUVC"].map(_clean_str)).astype(int)
+
+    return g, vendors
+
+def compute_windows(df):
+    # current week
+    current_week = int(pd.to_numeric(df.get("Fiscal Week Number", 0), errors="coerce").fillna(0).max()) if len(df) else 0
+
+    # Ensure the account-type column exists so we can aggregate by it
+    if "Customer Account Type Code" not in df.columns:
+        df["Customer Account Type Code"] = "UNKNOWN"
+
+    # REQUIRED grouping keys (now includes Account Type)
+    key = [
+        "Company Number","Company Name",
+        "Customer Name","Company Customer Number",
+        "Customer Account Type Code",        # <-- NEW: add account type to the key
+        "Lot Number","Lot Description",
+        "Attribute Group ID","Attribute Group Name",
+        "Alignment Key",
+        "SUPC","SUVC","Supplier Name"
+    ]
+    missing = [c for c in key if c not in df.columns]
+    if missing:
+        raise SystemExit(f"compute_windows(): required columns missing: {missing}")
+
+    df = df.copy()
+    for col in ["Pounds CY","Pounds PY"]:
+        if col not in df.columns: df[col] = 0.0
+
+    # Aligned flags & derived lbs
+    both_flag = ((df.get("IsAlignedItem", 0).astype(int)) & (df.get("IsAlignedVendor", 0).astype(int))).astype(int)
+    df["ItemAligned_Lbs"] = df["Pounds CY"] * df.get("IsAlignedItem", 0)
+    df["VendorAligned_Lbs"] = df["Pounds CY"] * df.get("IsAlignedVendor", 0)
+    df["ItemVendorAligned_Lbs"] = df["Pounds CY"] * both_flag
+
+    # YTD aggregates (now per-account-type)
+    ytd = df.groupby(key, dropna=False).agg(
+        Pounds_CY=("Pounds CY","sum"),
+        Pounds_PY=("Pounds PY","sum"),
+        ItemAligned_Lbs=("ItemAligned_Lbs","sum"),
+        VendorAligned_Lbs=("VendorAligned_Lbs","sum"),
+        ItemVendorAligned_Lbs=("ItemVendorAligned_Lbs","sum"),
+    ).reset_index()
+    ytd["Delta_YoY_Lbs"] = ytd["Pounds_CY"] - ytd["Pounds_PY"]
+    ytd["YoY_Pct"] = ytd.apply(lambda r: (r["Delta_YoY_Lbs"] / r["Pounds_PY"]) if r["Pounds_PY"] else np.nan, axis=1)
+
+    # Week-over-week (also per-account-type now)
+    lw = df[df["Fiscal Week Number"] == current_week].groupby(key)["Pounds CY"].sum().rename("W_Lbs").reset_index() if current_week else pd.DataFrame(columns=key+["W_Lbs"])
+    pw = df[df["Fiscal Week Number"] == current_week - 1].groupby(key)["Pounds CY"].sum().rename("Wm1_Lbs").reset_index() if current_week else pd.DataFrame(columns=key+["Wm1_Lbs"])
+    wow = lw.merge(pw, on=key, how="outer") if len(lw) or len(pw) else pd.DataFrame(columns=key+["W_Lbs","Wm1_Lbs"])
+    if "W_Lbs" not in wow.columns: wow["W_Lbs"] = 0.0
+    if "Wm1_Lbs" not in wow.columns: wow["Wm1_Lbs"] = 0.0
+    wow["WoW_Delta_Lbs"] = wow["W_Lbs"] - wow["Wm1_Lbs"]
+    wow["WoW_Pct"] = wow.apply(lambda r: (r["WoW_Delta_Lbs"] / r["Wm1_Lbs"]) if r["Wm1_Lbs"] else np.nan, axis=1)
+
+    # 4w vs prior 4w (also per-account-type)
+    last4 = df[df["Fiscal Week Number"].between(max(current_week-3, 0), current_week, inclusive="both")] if current_week else df.iloc[0:0]
+    prior4 = df[df["Fiscal Week Number"].between(max(current_week-7, 0), max(current_week-4, 0), inclusive="both")] if current_week else df.iloc[0:0]
+    l4 = last4.groupby(key)["Pounds CY"].sum().rename("L4_Lbs").reset_index() if len(last4) else pd.DataFrame(columns=key+["L4_Lbs"])
+    p4 = prior4.groupby(key)["Pounds CY"].sum().rename("P4_Lbs").reset_index() if len(prior4) else pd.DataFrame(columns=key+["P4_Lbs"])
+    m4 = l4.merge(p4, on=key, how="outer") if len(l4) or len(p4) else pd.DataFrame(columns=key+["L4_Lbs","P4_Lbs"])
+    if "L4_Lbs" not in m4.columns: m4["L4_Lbs"] = 0.0
+    if "P4_Lbs" not in m4.columns: m4["P4_Lbs"] = 0.0
+    m4["L4_vs_P4_Delta"] = m4["L4_Lbs"] - m4["P4_Lbs"]
+    m4["L4_vs_P4_Pct"] = m4.apply(lambda r: (r["L4_vs_P4_Delta"] / r["P4_Lbs"]) if r["P4_Lbs"] else np.nan, axis=1)
+
+    status = ytd.merge(wow, on=key, how="left").merge(m4, on=key, how="left").fillna(0)
+    return status, current_week
+
+
+def _format_sheet_by_headers(ws, number_headers=None, percent_headers=None):
+    if ws.max_row < 2:
+        return
+    number_headers  = set(number_headers or [])
+    percent_headers = set(percent_headers or [])
+
+    # map header -> col index
+    header_to_col = {str(c.value).strip(): c.col_idx for c in ws[1] if c.value is not None}
+
+    def _coerce_number(cell):
+        v = cell.value
+        if v is None or isinstance(v, (int, float)):
+            return
+        s = str(v).strip().replace(",", "")
+        # if someone already wrote "12345%" into a number column, strip the % and do NOT /100
+        if s.endswith("%"):
+            s = s[:-1]
+        try:
+            cell.value = float(s)
+        except Exception:
+            pass  # leave as-is
+
+    def _coerce_percent(cell):
+        v = cell.value
+        if v is None:
+            return
+        if isinstance(v, (int, float)):
+            # assume already fraction (0.23 -> 23%)
+            return
+        s = str(v).strip().replace(",", "")
+        try:
+            if s.endswith("%"):
+                cell.value = float(s[:-1]) / 100.0
+            else:
+                cell.value = float(s)  # treat as fraction already
+        except Exception:
+            pass
+
+    # clear any old formats on targeted cols first
+    for h in (number_headers | percent_headers):
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=col, max_col=col):
+            row[0].number_format = "General"
+
+    # numbers
+    for h in number_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=col, max_col=col):
+            _coerce_number(row[0])
+            row[0].number_format = "#,##0"
+
+    # percents
+    for h in percent_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=col, max_col=col):
+            _coerce_percent(row[0])
+            row[0].number_format = "0.0%"
+
+
+def _try_format(xw, sheet_name, number_headers=None, percent_headers=None):
+    wb = xw.book
+    if sheet_name not in wb.sheetnames:
+        return
+    _format_sheet_by_headers(wb[sheet_name], number_headers, percent_headers)
+
+
+def classify_conversion(status, X=0.80, Y=0.80, Z=0.95):
+    status["Frac_ItemAligned"] = status.apply(lambda r: pct(r["ItemAligned_Lbs"], r["Pounds_CY"]), axis=1)
+    status["Frac_VendorAligned"] = status.apply(lambda r: pct(r["VendorAligned_Lbs"], r["Pounds_CY"]), axis=1)
+    status["Frac_ItemVendorAligned"] = status.apply(lambda r: pct(r["ItemVendorAligned_Lbs"], r["Pounds_CY"]), axis=1)
+
+    def label(row):
+        cy = row["Pounds_CY"]
+        f_item = row["Frac_ItemAligned"] or 0
+        f_vendor = row["Frac_VendorAligned"] or 0
+        f_both = row["Frac_ItemVendorAligned"] or 0
+        if cy <= 0:
+            return "No CY Volume"
+        if f_both >= Z:
+            return "Converted"
+        if f_item >= Y and f_vendor < X:
+            return "Needs Vendor"
+        if f_vendor >= Y and f_item < X:
+            return "Needs Item"
+        if f_item < X and f_vendor < X:
+            return "Needs Both"
+        return "Partial"
+
+    status["Conversion_Status"] = status.apply(label, axis=1)
+    return status
+
+def mark_exit_lapsing(status, min_ytd):
+    status["Is_Exit"] = ((status["Pounds_CY"] <= 0) & (status["Pounds_PY"] >= min_ytd)).astype(int)
+    status["Is_Lapsing"] = ((status["Pounds_CY"] <= 0.2*status["Pounds_PY"]) & (status["Pounds_PY"] >= min_ytd)).astype(int)
+    return status
+
+def build_sales_leads(status, raw_df, min_ytd):
+    # Filter to meaningful volume & actionable statuses
+    leads = status[
+        (status["Pounds_CY"] >= min_ytd) &
+        (status["Conversion_Status"].isin(["Needs Both","Needs Item","Needs Vendor","Partial"]))
+    ].copy()
+
+    key = ["Company Number","Company Name","Customer Name","Company Customer Number","Lot Number","Lot Description","Alignment Key"]
+    cols_route = ["Customer DSM","Customer Territory","Customer Street Address","Customer City","Customer State","Customer Zip Code"]
+    cols_purchase = ["Item Number","Item Description","True Vendor Number","True Vendor Name","Pounds CY"]
+    attach_cols = key + cols_route + cols_purchase
+
+    latest = raw_df.copy()
+    latest = latest.sort_values(["Company Customer Number","Lot Number","Fiscal Week Number"], ascending=[True,True,False])
+    latest = latest.drop_duplicates(subset=key, keep="first")
+
+    slim = leads[key + ["Pounds_CY","Conversion_Status","SUPC","SUVC","Supplier Name","Frac_ItemAligned","Frac_VendorAligned","Frac_ItemVendorAligned"]]
+    out = slim.merge(latest[attach_cols], on=key, how="left")
+
+    def what_to_convert(row):
+        if row["Conversion_Status"] == "Needs Both": return "Convert Item + Vendor"
+        if row["Conversion_Status"] == "Needs Item": return "Convert Item"
+        if row["Conversion_Status"] == "Needs Vendor": return "Convert Vendor"
+        if row["Conversion_Status"] == "Partial": return "Top off to aligned"
+        return ""
+    out["Action"] = out.apply(what_to_convert, axis=1)
+
+    out.rename(columns={"Supplier Name":"Aligned Supplier Name"}, inplace=True)
+    out["Aligned Item (SUPC)"] = out["SUPC"]
+    out["Aligned Vendor (SUVC)"] = out["SUVC"]
+
+    ordered = [
+        "Company Number","Company Name","Customer Name","Company Customer Number",
+        "Customer DSM","Customer Territory","Customer Street Address","Customer City","Customer State","Customer Zip Code",
+        "Lot Number","Lot Description","Alignment Key","Aligned Supplier Name","Aligned Item (SUPC)","Aligned Vendor (SUVC)",
+        "Item Number","Item Description","True Vendor Number","True Vendor Name",
+        "Pounds_CY","Frac_ItemVendorAligned","Frac_ItemAligned","Frac_VendorAligned",
+        "Conversion_Status","Action"
+    ]
+    existing = [c for c in ordered if c in out.columns]
+    remaining = [c for c in out.columns if c not in existing]
+    out = out[existing + remaining]
+    return out
+
+def vendor_splits(leads_df, vendors_filter, outdir):
+    os.makedirs(os.path.join(outdir, "Vendor_Leads"), exist_ok=True)
+    if "Aligned Vendor (SUVC)" not in leads_df.columns:
+        return []
+    files = []
+    subset = leads_df[leads_df["Aligned Vendor (SUVC)"].notna() & (leads_df["Aligned Vendor (SUVC)"]!="")]
+    aligned_vendors = subset["Aligned Vendor (SUVC)"].dropna().unique().tolist()
+    if vendors_filter:
+        keep = set([v.strip() for v in vendors_filter.split(",") if v.strip()])
+        aligned_vendors = [v for v in aligned_vendors if v in keep]
+
+    for v in aligned_vendors:
+        dfv = subset[subset["Aligned Vendor (SUVC)"] == v].copy()
+        if dfv.empty: continue
+        fname = os.path.join(outdir, "Vendor_Leads", f"vendor_{v}_leads.csv")
+        dfv.to_csv(fname, index=False)
+        files.append(fname)
+    return files
+
+def build_summary(status, current_week):
+    # Totals
+    tot = status["Pounds_CY"].sum()
+
+    # Aligned lbs
+    iv = status["ItemVendorAligned_Lbs"].sum()       # both item+vendor
+    item_any = status["ItemAligned_Lbs"].sum()       # includes 'both'
+    vendor_any = status["VendorAligned_Lbs"].sum()   # includes 'both'
+
+    # Breakouts (non-overlapping)
+    i_only = max(item_any - iv, 0)
+    v_only = max(vendor_any - iv, 0)
+    neither = max(tot - (iv + i_only + v_only), 0)
+
+    # KPI row with added “Any” stats
+    kpi = pd.DataFrame([{
+        "KPI": "CY Pounds",
+        "Value": tot,
+        "% Any Item aligned": pct(item_any, tot),       # NEW
+        "% Any Vendor aligned": pct(vendor_any, tot),   # NEW
+        "% Item+Vendor aligned": pct(iv, tot),
+        "% Item-only": pct(i_only, tot),
+        "% Vendor-only": pct(v_only, tot),
+        "% Neither": pct(neither, tot),
+        "Current Fiscal Week": current_week
+    }])
+
+    # Biggest negative YoY by Company (as % of total loss)
+    by_co = status.groupby(["Company Number","Company Name"], dropna=False).agg(
+        CY=("Pounds_CY","sum"), PY=("Pounds_PY","sum"), d=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    total_loss = abs(by_co.loc[by_co["d"] < 0, "d"].sum())
+    by_co["Loss_%_of_total"] = by_co.apply(
+        lambda r: abs(r["d"]) / total_loss if total_loss > 0 and r["d"] < 0 else 0, axis=1
+    )
+    lag_sites = by_co.sort_values(["d"]).head(10)
+
+    # Biggest customer losses
+    by_cust = status.groupby(["Company Name","Customer Name"], dropna=False).agg(
+        CY=("Pounds_CY","sum"), PY=("Pounds_PY","sum"), d=("Delta_YoY_Lbs","sum")
+    ).reset_index().sort_values("d").head(10)
+
+    # Narrative
+    recs = []
+    if total_loss > 0:
+        worst = lag_sites.head(3)
+        sites_list = ", ".join([f"{r['Company Name']} ({r['d']:.0f} lbs)" for _, r in worst.iterrows()]) if not worst.empty else ""
+        recs.append(f"Focus on sites with largest YoY losses: {sites_list}.")
+    if tot > 0:
+        iv_pct = pct(iv, tot) or 0
+        if iv_pct < 0.8:
+            recs.append("Conversion <80% aligned on item+vendor: prioritize 'Needs Both' and 'Needs Vendor' leads.")
+    summary_text = " ".join(recs) if recs else "Conversion stable; monitor 4-week momentum."
+
+    return kpi, lag_sites, by_cust, summary_text
+
+
+def build_company_yoy(status_df):
+    need = ["Company Name","Pounds_CY","Pounds_PY","Delta_YoY_Lbs"]
+    for c in need:
+        if c not in status_df.columns:
+            status_df[c] = 0
+    by_co = status_df.groupby("Company Name", dropna=False).agg(
+        CY_YTD=("Pounds_CY","sum"),
+        PY_YTD=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum"),
+    ).reset_index()
+    by_co["YoY_Pct"] = np.where(by_co["PY_YTD"]>0, by_co["Delta_YoY_Lbs"]/by_co["PY_YTD"], np.nan)
+    total_loss = abs(by_co.loc[by_co["Delta_YoY_Lbs"]<0,"Delta_YoY_Lbs"].sum())
+    by_co["Loss_%_of_TotalLoss"] = np.where(
+        (by_co["Delta_YoY_Lbs"]<0) & (total_loss>0),
+        abs(by_co["Delta_YoY_Lbs"])/total_loss,
+        0.0
+    )
+    by_co = by_co.sort_values(["Delta_YoY_Lbs","CY_YTD"], ascending=[True,False])
+    return by_co
+
+def build_company_weekly(df_raw):
+    if "Fiscal Week Number" not in df_raw.columns:
+        raise SystemExit("Missing 'Fiscal Week Number' in source.")
+    current_week = int(pd.to_numeric(df_raw["Fiscal Week Number"], errors="coerce").fillna(0).max())
+    tot = df_raw.groupby("Fiscal Week Number", dropna=False)[["Pounds CY","Pounds PY"]].sum().reset_index()
+    tot = tot.rename(columns={"Pounds CY": "CY", "Pounds PY":"PY"})
+    # NEW: add weekly Delta and YoY %
+    tot["Delta_YoY_Lbs"] = tot["CY"] - tot["PY"]
+    tot["YoY_Pct"] = np.where(tot["PY"]>0, tot["Delta_YoY_Lbs"]/tot["PY"], np.nan)
+    return tot, current_week
+
+def make_12w_forecast(weekly_total, current_week, method="runrate"):
+    s = weekly_total.copy().sort_values("Fiscal Week Number")
+    if s.empty:
+        s["Type"] = "Actual"
+        return s
+    last4 = s.tail(4)["CY"].mean() if len(s)>=4 else s["CY"].mean()
+    if len(s) >= 2:
+        tail = s.tail(min(8, len(s)))
+        x = tail["Fiscal Week Number"].astype(float).values
+        y = tail["CY"].astype(float).values
+        slope, intercept = np.polyfit(x, y, 1)
+    else:
+        slope, intercept = 0.0, float(s["CY"].iloc[-1])
+    horizon = list(range(current_week+1, current_week+12+1))
+    yhat = [slope*w + intercept for w in horizon] if method=="linear" else [last4 for _ in horizon]
+    f = pd.DataFrame({"Fiscal Week Number": horizon, "CY": yhat})
+    f["PY"] = np.nan
+    f["Delta_YoY_Lbs"] = np.nan
+    f["YoY_Pct"] = np.nan
+    s["Type"] = "Actual"
+    f["Type"] = "Forecast"
+    return pd.concat([s, f], ignore_index=True)
+
+# ---------------------------- NEW: Tab builders ----------------------------
+def _brand_split(df):
+    # Sysco vs Non-Sysco using 'Sysco Brand Indicator' (Y/N)
+    if "Sysco Brand Indicator" not in df.columns:
+        return pd.DataFrame(columns=["Sysco Brand Indicator","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+    g = df.groupby("Sysco Brand Indicator", dropna=False).agg(
+        Pounds_CY=("Pounds_CY","sum"),
+        Pounds_PY=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    g["YoY_Pct"] = np.where(g["Pounds_PY"]>0, g["Delta_YoY_Lbs"]/g["Pounds_PY"], np.nan)
+    return g
+
+def _sites_rank(df):
+    # Ascending by Delta YoY Pounds
+    have = [c for c in ["Company Name","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"] if c in df.columns]
+    if "Company Name" not in have:
+        return pd.DataFrame(columns=["Company Name","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+    g = df.groupby("Company Name", dropna=False).agg(
+        Pounds_CY=("Pounds_CY","sum"),
+        Pounds_PY=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    g["YoY_Pct"] = np.where(g["Pounds_PY"]>0, g["Delta_YoY_Lbs"]/g["Pounds_PY"], np.nan)
+    return g.sort_values("Delta_YoY_Lbs", ascending=True)
+
+def _items_rank(df):
+    # prefer to group by Item Number + Item Description + Brand ID when available
+    keys = []
+    for k in ["Item Number", "Item Description", "Brand ID", "Brand"]:
+        if k in df.columns:
+            keys.append(k)
+    if not keys:
+        return pd.DataFrame(columns=["Item","Item Description","Brand ID","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+
+    g = df.groupby(keys, dropna=False).agg(
+        Pounds_CY=("Pounds_CY","sum"),
+        Pounds_PY=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    g["YoY_Pct"] = np.where(g["Pounds_PY"]>0, g["Delta_YoY_Lbs"]/g["Pounds_PY"], np.nan)
+
+    # nice column names (keep whatever exists)
+    if "Item Number" in g.columns:
+        g.rename(columns={"Item Number":"Item"}, inplace=True)
+
+    return g.sort_values("Delta_YoY_Lbs", ascending=True)
+
+
+def _overall_yoy(df):
+    row = {
+        "Pounds CY": df["Pounds_CY"].sum(),
+        "Pounds PY": df["Pounds_PY"].sum(),
+        "Delta Pounds YoY": df["Delta_YoY_Lbs"].sum()
+    }
+    row["YoY %"] = (row["Delta Pounds YoY"]/row["Pounds PY"]) if row["Pounds PY"] else np.nan
+    return pd.DataFrame([row])
+
+def _write_account_tab(xw, tab_name, df):
+    start = 0
+    # 1) OVERALL
+    overall = _overall_yoy(df)
+    overall.to_excel(xw, sheet_name=tab_name, index=False, startrow=start)
+    _format_table_at(
+        xw.book[tab_name], header_row_0idx=start, n_rows=overall.shape[0],
+        number_headers={"Pounds CY","Pounds PY","Delta Pounds YoY"},
+        percent_headers={"YoY %"}
+    )
+    start += overall.shape[0] + 2
+
+    # 2) BRAND SPLIT
+    brand = _brand_split(df)
+    if not brand.empty:
+        brand.to_excel(xw, sheet_name=tab_name, index=False, startrow=start)
+        _format_table_at(
+            xw.book[tab_name], header_row_0idx=start, n_rows=brand.shape[0],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
+        start += brand.shape[0] + 2
+
+    # 3) SITES
+    sites = _sites_rank(df)
+    if not sites.empty:
+        sites.to_excel(xw, sheet_name=tab_name, index=False, startrow=start)
+        _format_table_at(
+            xw.book[tab_name], header_row_0idx=start, n_rows=sites.shape[0],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
+        start += sites.shape[0] + 2
+
+    # 4) ITEMS
+    items = _items_rank(df)
+    if not items.empty:
+        items.to_excel(xw, sheet_name=tab_name, index=False, startrow=start)
+        _format_table_at(
+            xw.book[tab_name], header_row_0idx=start, n_rows=items.shape[0],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
+
+def _write_weekly_chart_only_tab(xw, sheet_name, weekly_df, forecast_method_desc):
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.worksheet.dimensions import RowDimension, ColumnDimension
+
+    df_out = weekly_df.copy()
+    DATA_START = 199  # header at Excel row 200
+    df_out.to_excel(xw, sheet_name=sheet_name, index=False, startrow=DATA_START)
+
+    ws = xw.book[sheet_name]
+    ws.sheet_view.showGridLines = False
+
+    # locate headers in the hidden table (row 200)
+    headers = {cell.value: cell.col_idx for cell in ws[DATA_START + 1] if cell.value is not None}
+    col_week  = headers.get("Fiscal Week Number")
+    col_delta = headers.get("Delta_YoY_Lbs") or headers.get("Delta Pounds YoY")
+    col_yoy   = headers.get("YoY_Pct") or headers.get("YoY %")
+    if not all([col_week, col_delta, col_yoy]):
+        return
+
+    n = df_out.shape[0]
+    header_row = DATA_START + 1
+    first_row  = header_row + 1
+    last_row   = header_row + n
+
+    # bar: Δ YoY lbs
+    bar = BarChart()
+    bar.title = f"Weekly Δ YoY lbs + YoY% ({forecast_method_desc})"
+    bar.y_axis.title = "Δ YoY lbs"
+    bar.x_axis.title = "Fiscal Week"
+    bar.style = 10
+    bar.width, bar.height = 32, 16
+
+    bar_data = Reference(ws, min_col=col_delta, min_row=header_row, max_row=last_row)
+    bar.add_data(bar_data, titles_from_data=True)
+    x_ref = Reference(ws, min_col=col_week, min_row=first_row, max_row=last_row)
+    bar.set_categories(x_ref)
+
+    # line: YoY % on secondary axis
+    line = LineChart()
+    line.y_axis.axId = 200
+    line.y_axis.crosses = "max"
+    line.y_axis.title = "YoY %"
+    line.smooth = True
+    try:
+        line.y_axis.number_format = "0%"
+        line.y_axis.majorUnit = 0.1
+        line.y_axis.scaling.min = -0.5
+        line.y_axis.scaling.max = 0.5
+    except Exception:
+        pass
+
+    line_data = Reference(ws, min_col=col_yoy, min_row=header_row, max_row=last_row)
+    line.add_data(line_data, titles_from_data=True)
+    bar += line
+    # after `bar += line`
+    try:
+        bar.y_axis.number_format = '#,##0'
+        bar.y_axis.title = "Δ YoY lbs"
+        bar.x_axis.title = "Fiscal Week"
+
+        line.y_axis.number_format = '0%'
+        line.y_axis.title = "YoY %"
+        line.y_axis.majorUnit = 0.1
+        line.y_axis.scaling.min = -0.5
+        line.y_axis.scaling.max = 0.5
+        line.smooth = True
+    except Exception:
+        pass
+    ws.add_chart(bar, "A1")
+    ws.sheet_view.showGridLines = False
+
+
+    # hide the support table so the sheet looks truly “chart only”
+    for r in range(header_row, last_row + 1):
+        ws.row_dimensions[r] = RowDimension(ws, r, hidden=True)
+    for c in range(min(col_week, col_delta, col_yoy), max(col_week, col_delta, col_yoy) + 1):
+        ws.column_dimensions[ws.cell(row=1, column=c).column_letter] = ColumnDimension(ws, ws.cell(row=1, column=c).column_letter, hidden=True)
+
+
+def _write_weekly_combo_chart(ws, data_start_row: int, n_data_rows: int, title: str):
+    """
+    Combo chart with secondary axis.
+    Table layout starting at data_start_row (0-based for header row):
+      A: Fiscal Week Number
+      B: CY
+      C: PY
+      D: Delta_YoY_Lbs
+      E: YoY_Pct
+    """
+    if n_data_rows < 1:
+        return
+
+    header_row = data_start_row + 1      # 1-indexed row of headers in Excel
+    first_data = header_row + 1          # first data row (under header)
+    last_data  = header_row + n_data_rows
+
+    # Bars: Delta YoY (col D) on primary axis
+    bar = BarChart()
+    bar.title = title
+    bar.y_axis.title = "Delta Pounds YoY"
+    bar.x_axis.title = "Fiscal Week"
+    bar.y_axis.axId = 100
+
+    x_ref = Reference(ws, min_col=1, min_row=first_data, max_row=last_data)   # A
+    y_bar = Reference(ws, min_col=4, min_row=first_data, max_row=last_data)   # D
+    bar.add_data(y_bar, titles_from_data=False)
+    bar.set_categories(x_ref)
+
+    # Line: YoY % (col E) on secondary axis
+    line = LineChart()
+    line.y_axis.axId = 200
+    line.y_axis.title = "YoY %"
+    line.y_axis.scaling.max = 1.0
+    line.y_axis.scaling.min = -1.0
+    y_line = Reference(ws, min_col=5, min_row=first_data, max_row=last_data)  # E
+    line.add_data(y_line, titles_from_data=False)
+    line.y_axis.crosses = "max"
+
+    # Combine
+    bar += line
+
+    # ----- readable axes & size -----
+    try:
+        bar.y_axis.number_format = '#,##0'   # commas for Δ YoY lbs
+        bar.y_axis.title = "Δ YoY lbs"
+
+        line.y_axis.number_format = '0%'     # percent for YoY%
+        line.y_axis.title = "YoY %"
+        line.smooth = True
+    except Exception:
+        pass
+
+    bar.style = 10
+    bar.width = 32
+    bar.height = 16
+
+    ws.add_chart(bar, f"A{last_data + 2}")
+
+def _write_weekly_tab(xw, sheet_name, weekly_df, forecast_method_desc):
+    """
+    Writes the weekly table at row 1, then appends notes, then a combo chart.
+    """
+    df_out = weekly_df.copy()
+    df_out.to_excel(xw, sheet_name=sheet_name, index=False, startrow=0)
+    ws = xw.book[sheet_name]
+
+    # data rows = len(df_out); header is at row 1 in Excel
+    n_data_rows = df_out.shape[0]
+    if n_data_rows >= 1:
+        _write_weekly_combo_chart(
+            ws,
+            data_start_row=0,        # header row index for Excel (0 -> row 1)
+            n_data_rows=n_data_rows,
+            title=f"Weekly Δ YoY lbs + YoY% ({sheet_name})"
+        )
+
+    # optional notes under the table
+    notes_row = n_data_rows + 3
+    notes = [
+        ["Notes"],
+        ["- Clustered bar shows Delta Pounds YoY; line (right axis) shows YoY%."],
+        [f"- Includes 12-week {forecast_method_desc} appended for CY pounds (YoY calcs blank for forecast rows)."]
+    ]
+    for i, row in enumerate(notes):
+        ws.cell(row=notes_row + i, column=1, value=row[0])
+        if i == 0:
+            ws.cell(row=notes_row + i, column=1).font = Font(bold=True)
+
+    
+def _format_table_at(ws, header_row_0idx: int, n_rows: int,
+                     number_headers=None, percent_headers=None):
+    number_headers = set(number_headers or [])
+    percent_headers = set(percent_headers or [])
+    header_row_1idx = header_row_0idx + 1
+    first_data = header_row_1idx + 1
+    last_data  = header_row_1idx + n_rows
+    if n_rows <= 0:
+        return
+
+    # Map header text in THIS table
+    header_to_col = {str(c.value).strip(): c.col_idx
+                     for c in ws[header_row_1idx] if c.value is not None}
+
+    def _coerce(cell, as_percent: bool):
+        v = cell.value
+        if v is None or isinstance(v, (int, float)):
+            return
+        s = str(v).replace(",", "").strip()
+        if not s:
+            return
+        try:
+            if as_percent and s.endswith("%"):
+                cell.value = float(s[:-1]) / 100.0
+            else:
+                cell.value = float(s)
+        except Exception:
+            pass
+
+    # Clear any stale formats in only the targeted columns
+    for h in (number_headers | percent_headers):
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
+            row[0].number_format = "General"
+
+    # Numbers
+    for h in number_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
+            _coerce(row[0], as_percent=False)
+            row[0].number_format = "#,##0"
+
+    # Percents
+    for h in percent_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
+            _coerce(row[0], as_percent=True)
+            row[0].number_format = "0.0%"
+
+# ---------------------------- Write workbook (extended) ----------------------------
+def write_excel(
+    excel_path,
+    summary_kpi, lag_sites, cust_losses,
+    status, leads, vendor_index,
+    company_yoy=None,
+    all_weekly=None, trs_weekly=None,
+    forecast_method="linear",
+    status_raw=None
+):
+    forecast_desc = "Linear Trend Forecast" if (forecast_method or "linear").lower() == "linear" \
+                    else "Run-Rate Forecast (Last 4 Weeks Avg)"
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as xw:
+        # ===== SUMMARY =====
+        summary_kpi.to_excel(xw, sheet_name="Summary", index=False, startrow=0)
+
+        explain = pd.DataFrame({"What this shows":[
+            "Conversion KPIs: share of CY pounds aligned to SUPC+SUVC.",
+            "Lagging Sites: Companies with the largest negative Δ Pounds YoY and their share of total category losses.",
+            "Top Customer Losses: Customers with the biggest YoY declines to target for recovery.",
+            "Recommendations: Auto-generated next steps based on losses and conversion gaps."
+        ]})
+        explain_start = summary_kpi.shape[0] + 2
+        explain.to_excel(xw, sheet_name="Summary", index=False, startrow=explain_start)
+
+        # (re)add lag tables so Summary has CY/PY/Delta columns visible on that sheet
+        lag_out = lag_sites.rename(columns={"d":"Delta_YoY_Lbs"})
+        lag_start = explain_start + explain.shape[0] + 3
+        lag_out.to_excel(xw, sheet_name="Summary", index=False, startrow=lag_start)
+
+        cust_out = cust_losses.rename(columns={"d":"Delta_YoY_Lbs"})
+        cust_start = lag_start + lag_out.shape[0] + 3
+        cust_out.to_excel(xw, sheet_name="Summary", index=False, startrow=cust_start)
+
+        _format_sheet_by_headers(
+            xw.book["Summary"],
+            number_headers={"CY", "PY", "Delta_YoY_Lbs"},
+            percent_headers={"Loss_%_of_total"}
+        )
+
+        # after cust_out.to_excel(...)
+        _format_table_at(
+            xw.book["Summary"],
+            header_row_0idx=cust_start,
+            n_rows=cust_out.shape[0],
+            number_headers={"CY","PY","Delta_YoY_Lbs"},
+            percent_headers={"Loss_%_of_total"},
+        )
+
+        # ===== PREP for ACCOUNT TABS =====
+        base_cols = [
+            "Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct",
+            "Sysco Brand Indicator","Company Name",
+            "Item Number","Item Description",
+            "Customer Account Type Code"
+        ]
+        if status_raw is not None:
+            for c in base_cols:
+                if c not in status.columns and c in status_raw.columns:
+                    status[c] = status_raw[c]
+
+        def slice_acct(df, codes=None):
+            if "Customer Account Type Code" not in df.columns or not codes:
+                return df
+            keep = set(x.strip() for x in codes)
+            return df[df["Customer Account Type Code"].astype(str).isin(keep)].copy()
+
+        # 01 — ALL ACCOUNTS
+        _write_account_tab(xw, "01_All_Accounts", status.copy())
+        _format_sheet_by_headers(
+            xw.book["01_All_Accounts"],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct","YoY %"}
+        )
+
+        # 02 — TRS
+        _write_account_tab(xw, "02_TRS", slice_acct(status, {"TRS"}))
+        _format_sheet_by_headers(
+            xw.book["02_TRS"],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct","YoY %"}
+        )
+
+        # 03 — LCC
+        _write_account_tab(xw, "03_LCC", slice_acct(status, {"LCC"}))
+        _format_sheet_by_headers(
+            xw.book["03_LCC"],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct","YoY %"}
+        )
+
+        # 04 — CMU
+        _write_account_tab(xw, "04_CMU", slice_acct(status, {"CMU"}))
+        _format_sheet_by_headers(
+            xw.book["04_CMU"],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct","YoY %"}
+        )
+
+        # 05b / 07b — chart-only sheets
+        if all_weekly is not None:
+            _write_weekly_chart_only_tab(xw, "05b_All_Weekly_Chart", all_weekly, forecast_method_desc=forecast_desc)
+        if trs_weekly is not None:
+            _write_weekly_chart_only_tab(xw, "07b_TRS_Weekly_Chart", trs_weekly, forecast_method_desc=forecast_desc)
+
+
+        # ===== 08 — Vendor/Item alignment =====
+        align_view = leads.copy()
+        align_view.to_excel(xw, sheet_name="08_VendorItem_Alignment", index=False)
+        _try_format(xw, "08_VendorItem_Alignment",
+                    number_headers={"Pounds_CY"},
+                    percent_headers=set())
+
+        # ===== 09 — Award vs Sales =====
+        if status_raw is not None and "Award Volume Annualized" in status_raw.columns:
+            by_vendor = status_raw.groupby(["SUVC","Supplier Name"], dropna=False).agg(
+                CY_Lbs=("Pounds CY","sum"),
+                PY_Lbs=("Pounds PY","sum"),
+                Award_Volume_Annualized=("Award Volume Annualized","first")
+            ).reset_index()
+            by_vendor["Award_Volume_Annualized"] = pd.to_numeric(by_vendor["Award_Volume_Annualized"], errors="coerce")
+            by_vendor["% of Award (CY)"] = np.where(by_vendor["Award_Volume_Annualized"]>0,
+                                                    by_vendor["CY_Lbs"]/by_vendor["Award_Volume_Annualized"], np.nan)
+            by_vendor.to_excel(xw, sheet_name="09_Award_vs_Sales", index=False)
+            _try_format(xw, "09_Award_vs_Sales",
+                        number_headers={"CY_Lbs","PY_Lbs","Award_Volume_Annualized"},
+                        percent_headers={"% of Award (CY)"})
+        else:
+            pd.DataFrame({"Note":[
+                "Award Volume Annualized not found. Confirm Alignment.csv carries it AND the join keys match."
+            ]}).to_excel(xw, sheet_name="09_Award_vs_Sales", index=False)
+
+        # ===== Sales Leads / Vendor Index =====
+        leads.to_excel(xw, sheet_name="Sales_Leads", index=False)
+        _try_format(xw, "Sales_Leads",
+                    number_headers={"Pounds_CY"},
+                    percent_headers=set())
+
+        vendor_index.to_excel(xw, sheet_name="Vendor_Leads_Index", index=False)
+        # no special formatting needed here
+
+# ======= Process report one time only =========
+def process_one_file(source_path: str,
+                     alignment_path: str,
+                     outdir_path: str,
+                     forecast_method: str = "linear") -> tuple[str, str]:
+    """
+    Process a single CSV: builds Excel + Sales_Leads.csv, emails them.
+    Returns (excel_path, leads_csv).
+    """
+    # Load + prep
+    raw, _ = load_and_prepare(
+        source_path,
+        alignment_path,
+        company=DEFAULTS.get("company"),
+        attr_groups=DEFAULTS.get("attr_groups"),
+        vendors=DEFAULTS.get("vendors")
+    )
+
+    status, current_week = compute_windows(raw)
+    min_ytd = max(1, int(current_week or 1)) * int(DEFAULTS.get("min_ytd_per_week", 20))
+
+    status = classify_conversion(status, X=0.80, Y=0.80, Z=0.95)
+    status = mark_exit_lapsing(status, min_ytd=min_ytd)
+
+    # Sales leads (+ filters if configured)
+    leads = build_sales_leads(status, raw, min_ytd=min_ytd)
+
+    leads_company = DEFAULTS.get("leads_company")
+    if leads_company:
+        site_tokens = [t.strip().strip('"').strip("'") for t in leads_company.split(",") if t.strip()]
+        site_tokens_norm = set(_as_bool("0") and [] or [_clean_str(t).lower() for t in site_tokens])  # keep type checker quiet
+        site_tokens_norm = set(_clean_str(t).lower() for t in site_tokens)
+        leads = leads[
+            leads["Company Number"].map(_clean_str).str.lower().isin(site_tokens_norm) |
+            leads["Company Name"].astype(str).str.strip().str.lower().isin(site_tokens_norm)
+        ].copy()
+
+    leads_acct = DEFAULTS.get("leads_acct_types", "TRS,LCC")
+    if leads_acct and "Customer Account Type Code" in raw.columns:
+        acct_keep = set([t.strip() for t in leads_acct.split(",") if t.strip()])
+        cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
+        leads = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+        leads = leads[leads["Customer Account Type Code"].isin(acct_keep)].copy()
+
+    # Vendor splits (TRS only)
+    vendor_files = []
+    if DEFAULTS.get("vendor_leads_active","Y").upper() == "Y":
+        if "Customer Account Type Code" in leads.columns:
+            leads_trs = leads[leads["Customer Account Type Code"]=="TRS"].copy()
+        else:
+            cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
+            leads_trs = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+            leads_trs = leads_trs[leads_trs["Customer Account Type Code"]=="TRS"].copy()
+        vendor_files = vendor_splits(leads_trs, DEFAULTS.get("vendors"), outdir_path)
+    vendor_index = pd.DataFrame({"Vendor_File": vendor_files})
+
+    # Summary bits
+    summary_kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
+    summary_kpi["Recommendations"] = narrative
+    company_yoy = build_company_yoy(status)
+
+    all_weekly_hist, _ = build_company_weekly(raw)
+    all_weekly = make_12w_forecast(all_weekly_hist, current_week, method=forecast_method)
+
+    if "Customer Account Type Code" in raw.columns:
+        raw_trs = raw[raw["Customer Account Type Code"]=="TRS"].copy()
+    else:
+        raw_trs = raw.iloc[0:0].copy()
+    trs_weekly_hist, _ = build_company_weekly(raw_trs) if not raw_trs.empty else (
+        pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week
+    )
+    trs_weekly = make_12w_forecast(trs_weekly_hist, current_week, method=forecast_method)
+
+    # filenames
+    fy_guess = "NA"
+    if "Fiscal Period ID" in raw.columns and len(raw):
+        try:
+            fy_guess = str(int(str(raw["Fiscal Period ID"].iloc[0])[:4]))
+        except Exception:
+            pass
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs(outdir_path, exist_ok=True)
+    excel_path = os.path.join(outdir_path, f"Category_Status_and_Leads_FY{fy_guess}_wk{current_week}_{stamp}.xlsx")
+    leads_csv  = os.path.join(outdir_path, "Sales_Leads.csv")
+
+    # write outputs
+    write_excel(
+        excel_path,
+        summary_kpi, lag_sites, cust_losses,
+        status, leads, vendor_index,
+        company_yoy=company_yoy,
+        all_weekly=all_weekly,
+        trs_weekly=trs_weekly,
+        forecast_method=forecast_method,
+        status_raw=raw
+    )
+    leads.to_csv(leads_csv, index=False)
+
+    # email (Excel + Leads CSV only; PDF can be added later)
+    body = f"Auto-generated report for {os.path.basename(source_path)} at {datetime.now():%Y-%m-%d %H:%M}."
+    send_email_with_attachments(MAIL_SUBJECT, body, [excel_path, leads_csv])
+
+    print("Done.")
+    print(f"- Excel: {excel_path}")
+    print(f"- Sales Leads CSV: {leads_csv}")
+    print(f"- Vendor files: {len(vendor_files)} created.")
+    return excel_path, leads_csv
+
+# ---------- Watcher ----------
+ALLOW_EXT = {".csv"}
+def _is_temp_file(p: str) -> bool:
+    name = os.path.basename(p).lower()
+    return (name.startswith("~$") or name.endswith(".tmp") or name.endswith(".partial"))
+
+class DebouncedHandler(FileSystemEventHandler):
+    def __init__(self, alignment_path: str, outdir_path: str, quiet_seconds: int = 8, forecast_method: str = "linear"):
+        super().__init__()
+        self._timers: dict[str, Timer] = {}
+        self.quiet_seconds = quiet_seconds
+        self.alignment_path = alignment_path
+        self.outdir_path = outdir_path
+        self.forecast_method = forecast_method
+        self._alignment_name = os.path.basename(alignment_path).lower() if alignment_path else ""
+
+    def on_created(self, event):
+        self._maybe_schedule(event.src_path)
+
+    def on_modified(self, event):
+        self._maybe_schedule(event.src_path)
+
+    def _maybe_schedule(self, path: str):
+        p = os.path.abspath(path)
+        if os.path.isdir(p): return
+        if os.path.splitext(p)[1].lower() not in ALLOW_EXT: return
+        if _is_temp_file(p): return
+        if self._alignment_name and os.path.basename(p).lower() == self._alignment_name:
+            return  # don't react to alignment file changes
+
+        # debounce
+        if p in self._timers:
+            self._timers[p].cancel()
+        t = Timer(self.quiet_seconds, self._process, args=[p])
+        self._timers[p] = t
+        t.start()
+        print(f"⏳ File change detected: {os.path.basename(p)} (processing in {self.quiet_seconds}s)")
+
+    def _process(self, path: str):
+        try:
+            print(f"\n📁 Processing file: {os.path.basename(path)}")
+            process_one_file(
+                source_path=path,
+                alignment_path=self.alignment_path,
+                outdir_path=self.outdir_path,
+                forecast_method=self.forecast_method
+            )
+            print(f"🎉 Processing complete: {os.path.basename(path)}")
+        except Exception as e:
+            print(f"    ❌ Processing failed for {os.path.basename(path)}: {e}")
+
+# ---------------------------- Main ----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source")
+    ap.add_argument("--alignment")
+    ap.add_argument("--outdir")
+    ap.add_argument("--company")
+    ap.add_argument("--attr-groups")
+    ap.add_argument("--vendors")
+    ap.add_argument("--forecast", choices=["linear", "runrate"])
+    # Extra lead controls (all optional)
+    ap.add_argument("--leads-company")       # quoted CSV of site names/numbers -> only build leads for these
+    ap.add_argument("--leads-acct-types")    # CSV of acct type codes for Sales Leads (default TRS,LCC)
+    ap.add_argument("--vendor-leads-active") # "Y"/"N"
+    ap.add_argument("--min-ytd-per-week", type=int)
+    ap.add_argument("--vendor-leads-respect-site-filter", choices=["Y","N"])
+    # Added for watcher
+    ap.add_argument("--watch", action="store_true", help="Watch a folder for new CSV files")
+    ap.add_argument("--watch-dir", help="Folder to watch (defaults: WATCH_DIR env or folder of --source)")
+    ap.add_argument("--quiet-seconds", type=int, default=int(os.getenv("QUIET_SECONDS", "8")),
+                    help="Debounce seconds for watcher")
+
+
+    args = ap.parse_args()
+
+    # Watch mode (CLI flag OR WATCH=1 env)
+    watch_mode = args.watch or _as_bool(os.getenv("WATCH", "0"))
+    if watch_mode:
+        # default watch folder: env WATCH_DIR, else the folder of the source file, else outdir
+        watch_dir = args.watch_dir or os.getenv("WATCH_DIR") or (os.path.dirname(source_path) if source_path else outdir_path)
+        start_watcher(
+            watch_dir=watch_dir,
+            alignment_path=alignment_path,
+            outdir_path=outdir_path,
+            quiet_seconds=args.quiet_seconds,
+            forecast_method=forecast_method
+        )
+        return  # do not run single file in watch mode
+
+    # merge with defaults
+    forecast_method = (args.forecast or DEFAULTS.get("forecast_method") or "linear").lower()
+    if forecast_method not in ("linear", "runrate"):
+        raise SystemExit("Invalid --forecast. Use 'linear' or 'runrate'.")
+
+    source_path = args.source or DEFAULTS.get("source")
+    alignment_path  = args.alignment  or DEFAULTS.get("alignment")
+    outdir_path     = args.outdir     or DEFAULTS.get("outdir")
+    company_filt    = args.company    or DEFAULTS.get("company")
+    attr_groups     = args.attr_groups or DEFAULTS.get("attr_groups")
+    vendors_filter  = args.vendors    or DEFAULTS.get("vendors")
+    min_ytd_per_week = args.min_ytd_per_week or int(DEFAULTS.get("min_ytd_per_week", 20))
+    vendor_leads_respect_site = (args.vendor_leads_respect_site_filter or DEFAULTS.get("vendor_leads_respect_site_filter","N")).upper() == "Y"
+
+
+    leads_company   = args.leads_company or DEFAULTS.get("leads_company")
+    leads_acct      = args.leads_acct_types or DEFAULTS.get("leads_acct_types", "TRS,LCC")
+    vendor_leads_on = (args.vendor_leads_active or DEFAULTS.get("vendor_leads_active","Y")).strip().upper() == "Y"
+
+    missing = [k for k, v in {"source": source_path,"alignment": alignment_path,"outdir": outdir_path}.items() if not v]
+    if missing:
+        raise SystemExit(f"Error: missing required inputs (CLI or DEFAULTS): {', '.join(missing)}")
+
+    os.makedirs(outdir_path, exist_ok=True)
+
+    # Load + join
+    raw, _ = load_and_prepare(
+        source_path,
+        alignment_path,
+        company=company_filt,
+        attr_groups=attr_groups,
+        vendors=vendors_filter
+    )
+
+    # Compute windows + YoY%
+    status, current_week = compute_windows(raw)
+
+    # Dynamic threshold for leads
+    min_ytd = max(1, int(current_week or 1)) * int(min_ytd_per_week)
+
+
+    # Conversion class + flags
+    status = classify_conversion(status, X=0.80, Y=0.80, Z=0.95)
+    status = mark_exit_lapsing(status, min_ytd=min_ytd)
+
+    # ---- Sales Leads (filtered by config) ----
+    leads = build_sales_leads(status, raw, min_ytd=min_ytd)
+
+    # NEW: restrict Sales Leads by site names/numbers and by account type codes
+    if leads_company:
+        site_tokens = [t.strip().strip('"').strip("'") for t in leads_company.split(",") if t.strip()]
+        site_tokens_norm = set(_clean_str(t).lower() for t in site_tokens)
+        leads = leads[
+            leads["Company Number"].map(_clean_str).str.lower().isin(site_tokens_norm) |
+            leads["Company Name"].astype(str).str.strip().str.lower().isin(site_tokens_norm)
+        ].copy()
+
+    if leads_acct and "Customer Account Type Code" in raw.columns:
+        acct_keep = set([t.strip() for t in leads_acct.split(",") if t.strip()])
+        # attach account type to leads via raw join
+        cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
+        leads = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+        leads = leads[leads["Customer Account Type Code"].isin(acct_keep)].copy()
+
+    # Vendor leads (TRS ONLY) if active
+    vendor_files = []
+    if vendor_leads_on:
+        if "Customer Account Type Code" in leads.columns:
+            leads_trs = leads[leads["Customer Account Type Code"]=="TRS"].copy()
+        else:
+            # try to attach again from raw if missing
+            cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
+            leads_trs = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+            leads_trs = leads_trs[leads_trs["Customer Account Type Code"]=="TRS"].copy()
+        vendor_files = vendor_splits(leads_trs, vendors_filter, outdir_path)
+    vendor_index = pd.DataFrame({"Vendor_File": vendor_files})
+
+    # Summary
+    kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
+    kpi["Recommendations"] = narrative
+
+    # Company aggregates + weekly series (+forecast) — ALL and TRS views
+    company_yoy = build_company_yoy(status)
+
+    all_weekly_hist, _ = build_company_weekly(raw)
+    all_weekly = make_12w_forecast(all_weekly_hist, current_week, method=forecast_method)
+
+    if "Customer Account Type Code" in raw.columns:
+        raw_trs = raw[raw["Customer Account Type Code"]=="TRS"].copy()
+    else:
+        raw_trs = raw.iloc[0:0].copy()
+    trs_weekly_hist, _ = build_company_weekly(raw_trs) if not raw_trs.empty else (pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week)
+    trs_weekly = make_12w_forecast(trs_weekly_hist, current_week, method=forecast_method)
+    
+    summary_kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
+    summary_kpi["Recommendations"] = narrative
+
+
+    fy_guess = "NA"
+    if "Fiscal Period ID" in raw.columns and len(raw):
+        try:
+            fy_guess = str(int(str(raw["Fiscal Period ID"].iloc[0])[:4]))
+        except Exception:
+            pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = os.path.join(outdir_path, f"Category_Status_and_Leads_FY{fy_guess}_wk{current_week}_{stamp}.xlsx")
+
+    # Write workbook + CSV exports
+    write_excel(
+        excel_path,
+        summary_kpi, lag_sites, cust_losses,
+        status, leads, vendor_index,
+        company_yoy=company_yoy,
+        all_weekly=all_weekly,         
+        trs_weekly=trs_weekly,          
+        forecast_method=forecast_method,
+        status_raw=raw
+    )
+
+    # one-off run
+    body = f"Auto-generated report for {os.path.basename(source_path)} at {datetime.now():%Y-%m-%d %H:%M}."
+    send_email_with_attachments(MAIL_SUBJECT, body, [excel_path, os.path.join(outdir_path, "Sales_Leads.csv")])
+
+    # --------- Email the outputs (Excel + Leads CSV) ----------
+    attachments = [
+        excel_path,
+        os.path.join(outdir_path, "Sales_Leads.csv"),
+    ]
+    body = (
+        f"Auto-generated report for {Path(source_path).name}\n"
+        f"Built: {datetime.now():%Y-%m-%d %H:%M}\n"
+        f"FY/week: FY{fy_guess}/wk{current_week}\n"
+        f"Rows — status: {len(status):,} | leads: {len(leads):,}\n"
+    )
+    send_email_with_attachments(MAIL_SUBJECT, body, attachments)
+
+    leads.to_csv(os.path.join(outdir_path, "Sales_Leads.csv"), index=False)
+
+    print(
+        "Done.\n"
+        f"- Excel: {excel_path}\n"
+        f"- Sales Leads CSV: {os.path.join(outdir_path, 'Sales_Leads.csv')}\n"
+        f"- Vendor files: {len(vendor_files)} created."
+    )
+
+if __name__ == "__main__":
+    pd.options.mode.copy_on_write = True
+    main()
