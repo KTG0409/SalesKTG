@@ -644,6 +644,25 @@ class ZoneOptimizationEngine:
         print("Generating consensus-based recommendations (never up-zone)...")
 
         current_df = self.extract_zone_features(current_data_df).copy()
+        
+        # current_df already has behavior columns merged by extract_zone_features()
+        bh_cols = [
+            'repeat_buyer_rate','retention_4w','active_buyer_share',
+            'avg_freq','avg_recency','avg_margin_per_lb','BehaviorScore'
+        ]
+        # lookup by (company_combo, zone) -> dict
+        def _bh(row):
+            return {k: (None if k not in row or pd.isna(row[k]) else float(row[k])) for k in bh_cols}
+
+        # fast index by company_combo & zone
+        bh_map = {}
+        for _, r in current_df.iterrows():
+            key = (r['Company_Combo_Key'], float(r['Zone_Suffix_Numeric']))
+            bh_map[key] = _bh(r)
+
+        def get_behavior_snapshot(company_combo, zone):
+            return bh_map.get((company_combo, float(zone)), {k: None for k in bh_cols})
+
         # Build consensus map; set to True if you want DMA-specific consensus
         consensus_map = self.build_consensus_zone_by_combo(use_dma=False)
 
