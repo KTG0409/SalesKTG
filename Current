@@ -37,11 +37,21 @@ class DataConfiguration:
     pounds_py_column: str = 'Pounds PY'
     zone_column: str = 'Zone_Suffix_Numeric'
     
-    # Filtering columns (NEW!)
-    company_number_column: str = 'Company Number'  # ← ADD THIS
-    company_region_id_column: str = 'Company Region ID'    # ← ADD THIS
+    # Filtering columns
+    company_number_column: str = 'Company Number'
+    company_region_id_column: str = 'Company Region ID'
     
-    # Optional grouping columns (toggle on/off)
+    # MARGIN COLUMNS (ADD THESE!)
+    margin_cy_column: str = 'Computer Margin $ Per LB CY'
+    margin_py_column: str = 'Computer Margin $ Per LB PY'
+    has_margin_data: bool = True  
+    
+    # NET SALES COLUMNS (ADD THESE!)
+    net_sales_cy_column: str = 'Net Sales Ext $ Per LB CY'
+    net_sales_py_column: str = 'Net Sales Ext $ Per LB PY'
+    has_net_sales_data: bool = True  
+    
+    # Optional grouping columns (existing - keep as is)
     use_attribute_group: bool = True
     attribute_group_column: str = 'Attribute Group ID'
     
@@ -113,9 +123,11 @@ class InputConfiguration:
     
     # Current week data (required)
     current_data_path: str = ""
-    
     # Historical data (optional, but recommended)
-    historical_data_paths: List[str] = None
+    historical_data_paths: List[str] = [
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1325_1326.csv",
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1324_1225.csv"
+    ]
     
     # Output settings
     output_directory: str = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing"
@@ -686,6 +698,13 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
     # Get latest week for recency calculations
     max_week = df['Fiscal_Week'].max()
     
+    # ADD: Ensure margin columns if available
+    if config.data_config.has_margin_data and 'Margin_CY' in df.columns:
+        df['Margin_CY'] = pd.to_numeric(df['Margin_CY'], errors='coerce').fillna(0)
+        has_margin = True
+    else:
+        has_margin = False
+        
     # Track journeys
     journey_records = []
     
@@ -700,6 +719,12 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
         
         if len(cust_data) < 2:
             # Single purchase - classify as stable
+            
+            # Calculate average margin for this customer if available
+            avg_margin = 0
+            if has_margin:
+                avg_margin = cust_data.iloc[0]['Margin_CY']
+            
             journey_records.append({
                 'combo': combo,
                 'customer': cust_id,
@@ -708,7 +733,8 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
                 'total_volume': cust_data.iloc[0]['Pounds_CY'],
                 'weeks_active': 1,
                 'weight': 1.0,
-                'evidence': 'Single purchase - treated as stable'
+                'evidence': 'Single purchase - treated as stable',
+                'avg_margin_per_lb': avg_margin  # ✅ ADD THIS
             })
             continue
         
@@ -827,6 +853,11 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
                 # Use most significant (highest weighted) classification
                 best_change = max(zone_changes, key=lambda x: x['weight'])
                 
+                # Calculate average margin for this customer if available
+                avg_margin = 0
+                if has_margin:
+                    avg_margin = cust_data['Margin_CY'].mean()
+                
                 journey_records.append({
                     'combo': combo,
                     'customer': cust_id,
@@ -836,9 +867,10 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
                     'weeks_active': len(weeks),
                     'weight': best_change['weight'],
                     'evidence': best_change['evidence'],
-                    'zone_transitions': len(zone_changes)
+                    'zone_transitions': len(zone_changes),
+                    'avg_margin_per_lb': avg_margin  # ✅ ADD THIS
                 })
-        
+                    
         # Check if currently lapsed (for alerts)
         weeks_since_purchase = max_week - weeks[-1]
         
@@ -854,27 +886,36 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
                     journey_records[-1]['alert'] = f"Lapsed from category {int(weeks_since_purchase)} weeks ago but still buying other products"
     
     journey_df = pd.DataFrame(journey_records)
-    
+
     if not journey_df.empty:
+        # Test: Check if margin column exists and has data
+        if 'avg_margin_per_lb' in journey_df.columns:
+            non_zero_margin = (journey_df['avg_margin_per_lb'] > 0).sum()
+            print(f"      💰 Margin data captured for {non_zero_margin:,} customers")
+        
         # Summarize patterns
         pattern_counts = journey_df['customer_type'].value_counts()
         print(f"      ✅ Journey analysis complete:")
         for pattern, count in pattern_counts.items():
             pct = (count / len(journey_df)) * 100
             print(f"         • {pattern}: {count:,} ({pct:.1f}%)")
-    
+
     return journey_df
 
-def calculate_weighted_zone_scores(journey_df: pd.DataFrame) -> pd.DataFrame:
+def calculate_weighted_zone_scores(journey_df: pd.DataFrame, 
+                                   config: FoodserviceConfig) -> pd.DataFrame:
     """
     Calculate zone performance scores using weighted customer types.
     
-    Weighting:
-    - GREEN FLAG Stable: 100%
-    - GREEN FLAG Reactive Recovery: 90%
-    - YELLOW FLAG Proactive Gainer: 75%
-    - RED FLAG Proactive Flat: 0% (don't count margin giveaways)
-    - RED FLAG Lapsed: Alert only
+    WITH MARGIN (has_margin_data=True):
+    - Profit dollars (volume × margin): 50%
+    - Customer count: 30%
+    - Consistency: 20%
+    
+    WITHOUT MARGIN (has_margin_data=False):
+    - Weighted volume: 60%
+    - Customer count: 30%
+    - Consistency: 10%
     """
     
     print("   📊 Calculating weighted zone scores...")
@@ -886,19 +927,53 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame) -> pd.DataFrame:
     zone_scores = journey_df.groupby(['combo', 'primary_zone'], dropna=False).agg({
         'customer': 'nunique',
         'total_volume': 'sum',
-        'weight': 'mean',  # Average weight
+        'weight': 'mean',
         'weeks_active': 'sum'
     }).reset_index()
     
-    zone_scores.columns = ['combo', 'zone', 'customer_count', 'total_volume', 'avg_weight', 'total_weeks_active']
+    zone_scores.columns = ['combo', 'zone', 'customer_count', 'total_volume', 
+                           'avg_weight', 'total_weeks_active']
     
     # Calculate weighted volume
     zone_scores['weighted_volume'] = zone_scores['total_volume'] * zone_scores['avg_weight']
     
+    # Add margin data if available
+    if config.data_config.has_margin_data and 'avg_margin_per_lb' in journey_df.columns:
+        # Get average margin for this zone from journey data
+        margin_data = journey_df.groupby(['combo', 'primary_zone'])['avg_margin_per_lb'].mean().reset_index()
+        margin_data.columns = ['combo', 'zone', 'avg_margin_per_lb']
+        
+        zone_scores = zone_scores.merge(margin_data, on=['combo', 'zone'], how='left')
+        zone_scores['avg_margin_per_lb'] = zone_scores['avg_margin_per_lb'].fillna(0)
+        
+        # Calculate weighted profit
+        zone_scores['weighted_profit'] = zone_scores['weighted_volume'] * zone_scores['avg_margin_per_lb']
+        
+        # SCORE WITH MARGIN
+        zone_scores['Zone_Score'] = (
+            zone_scores['weighted_profit'] * 0.50 +  # Profit dollars (50%)
+            zone_scores['customer_count'] * 100 * 0.30 +  # Customer count (30%)
+            (zone_scores['total_weeks_active'] / zone_scores['customer_count'].replace(0, 1)) * 10 * 0.20  # Consistency (20%)
+        )
+        
+        print(f"      ✅ Scored {zone_scores['combo'].nunique():,} combos WITH margin data")
+        
+    else:
+        # SCORE WITHOUT MARGIN
+        zone_scores['Zone_Score'] = (
+            zone_scores['weighted_volume'] * 0.6 +
+            zone_scores['customer_count'] * 100 * 0.3 +
+            (zone_scores['total_weeks_active'] / zone_scores['customer_count'].replace(0, 1)) * 10 * 0.1
+        )
+        
+        zone_scores['avg_margin_per_lb'] = None
+        zone_scores['weighted_profit'] = None
+        
+        print(f"      ⚠️  Scored {zone_scores['combo'].nunique():,} combos WITHOUT margin")
+    
     # Get customer type breakdown per zone
     type_breakdown = journey_df.groupby(['combo', 'primary_zone', 'customer_type'], dropna=False).size().reset_index(name='count')
     
-    # Pivot to get columns for each type
     type_pivot = type_breakdown.pivot_table(
         index=['combo', 'primary_zone'],
         columns='customer_type',
@@ -906,7 +981,6 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame) -> pd.DataFrame:
         fill_value=0
     ).reset_index()
     
-    # Merge with zone scores
     zone_scores = zone_scores.merge(
         type_pivot,
         left_on=['combo', 'zone'],
@@ -914,20 +988,11 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame) -> pd.DataFrame:
         how='left'
     )
     
-    # Calculate composite score
-    zone_scores['Zone_Score'] = (
-        zone_scores['weighted_volume'] * 0.6 +  # Weighted volume (60%)
-        zone_scores['customer_count'] * 100 * 0.3 +  # Customer count (30%)
-        (zone_scores['total_weeks_active'] / zone_scores['customer_count']) * 10 * 0.1  # Consistency (10%)
-    )
-    
     # Find optimal zone per combo
     idx = zone_scores.groupby('combo')['Zone_Score'].idxmax()
     optimal_zones = zone_scores.loc[idx, ['combo', 'zone', 'Zone_Score']].rename(columns={'zone': 'optimal_zone'})
     
     zone_scores = zone_scores.merge(optimal_zones[['combo', 'optimal_zone']], on='combo', how='left')
-    
-    print(f"      ✅ Scored {zone_scores['combo'].nunique():,} combos across {len(zone_scores):,} zones")
     
     return zone_scores
 
@@ -1228,8 +1293,8 @@ class FoodserviceZoneEngine:
             'Customer_Status': lambda x: (x == 'ACTIVE_BUYER').sum(),
             'Recovery_Potential': 'sum',
             'Pounds_CY': 'sum',
-            self.config.data_config.pounds_py_column: 'sum'
-        }).reset_index()
+            'Pounds_PY': 'sum'  # ✅ Use normalized column name
+        })
         
         summary.columns = [*grouping_cols, 
                           'Total_Customers', 'Active_Customers', 'Recovery_Potential_Score',
@@ -1797,11 +1862,28 @@ def _normalize_columns(df: pd.DataFrame, config: DataConfiguration) -> pd.DataFr
     # Rename for consistency
     rename_map = {}
     
+    # Existing pound columns
     if config.pounds_cy_column in df.columns and config.pounds_cy_column != 'Pounds_CY':
         rename_map[config.pounds_cy_column] = 'Pounds_CY'
     
     if config.pounds_py_column in df.columns and config.pounds_py_column != 'Pounds_PY':
         rename_map[config.pounds_py_column] = 'Pounds_PY'
+    
+    # ADD MARGIN COLUMNS (NEW!)
+    if config.has_margin_data:
+        if config.margin_cy_column in df.columns:
+            rename_map[config.margin_cy_column] = 'Margin_CY'
+        
+        if config.margin_py_column in df.columns:
+            rename_map[config.margin_py_column] = 'Margin_PY'
+    
+    # ADD NET SALES COLUMNS (NEW!)
+    if config.has_net_sales_data:
+        if config.net_sales_cy_column in df.columns:
+            rename_map[config.net_sales_cy_column] = 'Net_Sales_CY'
+        
+        if config.net_sales_py_column in df.columns:
+            rename_map[config.net_sales_py_column] = 'Net_Sales_PY'
     
     if rename_map:
         df = df.rename(columns=rename_map)
@@ -1810,6 +1892,21 @@ def _normalize_columns(df: pd.DataFrame, config: DataConfiguration) -> pd.DataFr
     for col in ['Pounds_CY', 'Pounds_PY']:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    # ADD: Ensure numeric for margin/sales (NEW!)
+    if config.has_margin_data:
+        for col in ['Margin_CY', 'Margin_PY']:
+            if col in df.columns:
+                # Remove $ signs and commas before converting
+                df[col] = df[col].astype(str).str.replace('$', '').str.replace(',', '')
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    
+    if config.has_net_sales_data:
+        for col in ['Net_Sales_CY', 'Net_Sales_PY']:
+            if col in df.columns:
+                # Remove $ signs and commas before converting
+                df[col] = df[col].astype(str).str.replace('$', '').str.replace(',', '')
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
     # ========================================
     # EXTRACT ZONE FROM PRICE ZONE ID
