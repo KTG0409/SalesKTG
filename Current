@@ -121,13 +121,9 @@ class InputConfiguration:
     "Tell the system where your data files are. Paste the file paths here."
     """
     
-    # Current week data (required)
+    # Current week data (required)    
     current_data_path: str = ""
-    # Historical data (optional, but recommended)
-    historical_data_paths: List[str] = [
-        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1325_1326.csv",
-        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1324_1225.csv"
-    ]
+    historical_data_paths: List[str] = None  # ✅ Use None as default
     
     # Output settings
     output_directory: str = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing"
@@ -523,37 +519,71 @@ def classify_customer_activity(df: pd.DataFrame,
     df = df.copy()
     
     # Validate required columns
-    if config.data_config.last_invoice_date_column not in df.columns:
-        raise ValueError(f"❌ Missing '{config.data_config.last_invoice_date_column}' - CRITICAL!")
+    if 'Fiscal_Week' not in df.columns:
+        raise ValueError(f"❌ Missing 'Fiscal_Week' - CRITICAL!")
     
-    # Parse dates
-    df['Last_Invoice_Date'] = pd.to_datetime(
-        df[config.data_config.last_invoice_date_column], 
-        errors='coerce'
+    if 'Pounds_CY' not in df.columns:
+        raise ValueError(f"❌ Missing 'Pounds_CY' - CRITICAL!")
+    
+    # Ensure numeric
+    df['Fiscal_Week'] = pd.to_numeric(df['Fiscal_Week'], errors='coerce')
+    df['Pounds_CY'] = pd.to_numeric(df['Pounds_CY'], errors='coerce').fillna(0)
+    
+    # Get latest fiscal week
+    max_week = df['Fiscal_Week'].max()
+    
+    if pd.isna(max_week):
+        raise ValueError("❌ No valid fiscal weeks found")
+    
+    # For each customer, find their last week of buying THIS category (where Pounds_CY > 0)
+    category_purchases = df[df['Pounds_CY'] > 0].copy()
+    
+    last_category_purchase = category_purchases.groupby(
+        config.data_config.customer_id_column
+    )['Fiscal_Week'].max().reset_index()
+    last_category_purchase.columns = ['customer', 'last_category_week']
+    
+    # Merge back to main df
+    df = df.merge(
+        last_category_purchase,
+        left_on=config.data_config.customer_id_column,
+        right_on='customer',
+        how='left'
     )
-    max_date = df['Last_Invoice_Date'].max()
     
-    if pd.isna(max_date):
-        raise ValueError("❌ No valid dates in Last Invoice Date column")
+    # Calculate weeks since last category purchase
+    df['Weeks_Since_Category_Purchase'] = max_week - df['last_category_week']
     
-    df['Days_Since_Last_Purchase'] = (max_date - df['Last_Invoice_Date']).dt.days
+    # For customers who never bought (NaN), set to a high number
+    df['Weeks_Since_Category_Purchase'] = df['Weeks_Since_Category_Purchase'].fillna(999)
     
-    # Ensure numeric volume
-    if config.data_config.pounds_cy_column in df.columns:
-        df['Pounds_CY'] = pd.to_numeric(df[config.data_config.pounds_cy_column], errors='coerce').fillna(0)
+    # Get Last Invoice Date to see if they're still active buying OTHER stuff
+    if config.data_config.last_invoice_date_column in df.columns:
+        df['Last_Invoice_Date'] = pd.to_datetime(
+            df[config.data_config.last_invoice_date_column],
+            errors='coerce'
+        )
+        current_date = pd.Timestamp.now()
+        df['Days_Since_Any_Purchase'] = (current_date - df['Last_Invoice_Date']).dt.days
     else:
-        df['Pounds_CY'] = 0
+        # Fallback if no Last Invoice Date
+        df['Days_Since_Any_Purchase'] = df['Weeks_Since_Category_Purchase'] * 7
     
     # Classification logic
     def classify(row):
-        days_since = row['Days_Since_Last_Purchase']
+        weeks_since_category = row['Weeks_Since_Category_Purchase']
+        days_since_any = row['Days_Since_Any_Purchase']
         has_current_volume = row['Pounds_CY'] > 0
         
         if has_current_volume:
             return 'ACTIVE_BUYER'
-        elif days_since <= config.LAPSED_FROM_CATEGORY_DAYS:
-            return 'LAPSED_FROM_CATEGORY'  # ← THE GOLD MINE!
-        elif days_since <= config.LOST_CUSTOMER_DAYS:
+        elif weeks_since_category <= 8:  # Within 8 weeks (roughly config.LAPSED_FROM_CATEGORY_DAYS / 7)
+            # Stopped buying category recently
+            if days_since_any <= 30:
+                return 'LAPSED_FROM_CATEGORY'  # ← THE GOLD MINE! Still buying other stuff
+            else:
+                return 'RECENTLY_LOST'  # Not buying anything
+        elif weeks_since_category <= 12:  # 8-12 weeks (roughly config.LOST_CUSTOMER_DAYS / 7)
             return 'RECENTLY_LOST'
         else:
             return 'LOST_CUSTOMER'
@@ -563,7 +593,7 @@ def classify_customer_activity(df: pd.DataFrame,
     # Add recovery potential score
     df['Recovery_Potential'] = df['Customer_Status'].map({
         'ACTIVE_BUYER': 0,
-        'LAPSED_FROM_CATEGORY': 10,
+        'LAPSED_FROM_CATEGORY': 10,  # HIGH opportunity - still active, just not buying this category
         'RECENTLY_LOST': 5,
         'LOST_CUSTOMER': 0
     })
@@ -902,8 +932,122 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
 
     return journey_df
 
+def calculate_lapse_penalty(df: pd.DataFrame, config: FoodserviceConfig) -> pd.DataFrame:
+    """
+    Calculate lapse rate penalty for each combo + zone.
+    
+    Lapse rate = % of customers who:
+    - Stopped buying THIS CATEGORY (max fiscal week with Pounds CY > 0, 8+ weeks ago)
+    - BUT still active with company (Last Invoice Date is recent - buying OTHER stuff)
+    
+    This is a SIGNAL OF OVERPRICING.
+    
+    Returns: DataFrame with combo, zone, lapse_rate, lapse_penalty
+    """
+    
+    print("   🚨 Calculating lapse rate penalties...")
+    
+    df = df.copy()
+    
+    # Ensure we have required columns
+    if 'Fiscal_Week' not in df.columns:
+        print("      ⚠️  Fiscal_Week not found - skipping lapse penalty")
+        return pd.DataFrame()
+    
+    if 'Pounds_CY' not in df.columns:
+        print("      ⚠️  Pounds_CY not found - skipping lapse penalty")
+        return pd.DataFrame()
+    
+    # Get latest week overall
+    max_week = df['Fiscal_Week'].max()
+    
+    # For each customer + combo + zone, find their last purchase week in THIS category
+    # Only count weeks where they actually bought something (Pounds CY > 0)
+    category_purchases = df[df['Pounds_CY'] > 0].copy()
+    
+    if category_purchases.empty:
+        print("      ⚠️  No purchases with Pounds_CY > 0 - skipping lapse penalty")
+        return pd.DataFrame()
+    
+    customer_zones = category_purchases.groupby([
+        'Company_Combo_Key', 
+        config.data_config.zone_column,
+        config.data_config.customer_id_column
+    ], dropna=False).agg({
+        'Fiscal_Week': 'max',  # Last week they bought THIS category (with volume > 0)
+    }).reset_index()
+    
+    customer_zones.columns = ['combo', 'zone', 'customer', 'last_category_week']
+    
+    # Get Last Invoice Date for each customer (from full df, not filtered)
+    if config.data_config.last_invoice_date_column in df.columns:
+        last_invoice = df.groupby(config.data_config.customer_id_column)[
+            config.data_config.last_invoice_date_column
+        ].max().reset_index()
+        last_invoice.columns = ['customer', 'last_any_purchase_date']
+        
+        customer_zones = customer_zones.merge(last_invoice, on='customer', how='left')
+        has_invoice_date = True
+    else:
+        print("      ⚠️  Last Invoice Date column not found - using fiscal week only")
+        customer_zones['last_any_purchase_date'] = None
+        has_invoice_date = False
+    
+    # Calculate weeks since category purchase
+    customer_zones['weeks_since_category'] = max_week - customer_zones['last_category_week']
+    
+    # Calculate days since ANY purchase (if we have Last Invoice Date)
+    if has_invoice_date:
+        customer_zones['last_any_purchase_date'] = pd.to_datetime(
+            customer_zones['last_any_purchase_date'], 
+            errors='coerce'
+        )
+        
+        # Use current date as reference
+        current_date = pd.Timestamp.now()
+        customer_zones['days_since_any_purchase'] = (
+            current_date - customer_zones['last_any_purchase_date']
+        ).dt.days
+    else:
+        # Fallback: use weeks since category purchase
+        customer_zones['days_since_any_purchase'] = customer_zones['weeks_since_category'] * 7
+    
+    # Classify: LAPSED FROM CATEGORY but STILL ACTIVE buying other stuff
+    customer_zones['is_lapsed_but_active'] = (
+        (customer_zones['weeks_since_category'] >= 8) &  # Haven't bought THIS category in 8+ weeks
+        (customer_zones['days_since_any_purchase'] <= 30)  # BUT bought OTHER stuff recently (within 30 days)
+    )
+    
+    # Calculate lapse rate per combo + zone
+    lapse_rates = customer_zones.groupby(['combo', 'zone']).agg({
+        'customer': 'count',
+        'is_lapsed_but_active': 'sum'
+    }).reset_index()
+    
+    lapse_rates.columns = ['combo', 'zone', 'total_customers', 'lapsed_but_active']
+    
+    lapse_rates['lapse_rate'] = (
+        lapse_rates['lapsed_but_active'] / lapse_rates['total_customers'].replace(0, 1)
+    )
+    
+    # Calculate penalty (scaled by severity)
+    lapse_rates['lapse_penalty'] = lapse_rates['lapse_rate'] * 50000
+    
+    print(f"      ✅ Calculated lapse penalties for {len(lapse_rates):,} combo-zone pairs")
+    
+    # Show worst offenders
+    worst = lapse_rates.nlargest(5, 'lapse_rate')
+    if not worst.empty:
+        print(f"      ⚠️  Highest lapse rates:")
+        for _, row in worst.iterrows():
+            if row['lapse_rate'] > 0:
+                print(f"         • {row['combo']} Zone {int(row['zone'])}: {row['lapse_rate']:.1%} lapsed but active elsewhere")
+    
+    return lapse_rates[['combo', 'zone', 'lapse_rate', 'lapse_penalty']]
+
 def calculate_weighted_zone_scores(journey_df: pd.DataFrame, 
-                                   config: FoodserviceConfig) -> pd.DataFrame:
+                                   config: FoodserviceConfig,
+                                   lapse_penalty_df: pd.DataFrame = None) -> pd.DataFrame:  # ✅ Add parameter
     """
     Calculate zone performance scores using weighted customer types.
     
@@ -936,7 +1080,20 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame,
     
     # Calculate weighted volume
     zone_scores['weighted_volume'] = zone_scores['total_volume'] * zone_scores['avg_weight']
-    
+
+    # ADD LAPSE RATE PENALTY (NEW!)
+    if lapse_penalty_df is not None and not lapse_penalty_df.empty:
+        zone_scores = zone_scores.merge(
+            lapse_penalty_df,
+            on=['combo', 'zone'],
+            how='left'
+        )
+        zone_scores['lapse_penalty'] = zone_scores['lapse_penalty'].fillna(0)
+        zone_scores['lapse_rate'] = zone_scores['lapse_rate'].fillna(0)
+    else:
+        zone_scores['lapse_penalty'] = 0
+        zone_scores['lapse_rate'] = 0
+ 
     # Add margin data if available
     if config.data_config.has_margin_data and 'avg_margin_per_lb' in journey_df.columns:
         # Get average margin for this zone from journey data
@@ -949,11 +1106,12 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame,
         # Calculate weighted profit
         zone_scores['weighted_profit'] = zone_scores['weighted_volume'] * zone_scores['avg_margin_per_lb']
         
-        # SCORE WITH MARGIN
+        # SCORE WITHOUT MARGIN
         zone_scores['Zone_Score'] = (
-            zone_scores['weighted_profit'] * 0.50 +  # Profit dollars (50%)
-            zone_scores['customer_count'] * 100 * 0.30 +  # Customer count (30%)
-            (zone_scores['total_weeks_active'] / zone_scores['customer_count'].replace(0, 1)) * 10 * 0.20  # Consistency (20%)
+            zone_scores['weighted_volume'] * 0.6 +
+            zone_scores['customer_count'] * 100 * 0.3 +
+            (zone_scores['total_weeks_active'] / zone_scores['customer_count'].replace(0, 1)) * 10 * 0.1
+            - zone_scores['lapse_penalty']  # ✅ SUBTRACT PENALTY!
         )
         
         print(f"      ✅ Scored {zone_scores['combo'].nunique():,} combos WITH margin data")
@@ -1288,23 +1446,49 @@ class FoodserviceZoneEngine:
         grouping_cols = self.config.data_config.get_grouping_columns()
         grouping_cols.append(self.config.data_config.zone_column)
         
-        summary = df.groupby(grouping_cols, dropna=False).agg({
+        # ✅ FILTER to only columns that exist in the DataFrame
+        grouping_cols = [col for col in grouping_cols if col in df.columns]
+        
+        # Check if we have required columns
+        agg_dict = {
             self.config.data_config.customer_id_column: 'nunique',
-            'Customer_Status': lambda x: (x == 'ACTIVE_BUYER').sum(),
-            'Recovery_Potential': 'sum',
-            'Pounds_CY': 'sum',
-            'Pounds_PY': 'sum'  # ✅ Use normalized column name
-        })
+        }
         
-        summary.columns = [*grouping_cols, 
-                          'Total_Customers', 'Active_Customers', 'Recovery_Potential_Score',
-                          'Volume_CY', 'Volume_PY']
+        # Only add columns that exist
+        if 'Customer_Status' in df.columns:
+            agg_dict['Customer_Status'] = lambda x: (x == 'ACTIVE_BUYER').sum()
+        if 'Recovery_Potential' in df.columns:
+            agg_dict['Recovery_Potential'] = 'sum'
+        if 'Pounds_CY' in df.columns:
+            agg_dict['Pounds_CY'] = 'sum'
+        if 'Pounds_PY' in df.columns:
+            agg_dict['Pounds_PY'] = 'sum'
         
-        # Calculate key metrics
-        summary['Lapsed_Customers'] = summary['Total_Customers'] - summary['Active_Customers']
-        summary['Lapsed_Pct'] = summary['Lapsed_Customers'] / summary['Total_Customers']
-        summary['Volume_Change'] = summary['Volume_CY'] - summary['Volume_PY']
-        summary['Volume_Change_Pct'] = summary['Volume_Change'] / summary['Volume_PY'].replace(0, 1)
+        summary = df.groupby(grouping_cols, dropna=False).agg(agg_dict).reset_index()
+        
+        # Build column names dynamically based on what we actually aggregated
+        new_columns = list(grouping_cols)
+        new_columns.append('Total_Customers')
+        
+        if 'Customer_Status' in df.columns:
+            new_columns.append('Active_Customers')
+        if 'Recovery_Potential' in df.columns:
+            new_columns.append('Recovery_Potential_Score')
+        if 'Pounds_CY' in df.columns:
+            new_columns.append('Volume_CY')
+        if 'Pounds_PY' in df.columns:
+            new_columns.append('Volume_PY')
+        
+        summary.columns = new_columns
+        
+        # Calculate derived metrics only if we have the required columns
+        if 'Active_Customers' in summary.columns:
+            summary['Lapsed_Customers'] = summary['Total_Customers'] - summary['Active_Customers']
+            summary['Lapsed_Pct'] = summary['Lapsed_Customers'] / summary['Total_Customers']
+        
+        if 'Volume_CY' in summary.columns and 'Volume_PY' in summary.columns:
+            summary['Volume_Change'] = summary['Volume_CY'] - summary['Volume_PY']
+            summary['Volume_Change_Pct'] = summary['Volume_Change'] / summary['Volume_PY'].replace(0, 1)
         
         return summary
         
@@ -1318,13 +1502,21 @@ class FoodserviceZoneEngine:
         # Track journeys in historical data
         journey_df = pd.DataFrame()
         zone_scores = pd.DataFrame()
-        
+        lapse_penalty_df = pd.DataFrame()  # ✅ ADD THIS
+
         if historical_df is not None:
             print("\n🔄 Analyzing customer zone journeys...")
             journey_df = track_customer_zone_journeys(historical_df, self.config)
             
+            # ✅ ADD THIS: Calculate lapse penalties
+            lapse_penalty_df = calculate_lapse_penalty(historical_df, self.config)
+            
             if not journey_df.empty:
-                zone_scores = calculate_weighted_zone_scores(journey_df)
+                zone_scores = calculate_weighted_zone_scores(
+                    journey_df, 
+                    self.config,
+                    lapse_penalty_df  # ✅ PASS IT IN!
+                )
         
         recommendations = []
         
@@ -1334,132 +1526,133 @@ class FoodserviceZoneEngine:
             combo_data = current_df[current_df['Company_Combo_Key'] == combo]
             
             # Get current zone (most common zone in current week)
-            current_zone = combo_data['Zone_Suffix_Numeric'].mode().iloc[0] if len(combo_data) > 0 else 5
-            
-            # Get optimal zone from scoring
-            optimal_zone = current_zone  # Default
-            
-            if not zone_scores.empty:
-                combo_score = zone_scores[zone_scores['combo'] == combo]
-                if not combo_score.empty:
-                    optimal_zone = combo_score.iloc[0]['optimal_zone']
-            
-            # Never recommend up-zoning
-            if optimal_zone > current_zone:
-                optimal_zone = current_zone
-            
-            # Get customer counts
-            total_customers = combo_data[self.config.data_config.customer_id_column].nunique()
-            
-            customer_status = combo_data.groupby(self.config.data_config.customer_id_column)['Customer_Status'].first()
-            active_customers = (customer_status == 'ACTIVE_BUYER').sum()
-            lapsed_customers = (customer_status == 'LAPSED_FROM_CATEGORY').sum()
-            lapsed_pct = lapsed_customers / total_customers if total_customers > 0 else 0
-            
-            total_volume = combo_data['Pounds_CY'].sum()
-            
-            # Get journey evidence for this combo
-            combo_journey = journey_df[journey_df['combo'] == combo] if not journey_df.empty else pd.DataFrame()
-            
-            green_flag_count = 0
-            reactive_recovery_count = 0
-            margin_giveaway_count = 0
-            
-            if not combo_journey.empty:
-                green_flag_count = len(combo_journey[combo_journey['customer_type'].str.contains('GREEN_FLAG', na=False)])
-                reactive_recovery_count = len(combo_journey[combo_journey['customer_type'] == 'GREEN_FLAG_REACTIVE_RECOVERY'])
-                margin_giveaway_count = len(combo_journey[combo_journey['customer_type'] == 'RED_FLAG_PROACTIVE_FLAT'])
-            
-            # Build recommendation
-            rec = {
-                'company_combo': combo,
-                'company_name': combo_data[self.config.data_config.company_column].iloc[0],
-                'cuisine': combo_data.get(self.config.data_config.cuisine_column, pd.Series(['N/A'])).iloc[0] if self.config.data_config.use_cuisine else 'N/A',
-                'attribute_group': combo_data.get(self.config.data_config.attribute_group_column, pd.Series(['N/A'])).iloc[0] if self.config.data_config.use_attribute_group else 'N/A',
-                'current_zone': int(current_zone),
-                'recommended_zone': int(optimal_zone),
-                'total_customers': int(total_customers),
-                'active_customers': int(active_customers),
-                'lapsed_customers': int(lapsed_customers),
-                'lapsed_pct': lapsed_pct,
-                'total_volume': float(total_volume),
-                'green_flag_customers': int(green_flag_count),
-                'reactive_recovery_customers': int(reactive_recovery_count),
-                'margin_giveaway_count': int(margin_giveaway_count),
-                'implementation_priority': 0
-            }
-            
-            # Determine recommendation type
-            if lapsed_pct >= 0.30 and current_zone > optimal_zone:
-                # HIGH RECOVERY POTENTIAL
-                rec.update({
-                    'recommendation_type': 'HIGH_RECOVERY_POTENTIAL',
-                    'stakeholder_message': (
-                        f"🎯 EASY WIN: {lapsed_customers} customers stopped buying but still order other items. "
-                        f"Zone {int(current_zone)} is too high. Move to Zone {int(optimal_zone)} - "
-                        f"{reactive_recovery_count} customers proved this works by coming back after we lowered pricing."
-                    ),
-                    'expected_result': f"Win back {int(lapsed_customers * 0.6)} customers = +{int(total_volume * 0.3):,} lbs",
-                    'timeline': '⚡ 2-4 weeks',
-                    'risk_level': '✅ LOW',
-                    'implementation_priority': 90
-                })
-            
-            elif reactive_recovery_count >= 5 and current_zone > optimal_zone:
-                # PROVEN BY REACTIVE RECOVERY
-                rec.update({
-                    'recommendation_type': 'REACTIVE_CORRECTION',
-                    'stakeholder_message': (
-                        f"⚠️ Historical data shows {reactive_recovery_count} customers lapsed at Zone {int(current_zone)}, "
-                        f"then came back at Zone {int(optimal_zone)}. This proves Zone {int(current_zone)} was wrong."
-                    ),
-                    'expected_result': f"Recover lapsed customers = +{int(total_volume * 0.2):,} lbs",
-                    'timeline': '📅 4-6 weeks',
-                    'risk_level': '✅ LOW',
-                    'implementation_priority': 85
-                })
-            
-            elif green_flag_count >= 10 and current_zone > optimal_zone:
-                # STABLE PERFORMERS AT LOWER ZONE
-                rec.update({
-                    'recommendation_type': 'GREEN_FLAG_ZONE',
-                    'stakeholder_message': (
-                        f"🟢 {green_flag_count} customers are stable, consistent buyers at Zone {int(optimal_zone)}. "
-                        f"Move Zone {int(current_zone)} customers down to match them."
-                    ),
-                    'expected_result': f"Match stable performers = +{int(total_volume * 0.15):,} lbs",
-                    'timeline': '📅 4-6 weeks',
-                    'risk_level': '✅ LOW',
-                    'implementation_priority': 80
-                })
-            
-            elif current_zone == optimal_zone:
-                # HOLD
-                rec.update({
-                    'recommendation_type': 'HOLD',
-                    'stakeholder_message': f"Current zone matches optimal zone",
-                    'expected_result': 'Maintain current performance',
-                    'timeline': 'Monitor monthly',
-                    'risk_level': '✅ LOW',
-                    'implementation_priority': 20
-                })
-            
+            zone_mode = combo_data['Zone_Suffix_Numeric'].mode()
+            if len(zone_mode) > 0:
+                current_zone = zone_mode.iloc[0]
             else:
-                # LOWER PRIORITY
-                rec.update({
-                    'recommendation_type': 'MONITOR',
-                    'stakeholder_message': f"Zone {int(current_zone)} performing adequately",
-                    'expected_result': 'Continue monitoring',
-                    'timeline': 'Review quarterly',
-                    'risk_level': '✅ LOW',
-                    'implementation_priority': 30
-                })
-            
-            # Add margin giveaway warning
-            if margin_giveaway_count > 0:
-                rec['warning'] = f"⚠️ {margin_giveaway_count} customers were moved down but didn't increase volume - margin giveaway"
+                # No valid zones found, use default
+                current_zone = 5
+                
+                # Get optimal zone from scoring
+                optimal_zone = current_zone  # Default
+                
+                if not zone_scores.empty:
+                    combo_score = zone_scores[zone_scores['combo'] == combo]
+                    if not combo_score.empty:
+                        optimal_zone = combo_score.iloc[0]['optimal_zone']
+                
+                # Never recommend up-zoning
+                if optimal_zone > current_zone:
+                    optimal_zone = current_zone
+                
+                # Get customer counts
+                total_customers = combo_data[self.config.data_config.customer_id_column].nunique()
+                
+                customer_status = combo_data.groupby(self.config.data_config.customer_id_column)['Customer_Status'].first()
+                active_customers = (customer_status == 'ACTIVE_BUYER').sum()
+                lapsed_customers = (customer_status == 'LAPSED_FROM_CATEGORY').sum()
+                lapsed_pct = lapsed_customers / total_customers if total_customers > 0 else 0
+                
+                total_volume = combo_data['Pounds_CY'].sum()
+                
+                # Get journey evidence for this combo
+                combo_journey = journey_df[journey_df['combo'] == combo] if not journey_df.empty else pd.DataFrame()
+                
+                green_flag_count = 0
+                reactive_recovery_count = 0
+                margin_giveaway_count = 0
+                
+                if not combo_journey.empty:
+                    green_flag_count = len(combo_journey[combo_journey['customer_type'].str.contains('GREEN_FLAG', na=False)])
+                    reactive_recovery_count = len(combo_journey[combo_journey['customer_type'] == 'GREEN_FLAG_REACTIVE_RECOVERY'])
+                    margin_giveaway_count = len(combo_journey[combo_journey['customer_type'] == 'RED_FLAG_PROACTIVE_FLAT'])
+                
+                # Build recommendation
+                rec = {
+                    'company_combo': combo,
+                    'company_name': combo_data[self.config.data_config.company_column].iloc[0],
+                    'cuisine': combo_data.get(self.config.data_config.cuisine_column, pd.Series(['N/A'])).iloc[0] if self.config.data_config.use_cuisine else 'N/A',
+                    'attribute_group': combo_data.get(self.config.data_config.attribute_group_column, pd.Series(['N/A'])).iloc[0] if self.config.data_config.use_attribute_group else 'N/A',
+                    'current_zone': int(current_zone),
+                    'recommended_zone': int(optimal_zone),
+                    'total_customers': int(total_customers),
+                    'active_customers': int(active_customers),
+                    'lapsed_customers': int(lapsed_customers),
+                    'lapsed_pct': lapsed_pct,
+                    'total_volume': float(total_volume),
+                    'green_flag_customers': int(green_flag_count),
+                    'reactive_recovery_customers': int(reactive_recovery_count),
+                    'margin_giveaway_count': int(margin_giveaway_count),
+                    'implementation_priority': 0
+                }
+                
+                # Determine recommendation type
+                if lapsed_pct >= 0.30 and current_zone > optimal_zone:
+                    # HIGH RECOVERY POTENTIAL
+                    rec.update({
+                        'recommendation_type': 'HIGH_RECOVERY_POTENTIAL',
+                        'stakeholder_message': (
+                            f"🎯 EASY WIN: {lapsed_customers} customers stopped buying but still order other items. "
+                            f"Zone {int(current_zone)} is too high. Move to Zone {int(optimal_zone)} - "
+                            f"{reactive_recovery_count} customers proved this works by coming back after we lowered pricing."
+                        ),
+                        'expected_result': f"Win back {int(lapsed_customers * 0.6)} customers = +{int(total_volume * 0.3):,} lbs",
+                        'timeline': '⚡ 2-4 weeks',
+                        'risk_level': '✅ LOW',
+                        'implementation_priority': 90
+                    })
+                
+                elif reactive_recovery_count >= 5 and current_zone > optimal_zone:
+                    # PROVEN BY REACTIVE RECOVERY
+                    rec.update({
+                        'recommendation_type': 'REACTIVE_CORRECTION',
+                        'stakeholder_message': (
+                            f"⚠️ Historical data shows {reactive_recovery_count} customers lapsed at Zone {int(current_zone)}, "
+                            f"then came back at Zone {int(optimal_zone)}. This proves Zone {int(current_zone)} was wrong."
+                        ),
+                        'expected_result': f"Recover lapsed customers = +{int(total_volume * 0.2):,} lbs",
+                        'timeline': '📅 4-6 weeks',
+                        'risk_level': '✅ LOW',
+                        'implementation_priority': 85
+                    })
+                
+                elif green_flag_count >= 10 and current_zone > optimal_zone:
+                    # STABLE PERFORMERS AT LOWER ZONE
+                    rec.update({
+                        'recommendation_type': 'GREEN_FLAG_ZONE',
+                        'stakeholder_message': (
+                            f"🟢 {green_flag_count} customers are stable, consistent buyers at Zone {int(optimal_zone)}. "
+                            f"Move Zone {int(current_zone)} customers down to match them."
+                        ),
+                        'expected_result': f"Match stable performers = +{int(total_volume * 0.15):,} lbs",
+                        'timeline': '📅 4-6 weeks',
+                        'risk_level': '✅ LOW',
+                        'implementation_priority': 80
+                    })
+                
+                elif current_zone == optimal_zone:
+                    # HOLD - Skip these (already optimal, all green flags)
+                    continue  # ✅ Don't add to recommendations list
+                
+                else:
+                    # LOWER PRIORITY
+                    rec.update({
+                        'recommendation_type': 'MONITOR',
+                        'stakeholder_message': f"Zone {int(current_zone)} performing adequately",
+                        'expected_result': 'Continue monitoring',
+                        'timeline': 'Review quarterly',
+                        'risk_level': '✅ LOW',
+                        'implementation_priority': 30
+                    })
+                
+                # Add margin giveaway warning
+                if margin_giveaway_count > 0:
+                    rec['warning'] = f"⚠️ {margin_giveaway_count} customers were moved down but didn't increase volume - margin giveaway"
             
             recommendations.append(rec)
+        
+        # Filter out any same-zone recommendations (already optimal)
+        recommendations = [r for r in recommendations if r['current_zone'] != r['recommended_zone']]
         
         # Sort by priority
         recommendations = sorted(recommendations, key=lambda x: x['implementation_priority'], reverse=True)
@@ -1861,15 +2054,19 @@ def _normalize_columns(df: pd.DataFrame, config: DataConfiguration) -> pd.DataFr
     
     # Rename for consistency
     rename_map = {}
-    
+
     # Existing pound columns
     if config.pounds_cy_column in df.columns and config.pounds_cy_column != 'Pounds_CY':
         rename_map[config.pounds_cy_column] = 'Pounds_CY'
-    
+
     if config.pounds_py_column in df.columns and config.pounds_py_column != 'Pounds_PY':
         rename_map[config.pounds_py_column] = 'Pounds_PY'
-    
-    # ADD MARGIN COLUMNS (NEW!)
+
+    # ADD LAST INVOICE DATE (NEW!)
+    if config.last_invoice_date_column in df.columns and config.last_invoice_date_column != 'Last_Invoice_Date':
+        rename_map[config.last_invoice_date_column] = 'Last_Invoice_Date'
+
+    # ADD MARGIN COLUMNS (existing)
     if config.has_margin_data:
         if config.margin_cy_column in df.columns:
             rename_map[config.margin_cy_column] = 'Margin_CY'
@@ -1968,7 +2165,33 @@ def _normalize_columns(df: pd.DataFrame, config: DataConfiguration) -> pd.DataFr
     else:
         df['Company_Combo_Key'] = 'DEFAULT'
     
+    # ========================================
+    # CREATE COMBINED FISCAL WEEK (YYYYWW)
+    # ========================================
+    if config.fiscal_week_column in df.columns:
+        print("   📅 Creating combined fiscal week identifier...")
+        
+        df['Fiscal_Week'] = pd.to_numeric(df[config.fiscal_week_column], errors='coerce').fillna(0).astype(int)
+        
+        # If we have fiscal year, create combined identifier for year-boundary handling
+        if 'Fiscal Year Key' in df.columns:
+            df['Fiscal_Year'] = pd.to_numeric(df['Fiscal Year Key'], errors='coerce').fillna(0).astype(int)
+            
+            # Create YYYYWW format for proper sorting across years
+            df['Fiscal_Week_Combined'] = (df['Fiscal_Year'] * 100 + df['Fiscal_Week']).astype(int)
+            
+            print(f"      ✅ Combined fiscal identifier created:")
+            print(f"         Latest: Year {df['Fiscal_Year'].max()}, Week {df['Fiscal_Week'].max()} (Combined: {df['Fiscal_Week_Combined'].max()})")
+        else:
+            df['Fiscal_Week_Combined'] = df['Fiscal_Week']
+            print(f"      ✅ Using fiscal week only (no year column found)")
+    else:
+        print("   ⚠️  No Fiscal Week column found")
+        df['Fiscal_Week'] = 0
+        df['Fiscal_Week_Combined'] = 0
+        
     return df
+
 
 # ============================================================================
 # BULLETPROOF EXCEL FORMATTING (NO STAKEHOLDER ACTION NEEDED)
@@ -2567,10 +2790,10 @@ if __name__ == "__main__":
         use_attribute_group=True,
         attribute_group_column='Attribute Group ID',
         
-        use_business_center=True,
+        use_business_center=False,
         business_center_column='Business Center ID',
         
-        use_item_group=True,
+        use_item_group=False,
         item_group_column='Item Group ID',
         
         use_price_source=True,
@@ -2578,8 +2801,8 @@ if __name__ == "__main__":
     )
     
     HISTORICAL_DATA = [
-        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\historical_shrimp_1.csv",
-        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\historical_shrimp_2.csv"
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1325_1326.csv",
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\groundfish_1324_1225.csv"
     ]
     
     # ==========================================
