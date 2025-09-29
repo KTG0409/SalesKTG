@@ -1,0 +1,2137 @@
+#!/usr/bin/env python3
+"""
+Zone Optimization Script v7 - Complete Implementation with Historical Analysis
+Integrates zone optimization analysis into your existing category analysis pipeline.
+
+Enhanced for 6-week accelerated timeline using 2+ years of historical data.
+Designed specifically for customer-week level data aggregation.
+"""
+
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+from collections import defaultdict, deque
+import json
+import warnings
+import os
+warnings.filterwarnings('ignore')
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
+from openpyxl.styles.differential import DifferentialStyle
+from openpyxl.formatting.rule import ColorScaleRule, CellIsRule, FormulaRule, DataBarRule, Rule
+
+out_dir = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing"
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")   # e.g. 20250924_141530
+excel_path = os.path.join(out_dir, f"zone_dashboard_{ts}.xlsx")
+
+
+# module-level config 
+ALLOW_UPZONE_EPSILON = 0.01
+
+def autofit_worksheet(ws, max_width=60, sample_rows=800):
+    """
+    Auto size columns based on sampled cell lengths.
+    Wrap text and top align for readability.
+    """
+    # Column widths
+    for col_cells in ws.columns:
+        try:
+            first = col_cells[0]
+        except IndexError:
+            continue
+        letter = get_column_letter(first.column)
+        lengths = []
+        for c in col_cells[:sample_rows]:
+            v = c.value
+            if v is None:
+                lengths.append(0)
+            else:
+                s = str(v)
+                s = s.replace("\n", " ")
+                lengths.append(len(s))
+        width = min(max(lengths + [10]), max_width)
+        ws.column_dimensions[letter].width = width
+
+    # Wrap and top align
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(wrap_text=True, vertical="top")
+
+# simple scope filter (CPA-only + exclude exceptions/discounts)
+def _apply_scope_filters(df: pd.DataFrame, cpa_only=True, exclude_exceptions=True) -> pd.DataFrame:
+    out = df.copy()
+    if cpa_only and 'Price Source Type' in out.columns:
+        out = out[out['Price Source Type'].astype(str).str.upper().eq('CPA')]
+    if exclude_exceptions:
+        for col in ['Exception Indicator','Discount Indicator']:
+            if col in out.columns:
+                out = out[~out[col].astype(str).str.upper().isin(['Y','1','TRUE'])]
+    return out
+
+
+def _col_index_by_header(ws, header_text: str) -> int:
+    """Return 1-based column index for the first cell in row 1 that matches header_text."""
+    for c in range(1, ws.max_column + 1):
+        if (ws.cell(1, c).value or "").strip() == header_text:
+            return c
+    return -1
+
+def _add_delta_column(ws, left_header: str, right_header: str, new_header: str) -> int:
+    """
+    Add a column computing right - left. Returns the new column index.
+    """
+    left_c = _col_index_by_header(ws, left_header)
+    right_c = _col_index_by_header(ws, right_header)
+    if left_c < 0 or right_c < 0:
+        return -1
+    new_c = ws.max_column + 1
+    ws.cell(1, new_c, new_header)
+    for r in range(2, ws.max_row + 1):
+        ws.cell(r, new_c, f"={get_column_letter(right_c)}{r}-{get_column_letter(left_c)}{r}")
+    return new_c
+
+
+class ZoneOptimizationEngine:
+    """
+    Learns optimal zone suffixes for each Company + NPD Cuisine + Attribute Group combination
+    to maximize volume and customer count growth, accepting margin sacrifice when overpriced.
+    Enhanced for historical analysis with 2+ years of data for accelerated implementation.
+    """
+    def build_consensus_zone_by_combo(self, use_dma: bool = False) -> dict:
+        """
+        Build a 'consensus' zone per combo from historical patterns.
+        Consensus = the most frequently 'historical_best_zone' across sites.
+        Excludes zone 0 from voting. Rounds to int zone buckets.
+        """
+        from collections import Counter, defaultdict
+
+        votes = defaultdict(Counter)
+        # hist entry has: company_name, combo_key, historical_best_zone, proven_pattern, ...
+        for combo_id, pat in getattr(self, "historical_patterns", {}).items():
+            z = pat.get('historical_best_zone', None)
+            if z is None:
+                continue
+            z = int(round(float(z)))
+            if z <= 0:
+                continue  # do not vote for zone 0
+            # Base key = Cuisine + AG + Price Source
+            # pat['combo_key'] already like "Cuisine_AG_CPA" from your pipeline
+            base_key = pat.get('combo_key', 'UNK')
+            key = base_key
+
+            # Optional DMA toggle
+            if use_dma:
+                # Prepend/append DMA from combo_id if present: "Company + '_' + combo_key"
+                # Your combo_id format: "Company Name_Cuisine_AG_CPA"
+                parts = str(combo_id).split('_', 1)
+                dma = parts[0] if parts else "UNK"
+                key = f"{base_key}__DMA:{dma}"
+
+            votes[key][z] += 1
+
+        consensus = {}
+        for k, counter in votes.items():
+            if not counter:
+                consensus[k] = 1  # safe default
+                continue
+            # pick most common zone, tie-breaker -> smallest zone (cheaper)
+            most_common = counter.most_common()
+            top_count = most_common[0][1]
+            candidates = [z for z, c in most_common if c == top_count]
+            consensus[k] = int(min(candidates))
+        return consensus
+
+    def _winsorize(self, s: pd.Series, p_low=0.05, p_high=0.95):
+        if s.empty:
+            return s
+        lo, hi = s.quantile(p_low), s.quantile(p_high)
+        return s.clip(lower=lo, upper=hi)
+
+    def _normalize_01(self, s: pd.Series):
+        if s.empty:
+            return s
+        lo, hi = s.min(), s.max()
+        if pd.isna(lo) or pd.isna(hi) or hi <= lo:
+            return pd.Series(np.zeros(len(s)), index=s.index)
+        return (s - lo) / (hi - lo)
+
+
+    def _compute_behavior_signals(self, df: pd.DataFrame, window_weeks: int = None) -> pd.DataFrame:
+        """
+        Build behavior signals at (Company, Cuisine, AG, Price Source, Zone) level
+        over a trailing window of fiscal weeks (default 12).
+        Required columns in df (best case, customer-week rows):
+        - 'Company Name', 'NPD Cuisine Type', 'Attribute Group ID', 'Price Source Type'
+        - 'Zone_Suffix_Numeric' (we create it earlier if needed)
+        - 'Company Customer Number'
+        - 'Fiscal Week Number'
+        - 'Pounds_CY' (numeric)
+        - 'Computer Margin $ Per LB CY' (optional but useful)
+        Fallback if you only have invoices: aggregate to customer-week first.
+        """
+        window_weeks = window_weeks or self.behavior_window_weeks
+
+        # Guard: need at least week and customer id to compute repeat
+        needed = {'Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type',
+                'Zone_Suffix_Numeric','Company Customer Number','Fiscal Week Number'}
+        if not needed.issubset(set(df.columns)):
+            # graceful empty return -> no change to downstream logic
+            return pd.DataFrame(columns=[
+                'Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type','Zone_Suffix_Numeric',
+                'active_customers','repeat_buyer_rate','active_buyer_share','avg_freq',
+                'avg_recency','retention_4w','avg_margin_per_lb','lbs'
+            ])
+
+        # Keep CPA only if present in scope
+        if 'Price Source Type' in df.columns:
+            df = df[df['Price Source Type'].astype(str).str.upper().eq('CPA')]
+
+        # Restrict to trailing window if full history exists (optional; many inputs are pre-windowed already)
+        if 'Fiscal Week Number' in df.columns and df['Fiscal Week Number'].notna().any():
+            max_wk = pd.to_numeric(df['Fiscal Week Number'], errors='coerce').max()
+            df = df[pd.to_numeric(df['Fiscal Week Number'], errors='coerce') >= (max_wk - window_weeks + 1)]
+
+        # If you have invoice-level rows (multiple per customer per week), roll to customer-week
+        # Detect granularity by checking duplicates of (cust, week, combo+zone)
+        keys_cw = ['Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type',
+                'Zone_Suffix_Numeric','Company Customer Number','Fiscal Week Number']
+        dup_mask = df.duplicated(keys_cw)
+        if dup_mask.any():
+            grp = df.groupby(keys_cw, dropna=False).agg(
+                Pounds_CY=('Pounds_CY','sum') if 'Pounds_CY' in df.columns else ('Fiscal Week Number','size'),
+                margin_per_lb=('Computer Margin $ Per LB CY','mean') if 'Computer Margin $ Per LB CY' in df.columns else ('Pounds_CY','size')
+            ).reset_index()
+        else:
+            # Already at customer-week
+            grp = df.copy()
+            if 'Pounds_CY' not in grp.columns:
+                grp['Pounds_CY'] = 0.0
+            if 'Computer Margin $ Per LB CY' in grp.columns:
+                grp['margin_per_lb'] = grp['Computer Margin $ Per LB CY']
+            else:
+                grp['margin_per_lb'] = np.nan
+
+        # We need Pounds_CY numeric and an "active" flag (>0 lbs)
+        if 'Pounds_CY' not in grp.columns:
+            grp['Pounds_CY'] = 0.0
+        grp['Pounds_CY'] = pd.to_numeric(grp['Pounds_CY'], errors='coerce').fillna(0.0)
+
+        grp['active_flag'] = (grp['Pounds_CY'] > 0).astype(int)
+
+        # Keep ALL rows (to detect lapsed customers), but separate ACTIVE rows for behavior
+        cw_all = grp.copy()
+        cw_pos = grp[grp['active_flag'] == 1].copy()
+
+        cust_keys = [
+            'Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type',
+            'Zone_Suffix_Numeric','Company Customer Number'
+        ]
+
+        # ---- Customer-level metrics in 12w window ----
+        # Active base: only >0 lb weeks
+        by_cust_pos = (cw_pos.groupby(cust_keys, dropna=False)
+                        .agg(weeks_active=('Fiscal Week Number','nunique'),
+                            purchases_12w=('Fiscal Week Number','count'),
+                            lbs_12w=('Pounds_CY','sum'),
+                            avg_margin_per_lb=('margin_per_lb','mean'))
+                        .reset_index())
+        by_cust_pos['repeat_flag'] = (by_cust_pos['weeks_active'] >= 2).astype(int)
+
+        # Seen base: customers present in the window (even if zero lbs → for lapse)
+        by_cust_all = (cw_all.groupby(cust_keys, dropna=False)
+                        .agg(weeks_seen=('Fiscal Week Number','nunique'))
+                        .reset_index())
+
+        # Merge active + seen to identify lapsed
+        by_cust = by_cust_all.merge(by_cust_pos, on=cust_keys, how='left')
+        for c in ['weeks_active','purchases_12w','lbs_12w','avg_margin_per_lb','repeat_flag']:
+            if c not in by_cust.columns:
+                by_cust[c] = 0
+        by_cust['active_any'] = (by_cust['weeks_active'] > 0).astype(int)
+        by_cust['lapsed_flag'] = ((by_cust['weeks_seen'] > 0) & (by_cust['active_any'] == 0)).astype(int)
+
+        # Recency & 4w retention based on ACTIVE weeks only
+        if not cw_pos.empty and cw_pos['Fiscal Week Number'].notna().any():
+            max_wk = pd.to_numeric(cw_pos['Fiscal Week Number'], errors='coerce').max()
+
+            last_wk = (cw_pos.groupby(cust_keys, dropna=False)['Fiscal Week Number']
+                            .max().rename('last_active_wk').reset_index())
+            by_cust = by_cust.merge(last_wk, on=cust_keys, how='left')
+            by_cust['recency_weeks'] = (max_wk - by_cust['last_active_wk']).clip(lower=0)
+            by_cust['recency_weeks'] = by_cust['recency_weeks'].fillna(np.inf)
+
+            recent_cut = max_wk - 3
+            recent = cw_pos[cw_pos['Fiscal Week Number'] >= recent_cut]
+            early  = cw_pos[cw_pos['Fiscal Week Number'] <  recent_cut]
+            rec_a = recent.groupby(cust_keys, dropna=False)['Fiscal Week Number'].nunique().rename('recent_active_weeks')
+            rec_b = early.groupby(cust_keys,  dropna=False)['Fiscal Week Number'].nunique().rename('early_active_weeks')
+            tmp = rec_a.to_frame().merge(rec_b, left_index=True, right_index=True, how='left').fillna(0)
+            tmp['retained_4w_flag'] = ((tmp['recent_active_weeks'] > 0) & (tmp['early_active_weeks'] > 0)).astype(int)
+            by_cust = by_cust.merge(tmp['retained_4w_flag'].reset_index(), on=cust_keys, how='left').fillna({'retained_4w_flag':0})
+        else:
+            by_cust['recency_weeks'] = np.inf
+            by_cust['retained_4w_flag'] = 0
+
+        # ---- Aggregate to combo+zone level ----
+        zkeys = ['Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type','Zone_Suffix_Numeric']
+
+        active_base = by_cust.groupby(zkeys, dropna=False)['active_any'].sum().rename('active_customers')
+        seen_base   = by_cust.groupby(zkeys, dropna=False)['weeks_seen'].apply(lambda s: s.gt(0).sum()).rename('seen_customers')
+        repeat_buyers = by_cust.groupby(zkeys, dropna=False)['repeat_flag'].sum().rename('repeat_buyers')
+        retained_4w   = by_cust.groupby(zkeys, dropna=False)['retained_4w_flag'].mean().rename('retention_4w')
+        avg_freq      = by_cust.groupby(zkeys, dropna=False)['purchases_12w'].mean().rename('avg_freq')
+        avg_recency   = by_cust.groupby(zkeys, dropna=False)['recency_weeks'].mean().replace(np.inf, np.nan).rename('avg_recency')
+        avg_mplb      = by_cust.groupby(zkeys, dropna=False)['avg_margin_per_lb'].mean().rename('avg_margin_per_lb')
+        lbs_sum       = by_cust.groupby(zkeys, dropna=False)['lbs_12w'].sum().rename('lbs')
+        lapsed_rate   = by_cust.groupby(zkeys, dropna=False)['lapsed_flag'].mean().rename('lapsed_12w_rate')
+
+        Z = (pd.concat([active_base, seen_base, repeat_buyers, retained_4w, avg_freq,
+                        avg_recency, avg_mplb, lbs_sum, lapsed_rate], axis=1)
+                .reset_index().fillna(0))
+
+        # Rates
+        Z['repeat_buyer_rate']  = np.where(Z['active_customers']>0, Z['repeat_buyers']/Z['active_customers'], 0.0)
+        Z['active_buyer_share'] = np.where(Z['seen_customers']>0, Z['active_customers']/Z['seen_customers'], 0.0)
+
+        # Winsorize margin and compute BehaviorScore (same weights)
+        if 'avg_margin_per_lb' in Z.columns:
+            Z['avg_margin_per_lb'] = self._winsorize(Z['avg_margin_per_lb'])
+
+        Z['nx_repeat']  = Z['repeat_buyer_rate'].clip(0,1)
+        Z['nx_active']  = Z['active_buyer_share'].clip(0,1)
+        Z['nx_ret4w']   = Z['retention_4w'].clip(0,1)
+        Z['nx_freq']    = (Z['avg_freq'] / max(self.behavior_target_freq, 1)).clip(0,1)
+        Z['nx_recency'] = (1 - (Z['avg_recency'] / max(self.behavior_recency_cap,1))).clip(0,1)
+        Z['nx_mplb']    = self._normalize_01(Z['avg_margin_per_lb'].fillna(Z['avg_margin_per_lb'].median()))
+
+        w = self.behavior_weights
+        Z['BehaviorScore'] = (
+            w['repeat_buyer_rate'] * Z['nx_repeat'] +
+            w['active_buyer_share'] * Z['nx_active'] +
+            w['retention_4w']      * Z['nx_ret4w'] +
+            w['avg_freq']          * Z['nx_freq'] +
+            w['recency']           * Z['nx_recency'] +
+            w['margin_per_lb']     * Z['nx_mplb']
+        ).clip(0, 1)
+
+        return Z
+# ---------- REPLACEMENT ENDS HERE ----------
+
+
+    def __init__(self, learning_window_weeks=26, min_sample_size=3, historical_analysis_mode=True):
+        
+
+        self.learning_window_weeks = learning_window_weeks
+        self.min_sample_size = min_sample_size
+        self.historical_analysis_mode = historical_analysis_mode  # NEW: Enable historical analysis
+        
+                    # === Behavior weighting knobs (tune if needed) ===
+        self.behavior_weights = {
+            "repeat_buyer_rate": 0.40,
+            "active_buyer_share": 0.15,
+            "retention_4w": 0.15,
+            "avg_freq": 0.10,
+            "recency": 0.10,         # lower recency (fresher) is better
+            "margin_per_lb": 0.10    # keep margin in the mix, lightly weighted
+        }
+        self.behavior_window_weeks = 12
+        self.behavior_recency_cap = 12  # clamp recency contribution
+        self.behavior_target_freq = 4   # 4 active weeks in 12w window ~ monthly buyer
+        self.allow_upzone_epsilon = 0.01  # tolerance for "non-inferior"
+        
+        # Core learning structures for zone performance
+        self.zone_performance = defaultdict(lambda: {
+            'volume_elasticity': 0.0,
+            'customer_elasticity': 0.0,
+            'optimal_zone_estimate': 5.0,
+            'zone_effectiveness_curve': {},
+            'sample_count': 0,
+            'confidence': 0.0,
+            'last_updated': datetime.now(),
+            'historical_performance': []
+        })
+        
+        # NEW: Historical pattern storage
+        self.historical_patterns = defaultdict(list)
+        self.proven_zone_changes = {}
+        self.failed_zone_changes = {}
+        self.high_confidence_recommendations = []
+        
+        # Track zone change outcomes
+        self.zone_change_outcomes = deque(maxlen=500)
+        
+        # Granularity expansion tracking
+        self.granularity_needs = defaultdict(lambda: {
+            'needs_expansion': False,
+            'recommended_zones_between_0_1': 0,
+            'zero_recommendations_count': 0,
+            'evidence_score': 0.0
+        })
+        
+        # Price sensitivity learning
+        self.price_sensitivity_patterns = defaultdict(list)
+    
+    def _flag_reactive_downzones(self, df, lookback=6, decline_thresh=-0.15):
+        """
+        Mark combos where a zone drop followed a clear pre-drop decline,
+        and the post-drop period did NOT recover.
+        """
+        flags = {}  # company_combo -> {'reactive_downzone': True, 'from_zone': z_hi, 'to_zone': z_lo}
+        if df is None or df.empty:
+            return flags
+
+        use = df.copy()
+        use['wk'] = pd.to_numeric(use.get('Fiscal Week Number'), errors='coerce')
+        use = use.dropna(subset=['wk'])
+        use['wk'] = use['wk'].astype(int)
+
+        key_cols = ['Company_Combo_Key']
+        if 'Company_Combo_Key' not in use.columns:
+            use['Company_Combo_Key'] = (
+                use.get('Company Name','UNK').astype(str) + '_' +
+                (use.get('NPD Cuisine Type','UNK').astype(str) + '_' +
+                use.get('Attribute Group ID','UNK').astype(str) + '_' +
+                use.get('Price Source Type','UNK').astype(str))
+            )
+
+        # --- Clean zone and volume before scanning ---
+        use['Zone_Suffix_Numeric'] = pd.to_numeric(use.get('Zone_Suffix_Numeric'), errors='coerce')
+        use['Pounds_CY'] = pd.to_numeric(use.get('Pounds_CY', 0), errors='coerce').fillna(0)
+        use = use[use['Zone_Suffix_Numeric'].between(0, 5)].copy()
+        use = use.dropna(subset=['wk'])
+
+        # --- Sort and scan ---
+        for combo, g in use.sort_values('wk').groupby('Company_Combo_Key', dropna=False):
+            if g.empty:
+                continue
+
+            z = g['Zone_Suffix_Numeric'].to_numpy()    # valid 0..5
+            wk = g['wk'].to_numpy()
+            vol = g['Pounds_CY'].to_numpy()
+
+            if len(z) < 2:
+                continue
+
+            # Detect first downward zone change
+            for i in range(1, len(z)):
+                if z[i] < z[i-1]:
+                    t = i
+                    prev = max(0, t - lookback)
+                    pre = vol[prev:t]
+                    post = vol[t:min(len(vol), t + lookback)]
+
+                    pre_growth = (pre[-1] - pre[0]) / max(pre[0], 1e-6) if len(pre) >= 3 else 0.0
+                    post_growth = (post[-1] - post[0]) / max(post[0], 1e-6) if len(post) >= 3 else 0.0
+
+                    if pre_growth <= decline_thresh and post_growth <= 0:
+                        flags[combo] = {
+                            'reactive_downzone': True,
+                            'from_zone': float(z[i-1]),
+                            'to_zone': float(z[i])
+                        }
+                    break  # first drop is enough
+
+
+        return flags
+
+
+    def analyze_historical_zone_changes(self, full_historical_df: pd.DataFrame) -> Dict:
+        """
+        Vectorized: analyze 2+ years of historical data to identify proven zone change patterns
+        MUCH faster than looping over each Company_Combo_Key.
+        """
+        print("Analyzing historical zone change patterns...")
+        print(f"rows={len(full_historical_df):,}, combos={full_historical_df['Company Name'].nunique()} companies")
+
+
+        df = self.extract_zone_features(full_historical_df).copy()
+
+        # Required columns sanity
+        for col in ['Pounds_CY', 'Combined_Performance_Score', 'Volume_Growth_Rate', 'Zone_Suffix_Numeric']:
+            if col not in df.columns:
+                df[col] = 0
+
+        # Ensure numerics (avoid '>' between str and int issues later)
+        num_cols = ['Pounds_CY', 'Combined_Performance_Score', 'Volume_Growth_Rate', 'Zone_Suffix_Numeric']
+        for c in num_cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df['Pounds_CY'] = df['Pounds_CY'].fillna(0)
+        df['Combined_Performance_Score'] = df['Combined_Performance_Score'].fillna(0)
+        df['Volume_Growth_Rate'] = df['Volume_Growth_Rate'].fillna(0)
+        # Remove unknown zone rows
+        df = df[df['Zone_Suffix_Numeric'].between(0, 20, inclusive='both')]  # or <=5 if you’re hard-capped
+
+
+        # We’ll treat each row as a "week". If you have true week IDs, we’ll use them to count weeks.
+        if 'Fiscal Week Number' in df.columns:
+            df['Fiscal Week Number'] = pd.to_numeric(df['Fiscal Week Number'], errors='coerce')
+
+        # 1) Aggregate per (Company_Combo_Key, Zone)
+        grp = df.groupby(['Company_Combo_Key', 'Zone_Suffix_Numeric'], dropna=False).agg(
+            avg_performance=('Combined_Performance_Score', 'mean'),
+            total_volume=('Pounds_CY', 'sum'),
+            weeks_tested=('Fiscal Week Number', 'nunique' if 'Fiscal Week Number' in df.columns else 'size'),
+            volume_growth_rate=('Volume_Growth_Rate', 'mean'),
+            company_name=('Company Name', 'first'),
+            combo_key=('Combo_Key', 'first')
+        ).reset_index()
+
+        # filter out zones with too little data (optional but helps stability)
+        grp = grp[grp['weeks_tested'] >= 3]
+
+        # 2) Compute per-company totals
+        company_totals = grp.groupby('Company_Combo_Key', dropna=False).agg(
+            total_historical_volume=('total_volume', 'sum'),
+            zones_tested_count=('Zone_Suffix_Numeric', 'nunique'),
+            total_weeks=('weeks_tested', 'sum')
+        ).reset_index()
+
+        # 3) Identify best zone per company (by avg_performance)
+        idx_best = grp.groupby('Company_Combo_Key')['avg_performance'].idxmax()
+        best = grp.loc[idx_best].rename(columns={
+            'Zone_Suffix_Numeric': 'historical_best_zone',
+            'avg_performance': 'historical_best_performance'
+        })
+
+        # 4) For confidence & pattern type, we need the "second best" and separation
+        #    Compute average of the non-best zones per company
+        merged = grp.merge(best[['Company_Combo_Key', 'historical_best_zone']], on='Company_Combo_Key', how='left')
+        merged['is_best'] = merged['Zone_Suffix_Numeric'] == merged['historical_best_zone']
+
+        others_avg = (merged[~merged['is_best']]
+                    .groupby('Company_Combo_Key', dropna=False)['avg_performance']
+                    .mean()
+                    .rename('others_avg_performance')
+                    .reset_index())
+
+        out = (best.merge(company_totals, on='Company_Combo_Key', how='left')
+                    .merge(others_avg, on='Company_Combo_Key', how='left'))
+
+        # fill NaN others_avg_performance (cases with only one zone tested)
+        out['others_avg_performance'] = out['others_avg_performance'].fillna(out['historical_best_performance'])
+
+        # Confidence calculation (match your earlier logic)
+        def _conf(row):
+            zone_conf = min(row['zones_tested_count'] / 5.0, 0.4)
+            time_conf = min(row['total_weeks'] / 50.0, 0.4)
+            separation = abs(row['historical_best_performance'] - row['others_avg_performance'])
+            sep_conf = min(separation / 0.3, 0.2)
+            return min(zone_conf + time_conf + sep_conf, 0.95)
+
+        out['confidence'] = out.apply(_conf, axis=1)
+
+        # Proven pattern classification
+        def _pattern(row):
+            if row['historical_best_zone'] <= 1:
+                return "GRANULARITY_EXPANSION_VALIDATED"
+            separation = row['historical_best_performance'] - row['others_avg_performance']
+            if row['zones_tested_count'] >= 3:
+                return "CLEAR_OPTIMAL_ZONE" if separation > 0.2 else "MARGINAL_DIFFERENCES"
+            return "LIMITED_COMPARISON"
+
+        out['proven_pattern'] = out.apply(_pattern, axis=1)
+
+        # 5) Rebuild the dict structure you expect
+        hist_patterns = {}
+        # Also collect the list of zones tested per company (vectorized)
+        zones_list = (grp.groupby('Company_Combo_Key')['Zone_Suffix_Numeric']
+                        .apply(lambda s: sorted(s.unique().tolist()))
+                        .rename('zones_tested').reset_index())
+
+        # merge zones list and a convenient dict-ish snapshot of zone history (optional)
+        out = out.merge(zones_list, on='Company_Combo_Key', how='left')
+
+        # (Optional) Keep the full per-zone records (history) per company for reference
+        zone_perf_records = (grp.groupby('Company_Combo_Key')
+                            .apply(lambda g: g.sort_values('avg_performance', ascending=False)
+                                    .to_dict('records'))
+                            .rename('zone_performance_history')
+                            .reset_index())
+        out = out.merge(zone_perf_records, on='Company_Combo_Key', how='left')
+
+        for _, r in out.iterrows():
+            hist_patterns[r['Company_Combo_Key']] = {
+                'company_name': r['company_name'],
+                'combo_key': r['combo_key'],
+                'total_historical_volume': float(r['total_historical_volume']),
+                'zones_tested': r['zones_tested'],
+                'historical_best_zone': float(r['historical_best_zone']),
+                'historical_best_performance': float(r['historical_best_performance']),
+                'zone_performance_history': r['zone_performance_history'],
+                'confidence': float(r['confidence']),
+                'proven_pattern': r['proven_pattern'],
+            }
+
+        # Detect reactive-downzone artifacts and tag them
+        rd_flags = self._flag_reactive_downzones(full_historical_df)
+
+        for combo, pat in hist_patterns.items():
+            if combo in rd_flags:
+                pat['reactive_downzone'] = True
+                pat['reactive_detail'] = rd_flags[combo]
+
+        self.historical_patterns = hist_patterns
+        print(f"Historical patterns found for {len(hist_patterns):,} combos")
+        return hist_patterns
+
+    
+    def _calculate_historical_confidence(self, zone_performance_history: List[Dict]) -> float:
+        """Calculate confidence based on historical data depth and consistency"""
+        
+        if not zone_performance_history:
+            return 0.0
+        
+        # More zones tested = higher confidence
+        zones_tested = len(zone_performance_history)
+        zone_confidence = min(zones_tested / 5.0, 0.4)  # Max 40% from variety
+        
+        # More data points = higher confidence  
+        total_weeks = sum(zp['weeks_tested'] for zp in zone_performance_history)
+        time_confidence = min(total_weeks / 50.0, 0.4)  # Max 40% from sample size
+        
+        # Performance separation = higher confidence
+        if len(zone_performance_history) >= 2:
+            best_performance = zone_performance_history[0]['avg_performance']
+            second_best = zone_performance_history[1]['avg_performance']
+            separation = abs(best_performance - second_best)
+            separation_confidence = min(separation / 0.3, 0.2)  # Max 20% from clear winner
+        else:
+            separation_confidence = 0.0
+        
+        return min(zone_confidence + time_confidence + separation_confidence, 0.95)
+    
+    def _identify_proven_pattern(self, zone_performance_history: List[Dict]) -> str:
+        """Identify the type of proven pattern from historical data"""
+        
+        if not zone_performance_history:
+            return "INSUFFICIENT_DATA"
+        
+        zones_by_performance = [zp['zone'] for zp in zone_performance_history]
+        best_zone = zones_by_performance[0]
+        
+        # Check for Zone 0 tendency
+        if best_zone <= 1:
+            return "GRANULARITY_EXPANSION_VALIDATED"
+        
+        # Check for clear zone preference
+        if len(zone_performance_history) >= 3:
+            best_performance = zone_performance_history[0]['avg_performance']
+            avg_others = np.mean([zp['avg_performance'] for zp in zone_performance_history[1:]])
+            
+            if best_performance > avg_others + 0.2:
+                return "CLEAR_OPTIMAL_ZONE"
+            else:
+                return "MARGINAL_DIFFERENCES"
+        
+        return "LIMITED_COMPARISON"
+    
+    def generate_immediate_high_confidence_recommendations(self, current_data_df: pd.DataFrame) -> List[Dict]:
+        """
+        Never up-zone. Recommend step-downs toward the consensus zone
+        that wins most often across peer sites for the same NPD Cuisine + AG (CPA).
+        If already at/below consensus, hold or propose fractional zones instead of zone 0.
+        """
+        if not getattr(self, "historical_patterns", None):
+            zone_df = self.extract_zone_features(current_data_df)
+            zone_analysis = self.analyze_zone_effectiveness(zone_df)
+            return self.generate_zone_recommendations(zone_analysis)
+
+        print("Generating consensus-based recommendations (never up-zone)...")
+
+        current_df = self.extract_zone_features(current_data_df).copy()
+        
+        # current_df already has behavior columns merged by extract_zone_features()
+        bh_cols = [
+            'repeat_buyer_rate','retention_4w','active_buyer_share',
+            'avg_freq','avg_recency','avg_margin_per_lb','BehaviorScore'
+        ]
+        # lookup by (company_combo, zone) -> dict
+        def _bh(row):
+            return {k: (None if k not in row or pd.isna(row[k]) else float(row[k])) for k in bh_cols}
+
+        # fast index by company_combo & zone
+        bh_map = {}
+        for _, r in current_df.iterrows():
+            key = (r['Company_Combo_Key'], float(r['Zone_Suffix_Numeric']))
+            bh_map[key] = _bh(r)
+
+        def get_behavior_snapshot(company_combo, zone):
+            return bh_map.get((company_combo, float(zone)), {k: None for k in bh_cols})
+
+        # Build consensus map; set to True if you want DMA-specific consensus
+        consensus_map = self.build_consensus_zone_by_combo(use_dma=False)
+
+        def _combo_key_for_consensus(row) -> str:
+            # Matches how combo_key was built in extract_zone_features: "Cuisine_AG_PriceSource"
+            return f"{str(row.get('NPD Cuisine Type','UNK'))}_{str(row.get('Attribute Group ID','UNK'))}_{str(row.get('Price Source Type','UNK'))}"
+
+        recs: List[Dict] = []
+
+        # Iterate current combos
+        for _, row in current_df.iterrows():
+            company_combo = row['Company_Combo_Key']
+            company_name = row.get('Company Name')
+            current_zone = float(row.get('Zone_Suffix_Numeric', 5))
+            combo_key = _combo_key_for_consensus(row)
+
+            # Consensus target zone for this combo_key
+            target_zone = float(consensus_map.get(combo_key, 1))
+
+            # NEVER up-zone
+            if target_zone > current_zone:
+                target_zone = current_zone  # hold
+
+            fractional_needed = (target_zone <= 1)
+
+            if fractional_needed:
+                # 1) Emit a GRANULARITY flag the dashboard will pick up on the first tab
+                recs.append({
+                    'type': 'GRANULARITY_EXPANSION',
+                    'recommendation_type': 'GRANULARITY_EXPANSION_NEEDED',
+                    'company_combo': company_combo,
+                    'company_name': company_name,
+                    'combo_description': combo_key,
+                    'current_zone': current_zone,
+                    'recommended_zone': max(1.0, current_zone),  # never output literal 0
+                    'confidence': 0.9,
+                    'historical_evidence': 'Peer consensus bottoms at ≤1; add fractional 0.x tiers.',
+                    'granularity_expansion_plan': {'suggested_new_zones': [0.8, 0.5, 0.3]},
+                    'total_volume_at_stake': float(row.get('Pounds_CY', 0.0)),
+                    'implementation_priority': 75.0,
+                    'expected_timeline': '2–4 weeks pilot (0.8/0.5) or 8–12 weeks for structure',
+                    'risk_assessment': {
+                        'risk_level': 'MEDIUM',
+                        'risk_factors': ['Requires fractional zone definition'],
+                        'mitigation_strategies': ['Pilot 0.8 then 0.5; track repeat/retention/active share']
+                    },
+                    'proven_pattern': 'CONSENSUS_BELOW_ONE'
+                })
+
+                # 2) If priced above 1 now, ALSO add a step-down to 1.0 as an immediate action
+                if current_zone > 1:
+                    recs.append({
+                        'type': 'CONSENSUS_STEP_DOWN',
+                        'recommendation_type': 'HISTORICAL_PROVEN',
+                        'company_combo': company_combo,
+                        'company_name': company_name,
+                        'combo_description': combo_key,
+                        'current_zone': current_zone,
+                        'recommended_zone': 1.0,
+                        'confidence': 0.9,
+                        'historical_evidence': 'Peer consensus at the floor; step down to Zone 1 while fractional tiers are built.',
+                        'expected_volume_impact': 'Positive (safety-first)',
+                        'total_volume_at_stake': float(row.get('Pounds_CY', 0.0)),
+                        'implementation_priority': 75.0,
+                        'expected_timeline': '2–3 weeks',
+                        'risk_assessment': {'risk_level': 'LOW'},
+                        'specific_actions': [f"Change from Zone {int(current_zone)} to Zone 1"]
+                    })
+
+                continue  # done with this row
+
+
+            # If we are above consensus, step down by at most 1 zone toward consensus
+            if current_zone > target_zone:
+                step_down = max(target_zone, current_zone - 1.0)  # one step at a time
+                recs.append({
+                    'type': 'CONSENSUS_STEP_DOWN',
+                    'recommendation_type': 'HISTORICAL_PROVEN',  # still “proven” but via consensus
+                    'company_combo': company_combo,
+                    'company_name': company_name,
+                    'combo_description': combo_key,
+                    'current_zone': current_zone,
+                    'recommended_zone': float(step_down),
+                    'confidence': 0.9,
+                    'historical_evidence': f"Consensus zone across peer sites is {int(target_zone)}. Step down 1 zone toward consensus.",
+                    'expected_volume_impact': 'Positive, based on peer outcomes and safety-first rule',
+                    'total_volume_at_stake': float(row.get('Pounds_CY', 0.0)),
+                    'implementation_priority': 75.0,
+                    'expected_timeline': '2-3 weeks',
+                    'risk_assessment': {
+                        'risk_level': 'LOW',
+                        'risk_factors': ['Price previously too high for this peer set'],
+                        'mitigation_strategies': ['Monitor repeat, retention, active share weekly']
+                    },
+                    'proven_pattern': 'CONSENSUS',
+                    'historical_zones_tested': None,
+                    'specific_actions': [f"Change from Zone {int(current_zone)} to Zone {int(step_down)}"]
+                })
+            else:
+                # At or below consensus: hold steady
+                recs.append({
+                    'type': 'HOLD_CONSENSUS',
+                    'recommendation_type': 'HOLD',
+                    'company_combo': company_combo,
+                    'company_name': company_name,
+                    'combo_description': combo_key,
+                    'current_zone': current_zone,
+                    'recommended_zone': current_zone,
+                    'confidence': 0.9,
+                    'historical_evidence': f"Current zone is at or below peer consensus {int(target_zone)}.",
+                    'expected_volume_impact': 'Stable',
+                    'total_volume_at_stake': float(row.get('Pounds_CY', 0.0)),
+                    'implementation_priority': 40.0,
+                    'expected_timeline': 'Monitor',
+                    'risk_assessment': {
+                        'risk_level': 'LOW',
+                        'risk_factors': ['None material'],
+                        'mitigation_strategies': ['Continue monitoring behavior KPIs']
+                    },
+                    'proven_pattern': 'CONSENSUS',
+                    'historical_zones_tested': None,
+                    'specific_actions': ['Hold pricing']
+                })
+
+        recs.sort(key=lambda x: x.get('implementation_priority', 0), reverse=True)
+        print(f"Generated {len(recs)} consensus-based recommendations (no up-zones).")
+        return recs
+
+
+    
+    def _estimate_historical_volume_impact(self, performance_improvement: float, current_volume: float) -> str:
+        def fmt(lbs): return f"{lbs:,.0f} lbs"
+        if performance_improvement > 0.3: return f"20–30% volume increase (~{fmt(current_volume * 0.25)})"
+        if performance_improvement > 0.2: return f"15–20% volume increase (~{fmt(current_volume * 0.175)})"
+        if performance_improvement > 0.1: return f"10–15% volume increase (~{fmt(current_volume * 0.125)})"
+        if performance_improvement > 0:   return f"5–10% volume increase (~{fmt(current_volume * 0.075)})"
+        return "Minimal impact expected"
+
+    
+    def _calculate_historical_priority(self, confidence: float, volume: float, improvement: float) -> float:
+        """Calculate priority for historical recommendations"""
+        
+        priority = 0.0
+        
+        # Confidence weight (0-40 points)
+        priority += confidence * 40
+        
+        # Volume weight (0-30 points)  
+        priority += min(volume / 10000, 30)
+        
+        # Improvement potential (0-30 points)
+        priority += min(improvement * 100, 30)
+        
+        return min(priority, 100)
+    
+    def _assess_historical_risk(self, historical_analysis: Dict, current_zone: float, recommended_zone: float) -> Dict:
+        """Assess risk based on historical patterns"""
+        
+        risk_factors = []
+        risk_level = "LOW"
+        
+        # Large zone change risk
+        zone_change = abs(current_zone - recommended_zone)
+        if zone_change > 2:
+            risk_factors.append(f"Large zone change: {current_zone} to {recommended_zone}")
+            risk_level = "MEDIUM"
+        
+        # High volume risk
+        if historical_analysis['total_historical_volume'] > 50000:
+            risk_factors.append("High historical volume - significant business impact")
+            risk_level = "MEDIUM"
+        
+        # Pattern reliability
+        if historical_analysis['proven_pattern'] == "MARGINAL_DIFFERENCES":
+            risk_factors.append("Historically marginal differences between zones")
+            if risk_level == "LOW":
+                risk_level = "MEDIUM"
+        
+        # Confidence-based risk adjustment
+        if historical_analysis['confidence'] > 0.9:
+            risk_level = "LOW"  # Override to low risk for very high confidence
+        
+        return {
+            'risk_level': risk_level,
+            'risk_factors': risk_factors,
+            'mitigation_strategies': self._historical_risk_mitigation(risk_factors, historical_analysis)
+        }
+    
+    def _historical_risk_mitigation(self, risk_factors: List[str], historical_analysis: Dict) -> List[str]:
+        """Suggest risk mitigation for historical recommendations"""
+        
+        mitigations = []
+        
+        if any("Large zone change" in factor for factor in risk_factors):
+            mitigations.append("Phase implementation: test intermediate zone first for 1 week")
+        
+        if any("High historical volume" in factor for factor in risk_factors):
+            mitigations.append("Monitor daily for first 5 days, weekly thereafter")
+        
+        if any("marginal differences" in factor for factor in risk_factors):
+            mitigations.append("Set clear success metrics and 2-week evaluation checkpoint")
+        
+        # Always include historical context
+        zones_tested = ", ".join(map(str, historical_analysis['zones_tested']))
+        mitigations.append(f"Historical context: Previously tested zones {zones_tested}")
+        
+        return mitigations
+    
+    def extract_zone_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extract zone optimization features from data"""
+        
+        zone_df = df.copy()
+        
+        # Ensure numeric dtypes (CSV loads often give strings)
+        for c in ['Pounds_CY', 'Pounds_PY', 'Delta_YoY_Lbs', 'Distinct_Customers_CY', 'Distinct_Customers_PY']:
+            if c in zone_df.columns:
+                zone_df[c] = pd.to_numeric(zone_df[c], errors='coerce').fillna(0)
+
+        
+        # --- Parse Price Zone ID to get Zone Suffix (safe, 0..5 only) ---
+        if 'Price Zone ID' in zone_df.columns:
+            zone_df['Zone_Suffix'] = (
+                zone_df['Price Zone ID']
+                .astype(str).str.split('-').str[-1]
+                .str.extract(r'(\d+)')[0]
+            )
+        else:
+            # No Price Zone ID, set a default string
+            zone_df['Zone_Suffix'] = '5'
+
+        zone_df['Zone_Suffix_Numeric'] = pd.to_numeric(zone_df['Zone_Suffix'], errors='coerce')
+
+        # keep only 0..5, drop others
+        zone_df = zone_df[zone_df['Zone_Suffix_Numeric'].between(0, 5)].copy()
+
+        # if everything got dropped, fall back to default zone 5 for any remaining rows
+        if zone_df.empty and 'Price Zone ID' in locals():
+            zone_df = zone_df.copy()
+        zone_df['Zone_Suffix_Numeric'] = zone_df['Zone_Suffix_Numeric'].fillna(5).astype(float)
+
+        
+        # Create the significant combo key
+        zone_df['Combo_Key'] = (
+            zone_df.get('NPD Cuisine Type', 'Unknown').astype(str) + '_' +
+            zone_df.get('Attribute Group ID', 'Unknown').astype(str) + '_' +
+            zone_df.get('Price Source Type', 'Unknown').astype(str)
+        )
+        
+        # Company-specific combo key
+        zone_df['Company_Combo_Key'] = (
+            zone_df.get('Company Name', 'Unknown').astype(str) + '_' + zone_df['Combo_Key']
+        )
+        
+        # Performance metrics
+        zone_df['Volume_Performance'] = zone_df.get('Delta_YoY_Lbs', 0)
+        zone_df['Volume_Growth_Rate'] = np.where(
+            zone_df.get('Pounds_PY', 0) > 0,
+            zone_df.get('Delta_YoY_Lbs', 0) / zone_df.get('Pounds_PY', 1),
+            0
+        )
+        
+        # Customer metrics (if available)
+        if 'Distinct_Customers_CY' in zone_df.columns and 'Distinct_Customers_PY' in zone_df.columns:
+            zone_df['Customer_Growth'] = zone_df['Distinct_Customers_CY'] - zone_df['Distinct_Customers_PY']
+            zone_df['Customer_Growth_Rate'] = np.where(
+                zone_df['Distinct_Customers_PY'] > 0,
+                zone_df['Customer_Growth'] / zone_df['Distinct_Customers_PY'],
+                0
+            )
+        else:
+            # Estimate distinct customers from volume patterns
+            zone_df['Customer_Growth'] = zone_df['Volume_Performance'] * 0.1  # Rough proxy
+            zone_df['Customer_Growth_Rate'] = zone_df['Volume_Growth_Rate'] * 0.8  # Customers less elastic
+        
+        # Combined performance score (weighted toward volume and customers)
+        zone_df['Combined_Performance_Score'] = (
+            zone_df['Volume_Growth_Rate'] * 0.6 +  # Volume gets 60% weight
+            zone_df['Customer_Growth_Rate'] * 0.4   # Customers get 40% weight
+        )
+        
+        # === BEHAVIOR SIGNALS MERGE ===
+        behavior = self._compute_behavior_signals(zone_df, window_weeks=self.behavior_window_weeks)
+
+        if not behavior.empty:
+            merge_keys = ['Company Name','NPD Cuisine Type','Attribute Group ID','Price Source Type','Zone_Suffix_Numeric']
+            for k in merge_keys:
+                if k not in zone_df.columns:
+                    zone_df[k] = 'UNKNOWN'
+            zone_df = zone_df.merge(behavior, on=merge_keys, how='left', suffixes=('',''))
+
+        # --- Ensure BehaviorScore exists even if behavior signals are missing ---
+        if 'BehaviorScore' not in zone_df.columns or zone_df['BehaviorScore'].isna().all():
+            # Fallback: normalize your existing Combined_Performance_Score into 0–1
+            if 'Combined_Performance_Score' in zone_df.columns:
+                zone_df['BehaviorScore'] = self._normalize_01(zone_df['Combined_Performance_Score'].fillna(0))
+            else:
+                zone_df['BehaviorScore'] = 0.0
+
+        # Keep a clean float
+        zone_df['BehaviorScore'] = pd.to_numeric(zone_df['BehaviorScore'], errors='coerce').fillna(0.0)
+
+
+        return zone_df
+    
+    def analyze_zone_effectiveness(self, zone_df: pd.DataFrame) -> Dict:
+        """Analyze how different zones perform for each company-combo"""
+        
+        zone_analysis = {}
+        
+        for company_combo in zone_df['Company_Combo_Key'].unique():
+            
+            combo_data = zone_df[zone_df['Company_Combo_Key'] == company_combo].copy()
+            
+            if len(combo_data) < 2:  # Need multiple data points
+                continue
+            
+            # Group by zone suffix to see performance patterns
+            zone_performance = combo_data.groupby('Zone_Suffix_Numeric').agg({
+                'Volume_Performance': 'sum',
+                'Volume_Growth_Rate': 'mean',
+                'Customer_Growth': 'sum',
+                'Customer_Growth_Rate': 'mean',
+                'Combined_Performance_Score': 'mean',
+                'BehaviorScore': 'mean',                         # NEW
+                'repeat_buyer_rate': 'mean',                     # NEW
+                'active_buyer_share': 'mean',                    # NEW
+                'avg_freq': 'mean', 'avg_recency': 'mean',       # NEW
+                'retention_4w': 'mean', 'avg_margin_per_lb': 'mean',  # NEW
+                'Pounds_CY': 'sum',
+                'Company Name': 'first',
+                'Combo_Key': 'first'
+            }).reset_index()
+
+            zone_performance = zone_performance.sort_values('Zone_Suffix_Numeric')
+
+            # Choose optimal by BEHAVIOR, not margin/combined
+            if not zone_performance.empty:
+                best_zone_idx = zone_performance['BehaviorScore'].idxmax()
+                optimal_zone = zone_performance.loc[best_zone_idx, 'Zone_Suffix_Numeric']
+                best_performance = zone_performance.loc[best_zone_idx, 'BehaviorScore']  # store behavior score as performance
+
+                
+                # Calculate price elasticity (how performance changes with zone)
+                if len(zone_performance) >= 3:
+                    zones = zone_performance['Zone_Suffix_Numeric'].values
+                    scores = zone_performance['Combined_Performance_Score'].values
+                    
+                    # Simple elasticity: change in performance per zone change
+                    zone_changes = np.diff(zones)
+                    score_changes = np.diff(scores)
+                    elasticities = np.where(zone_changes != 0, score_changes / zone_changes, 0)
+                    avg_elasticity = np.mean(elasticities)
+                else:
+                    avg_elasticity = 0
+                
+                zone_analysis[company_combo] = {
+                    'company_name': combo_data['Company Name'].iloc[0],
+                    'combo_key': combo_data['Combo_Key'].iloc[0],
+                    'current_zones_tested': zone_performance['Zone_Suffix_Numeric'].tolist(),
+                    'zone_performance_curve': zone_performance.to_dict('records'),
+                    'optimal_zone': optimal_zone,
+                    'optimal_performance': best_performance,
+                    'price_elasticity': avg_elasticity,
+                    'total_volume': combo_data['Pounds_CY'].sum(),
+                    'needs_analysis': self._assess_analysis_needs(zone_performance, optimal_zone),
+                    'zone_performance_curve': zone_performance.to_dict('records'),
+                    'optimal_zone': optimal_zone,
+                    'optimal_performance': float(best_performance),
+                    'behavior_best': {
+                        'repeat_buyer_rate': float(zone_performance.loc[best_zone_idx, 'repeat_buyer_rate']),
+                        'retention_4w': float(zone_performance.loc[best_zone_idx, 'retention_4w']),
+                        'active_buyer_share': float(zone_performance.loc[best_zone_idx, 'active_buyer_share']),
+                        'avg_freq': float(zone_performance.loc[best_zone_idx, 'avg_freq']),
+                        'avg_recency': float(zone_performance.loc[best_zone_idx, 'avg_recency']),
+                        'avg_margin_per_lb': float(zone_performance.loc[best_zone_idx, 'avg_margin_per_lb'])
+                    },
+                }
+        
+        return zone_analysis
+    
+    def _assess_analysis_needs(self, zone_performance: pd.DataFrame, optimal_zone: float) -> Dict:
+        """Assess what kind of analysis or action is needed for this combo"""
+        
+        needs = {
+            'type': 'STABLE',
+            'recommendations': [],
+            'confidence': 'HIGH',
+            'priority': 'LOW'
+        }
+        
+        zones_tested = set(zone_performance['Zone_Suffix_Numeric'].tolist())
+        performance_scores = zone_performance['Combined_Performance_Score'].tolist()
+        
+        # Check if optimal zone is at boundary (need to test more zones)
+        min_zone_tested = min(zones_tested)
+        max_zone_tested = max(zones_tested)
+        
+        if optimal_zone == min_zone_tested and min_zone_tested > 0:
+            needs['type'] = 'TEST_LOWER_ZONES'
+            needs['recommendations'].append(f"Test zones {max(0, min_zone_tested-2)}-{min_zone_tested-1}")
+            needs['confidence'] = 'MEDIUM'
+            needs['priority'] = 'MEDIUM'
+            
+            # Special case: if optimal is zone 1 or 2, flag for granularity expansion
+            if optimal_zone <= 2:
+                needs['granularity_expansion_candidate'] = True
+                needs['recommendations'].append("Consider adding zones 0.1, 0.2, 0.5 for finer pricing")
+        
+        elif optimal_zone == max_zone_tested:
+            needs['type'] = 'TEST_HIGHER_ZONES' 
+            needs['recommendations'].append(f"Test zones {max_zone_tested+1}-{max_zone_tested+3}")
+            needs['confidence'] = 'MEDIUM'
+            needs['priority'] = 'LOW'  # Less urgent since we're not at the cheap end
+        
+        # Check if we're recommending zone 0 (which we won't implement)
+        if optimal_zone == 0:
+            needs['type'] = 'GRANULARITY_EXPANSION_NEEDED'
+            needs['recommendations'] = [
+                "ZONE 0 RECOMMENDED - DO NOT IMPLEMENT",
+                "Create zones 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 between current 0 and 1",
+                "This combo shows high price sensitivity - needs finer pricing granularity"
+            ]
+            needs['confidence'] = 'HIGH'
+            needs['priority'] = 'HIGH'
+        
+        # Check for strong price sensitivity (big performance differences between zones)
+        if len(performance_scores) >= 3:
+            performance_range = max(performance_scores) - min(performance_scores)
+            if performance_range > 0.3:  # Large performance swing across zones
+                needs['high_price_sensitivity'] = True
+                if needs['type'] == 'STABLE':
+                    needs['type'] = 'HIGH_SENSITIVITY'
+                    needs['recommendations'].append("Monitor closely - high price sensitivity detected")
+                    needs['priority'] = 'MEDIUM'
+        
+        return needs
+    
+    def generate_zone_recommendations(self, zone_analysis: Dict) -> List[Dict]:
+        """Generate specific zone change recommendations"""
+        
+        recommendations = []
+        
+        for company_combo, analysis in zone_analysis.items():
+            
+            needs = analysis['needs_analysis']
+            current_optimal = analysis['optimal_zone']
+            total_volume = analysis['total_volume']
+            
+            # Skip low-volume combos unless they show exceptional promise
+            if total_volume < 1000 and analysis['optimal_performance'] < 0.2:
+                continue
+            
+            rec = {
+                'company_combo': company_combo,
+                'company_name': analysis['company_name'],
+                'combo_description': analysis['combo_key'],
+                'current_optimal_zone': current_optimal,
+                'current_performance': analysis['optimal_performance'],
+                'total_volume_at_stake': total_volume,
+                'recommendation_type': needs['type'],
+                'specific_actions': needs['recommendations'],
+                'implementation_priority': self._calculate_zone_priority(analysis, needs),
+                'expected_timeline': self._estimate_implementation_timeline(needs),
+                'risk_assessment': self._assess_zone_change_risk(analysis, needs)
+            }
+            
+            # Add specific zone targets for actionable recommendations
+            if needs['type'] == 'TEST_LOWER_ZONES':
+                suggested_zones = self._suggest_specific_lower_zones(analysis)
+                rec['suggested_test_zones'] = suggested_zones
+                rec['expected_volume_impact'] = self._estimate_volume_impact(analysis, suggested_zones)
+            
+            elif needs['type'] == 'GRANULARITY_EXPANSION_NEEDED':
+                rec['granularity_expansion_plan'] = self._create_granularity_plan(analysis)
+                rec['expected_volume_impact'] = "15-30% increase with proper granularity"
+            
+            recommendations.append(rec)
+        
+        return sorted(recommendations, key=lambda x: x['implementation_priority'], reverse=True)
+    
+    def _calculate_zone_priority(self, analysis: Dict, needs: Dict) -> float:
+        """Calculate implementation priority (0-100)"""
+        
+        priority = 0.0
+        
+        # Volume impact potential
+        volume_factor = min(analysis['total_volume'] / 10000, 30)  # Max 30 points
+        priority += volume_factor
+        
+        # Performance opportunity
+        if analysis['optimal_performance'] > 0.1:
+            priority += 25  # Good performance opportunity
+        elif analysis['optimal_performance'] > 0.05:
+            priority += 15
+        
+        # Urgency based on need type
+        if needs['type'] == 'GRANULARITY_EXPANSION_NEEDED':
+            priority += 35  # High urgency - zone 0 recommendations
+        elif needs['type'] == 'TEST_LOWER_ZONES':
+            priority += 20  # Medium urgency - potential for lower pricing
+        elif needs['type'] == 'HIGH_SENSITIVITY':
+            priority += 10  # Monitor closely
+        
+        # Price elasticity bonus (more responsive = higher priority)
+        if abs(analysis['price_elasticity']) > 0.1:
+            priority += 10
+        
+        return min(priority, 100)
+    
+    def _suggest_specific_lower_zones(self, analysis: Dict) -> List[int]:
+        """Suggest specific lower zones to test"""
+        
+        current_optimal = analysis['optimal_zone']
+        zones_tested = set(analysis['current_zones_tested'])
+        
+        suggestions = []
+        
+        # Test 2-3 zones below current optimal
+        for test_zone in range(max(0, int(current_optimal) - 3), int(current_optimal)):
+            if test_zone not in zones_tested and test_zone >= 0:
+                suggestions.append(test_zone)
+        
+        return suggestions[:3]  # Limit to 3 suggestions
+    
+    def _create_granularity_plan(self, analysis: Dict) -> Dict:
+        """Create a plan for adding granular zones between 0 and 1"""
+        
+        return {
+            'problem': 'Optimal zone recommendation is 0, but we will not implement zone 0',
+            'solution': 'Add granular zones between 0 and 1',
+            'suggested_new_zones': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+            'implementation_approach': 'Start with 0.5 and 0.8, then add others based on results',
+            'expected_outcome': 'Find sweet spot that maximizes volume without going to zone 0',
+            'monitoring_plan': 'Test 0.5 for 4 weeks, then 0.8 for 4 weeks, compare to current zone 1'
+        }
+    
+    def _estimate_volume_impact(self, analysis: Dict, suggested_zones: List[int]) -> str:
+        """Estimate volume impact from testing suggested zones"""
+        
+        elasticity = analysis['price_elasticity']
+        current_optimal = analysis['optimal_zone']
+        
+        if not suggested_zones:
+            return "Unable to estimate - no valid test zones"
+        
+        # Estimate impact of moving to lowest suggested zone
+        lowest_zone = min(suggested_zones)
+        zone_change = current_optimal - lowest_zone
+        
+        if abs(elasticity) > 0.05:  # Meaningful elasticity
+            estimated_impact = zone_change * elasticity * 100
+            if estimated_impact > 0:
+                return f"Potential {estimated_impact:.0f}% volume increase"
+            else:
+                return f"Risk of {abs(estimated_impact):.0f}% volume decrease"
+        else:
+            return "Low price sensitivity - modest impact expected"
+    
+    def _estimate_implementation_timeline(self, needs: Dict) -> str:
+        """Estimate timeline for implementing recommendations"""
+        
+        if needs['type'] == 'GRANULARITY_EXPANSION_NEEDED':
+            return "8-12 weeks (requires zone structure changes)"
+        elif needs['type'] in ['TEST_LOWER_ZONES', 'TEST_HIGHER_ZONES']:
+            return "2-4 weeks (simple zone adjustments)"
+        elif needs['type'] == 'HIGH_SENSITIVITY':
+            return "Ongoing monitoring (no immediate action)"
+        else:
+            return "4-6 weeks"
+    
+    def _assess_zone_change_risk(self, analysis: Dict, needs: Dict) -> Dict:
+        """Assess risk of implementing zone changes"""
+        
+        risk_factors = []
+        risk_level = "LOW"
+        
+        volume = analysis['total_volume']
+        elasticity = abs(analysis['price_elasticity'])
+        
+        # High volume at stake
+        if volume > 10000:
+            risk_factors.append(f"High volume at stake: ${volume:,.0f}")
+            risk_level = "MEDIUM"
+        
+        # High price sensitivity
+        if elasticity > 0.2:
+            risk_factors.append("High price sensitivity - changes will have major impact")
+            risk_level = "MEDIUM"
+        
+        # Granularity expansion risks
+        if needs['type'] == 'GRANULARITY_EXPANSION_NEEDED':
+            risk_factors.append("Requires significant zone structure changes")
+            risk_level = "HIGH"
+        
+        # Limited testing data
+        zones_tested = len(analysis['current_zones_tested'])
+        if zones_tested < 3:
+            risk_factors.append(f"Limited zone testing data ({zones_tested} zones)")
+            if risk_level == "LOW":
+                risk_level = "MEDIUM"
+        
+        return {
+            'risk_level': risk_level,
+            'risk_factors': risk_factors,
+            'mitigation_strategies': self._suggest_risk_mitigation(risk_factors, needs)
+        }
+    
+    def _suggest_risk_mitigation(self, risk_factors: List[str], needs: Dict) -> List[str]:
+        """Suggest risk mitigation strategies"""
+        
+        mitigations = []
+        
+        if any("High volume" in factor for factor in risk_factors):
+            mitigations.append("Phase implementation: start with 25% of volume for 2 weeks")
+        
+        if any("High price sensitivity" in factor for factor in risk_factors):
+            mitigations.append("Monitor daily for first week, weekly thereafter")
+        
+        if any("zone structure changes" in factor for factor in risk_factors):
+            mitigations.append("Coordinate with pricing team, IT, and operations before implementation")
+        
+        if any("Limited zone testing" in factor for factor in risk_factors):
+            mitigations.append("Start with most conservative zone recommendation first")
+        
+        if needs['type'] == 'GRANULARITY_EXPANSION_NEEDED':
+            mitigations.append("Test zone 0.8 first as safest starting point near zone 1")
+        
+        return mitigations
+    
+    def predict_volume_turnaround_timeline(self, recommendations: List[Dict], 
+                                         current_trend: Dict) -> Dict:
+        """Predict when volume will turn positive based on zone optimization recommendations"""
+        
+        # Current situation
+        current_decline_rate = current_trend.get('volume_decline_rate_pct', 0)
+        total_volume = current_trend.get('total_volume', 0)
+        
+        if total_volume == 0:
+            return {'error': 'No volume data for prediction'}
+        
+        # Analyze recommendations by implementation timeline
+        immediate_impact_recs = [r for r in recommendations if '2-4 weeks' in r.get('expected_timeline', '')]
+        medium_term_recs = [r for r in recommendations if '4-6 weeks' in r.get('expected_timeline', '')]
+        long_term_recs = [r for r in recommendations if '8-12 weeks' in r.get('expected_timeline', '')]
+        
+        # Estimate volume impact from each wave
+        immediate_volume_lift = sum(self._extract_volume_impact(r) for r in immediate_impact_recs)
+        medium_volume_lift = sum(self._extract_volume_impact(r) for r in medium_term_recs)
+        long_volume_lift = sum(self._extract_volume_impact(r) for r in long_term_recs)
+        
+        total_potential_lift = immediate_volume_lift + medium_volume_lift + long_volume_lift
+        
+        # Calculate turnaround timeline
+        if total_potential_lift > abs(current_decline_rate * total_volume):
+            # We can overcome the decline
+            if immediate_volume_lift > abs(current_decline_rate * total_volume * 0.7):
+                turnaround_week = 6  # Fast turnaround
+            elif immediate_volume_lift + medium_volume_lift > abs(current_decline_rate * total_volume):
+                turnaround_week = 10  # Medium turnaround
+            else:
+                turnaround_week = 16  # Longer turnaround
+        else:
+            turnaround_week = None  # Need more aggressive action
+        
+        return {
+            'current_decline_rate_pct': current_decline_rate,
+            'total_volume_base': total_volume,
+            'potential_volume_lift': total_potential_lift,
+            'immediate_impact_volume': immediate_volume_lift,
+            'medium_term_impact_volume': medium_volume_lift,
+            'long_term_impact_volume': long_volume_lift,
+            'predicted_turnaround_week': turnaround_week,
+            'confidence': self._calculate_prediction_confidence(recommendations, total_potential_lift),
+            'key_dependencies': [
+                f"{len(immediate_impact_recs)} immediate-impact zone changes",
+                f"{len(long_term_recs)} granularity expansions", 
+                "Successful implementation without major operational issues"
+            ]
+        }
+    
+    def _extract_volume_impact(self, recommendation: Dict) -> float:
+        """Extract estimated volume impact from a recommendation"""
+        
+        volume_at_stake = recommendation.get('total_volume_at_stake', 0)
+        
+        # Parse expected impact
+        impact_text = recommendation.get('expected_volume_impact', '0')
+        if 'increase' in str(impact_text).lower():
+            # Extract percentage
+            import re
+            pct_match = re.search(r'(\d+)%', str(impact_text))
+            if pct_match:
+                pct_increase = float(pct_match.group(1)) / 100
+                return volume_at_stake * pct_increase
+        
+        # Default conservative estimate based on recommendation type
+        if recommendation['recommendation_type'] == 'GRANULARITY_EXPANSION_NEEDED':
+            return volume_at_stake * 0.2  # 20% conservative estimate
+        elif recommendation['recommendation_type'] == 'TEST_LOWER_ZONES':
+            return volume_at_stake * 0.1  # 10% conservative estimate
+        
+        return 0
+    
+    def _calculate_prediction_confidence(self, recommendations: List[Dict], 
+                                       total_lift: float) -> float:
+        """Calculate confidence in the turnaround prediction"""
+        
+        confidence = 0.5  # Start at 50%
+        
+        # More recommendations = higher confidence (up to a point)
+        rec_confidence = min(len(recommendations) / 10.0, 0.3)
+        confidence += rec_confidence
+        
+        # Higher volume impact = higher confidence 
+        if total_lift > 0:
+            impact_confidence = min(total_lift / 50000, 0.2)  # Cap at 20%
+            confidence += impact_confidence
+        
+        return min(confidence, 0.9)  # Cap at 90%
+    
+    def generate_executive_dashboard(self, recommendations: List[Dict], turnaround_prediction: Dict) -> Dict:
+        """
+        Generate executive dashboard for zone optimization
+        (compatible with both standard and historical-proven recs)
+        """
+
+        # Treat “high priority” as either high score OR high confidence historical
+        high_priority = [
+            r for r in recommendations
+            if r.get('implementation_priority', 0) >= 70 or r.get('confidence', 0) >= 0.8
+        ]
+
+        # -------- NEW: volume-aware ranking for Top Priorities --------
+        MIN_VOL_FOR_TOP = 2000.0  # only show items with >= 2,000 lbs at stake as first pass
+
+        def _top_score(r):
+            vol = float(r.get('total_volume_at_stake', 0) or 0.0)
+            pri = float(r.get('implementation_priority', 0) or 0.0)
+            conf = float(r.get('confidence', 0) or 0.0)
+
+            # Volume points: 1 pt per 1k lbs, capped at 50
+            vol_pts = min(vol / 1000.0, 50.0)
+            # Confidence points: up to 20
+            conf_pts = min(conf * 20.0, 20.0)
+
+            # Final score: keep your priority weight, add volume + a touch of confidence
+            return pri + vol_pts + conf_pts
+
+        # First, take only items meeting the volume floor
+        candidates = [r for r in high_priority if (r.get('total_volume_at_stake', 0) or 0) >= MIN_VOL_FOR_TOP]
+
+        # If we do not have 5 yet, backfill with the remaining high_priority by score (no volume floor)
+        if len(candidates) < 5:
+            backfill = [r for r in high_priority if r not in candidates]
+            backfill_sorted = sorted(backfill, key=_top_score, reverse=True)
+            candidates.extend(backfill_sorted)
+
+        # Final top 5 by score
+        top5 = sorted(candidates, key=_top_score, reverse=True)[:5]
+        # --------------------------------------------------------------
+
+        # Count granularity from either standard need OR historical proven pattern that implies it
+        granularity_expansions = [
+            r for r in recommendations
+            if r.get('recommendation_type') == 'GRANULARITY_EXPANSION_NEEDED'
+            or r.get('type') == 'GRANULARITY_EXPANSION'
+            or r.get('recommendation_type') == 'INVESTIGATE_FRACTIONAL'  # backward compat
+            or r.get('proven_pattern') == 'GRANULARITY_EXPANSION_VALIDATED'
+        ]
+        # “Zone tests recommended” = any explicit TEST_* type OR historical-proven direct zone-change
+        zone_tests = [
+            r for r in recommendations
+            if (r.get('recommendation_type', '').startswith('TEST_'))
+            or (r.get('recommendation_type') == 'HISTORICAL_PROVEN')
+        ]
+
+        # Coerce to plain float to avoid np.float64(...) in printouts
+        total_volume_opportunity = float(sum(r.get('total_volume_at_stake', 0) or 0 for r in recommendations))
+
+        exec_summary = {
+            'total_zone_opportunities': len(recommendations),
+            'high_priority_actions': len(high_priority),
+            'granularity_expansions_needed': len(granularity_expansions),
+            'zone_tests_recommended': len(zone_tests),
+            'total_volume_in_scope': total_volume_opportunity,
+            'predicted_turnaround_week': turnaround_prediction.get('predicted_turnaround_week', 'TBD'),
+        }
+
+        return {
+            'executive_summary': exec_summary,
+            'immediate_action_items': [
+                {
+                    'company': r.get('company_name'),
+                    'combo': r.get('combo_description'),
+                    'action': (r.get('specific_actions') or ['Review needed'])[0],
+                    'volume': float(r.get('total_volume_at_stake', 0) or 0.0),
+                    'priority': float(r.get('implementation_priority', 0) or 0.0),
+                }
+                for r in top5
+            ],
+            'granularity_expansion_alerts': [
+                {
+                    'company': r.get('company_name'),
+                    'combo': r.get('combo_description'),
+                    'issue': 'ZONE 0 RECOMMENDED / HISTORICAL TILT TO ≤1 — CONSIDER FRACTIONAL ZONES',
+                    'volume': r.get('total_volume_at_stake', 0),
+                }
+                for r in granularity_expansions
+            ],
+            'timeline_forecast': turnaround_prediction,
+            'success_metrics': {
+                'volume_growth_target': f"+{turnaround_prediction.get('potential_volume_lift', 0):,.0f} lbs",
+                'customer_growth_target': "Est. +10–15% distinct customers",
+                'margin_impact': "Expected margin compression offset by volume gains",
+            },
+        }
+
+
+    def predict_historical_turnaround_timeline(self, recommendations: List[Dict], current_trend: Dict) -> Dict:
+        current_decline_rate = current_trend.get('volume_decline_rate_pct', 0)
+        total_volume = current_trend.get('total_volume', 0)
+        if total_volume == 0:
+            return {'error': 'No volume data for prediction'}
+
+        high_confidence_recs = [r for r in recommendations if r.get('confidence', 0) >= 0.8]
+        medium_confidence_recs = [r for r in recommendations if 0.6 <= r.get('confidence', 0) < 0.8]
+
+        high_conf_volume_lift = sum(self._extract_historical_volume_impact(r) for r in high_confidence_recs)
+        medium_conf_volume_lift = sum(self._extract_historical_volume_impact(r) for r in medium_confidence_recs)
+        total_potential_lift = high_conf_volume_lift + medium_conf_volume_lift
+
+        if high_conf_volume_lift > abs(current_decline_rate * total_volume * 0.8):
+            turnaround_week = 3
+        elif total_potential_lift > abs(current_decline_rate * total_volume):
+            turnaround_week = 5
+        else:
+            turnaround_week = 6
+
+        # IMPORTANT: include the keys your Excel writer expects
+        return {
+            'current_decline_rate_pct': current_decline_rate,
+            'total_volume_base': total_volume,
+            'potential_volume_lift': total_potential_lift,
+            'immediate_impact_volume': high_conf_volume_lift,   # alias for Excel
+            'medium_term_impact_volume': medium_conf_volume_lift,  # alias for Excel
+            'long_term_impact_volume': 0,  # no “long” bucket here; set 0
+            'predicted_turnaround_week': turnaround_week,
+            'confidence': min(len(high_confidence_recs) / 5.0, 0.95),
+            'key_dependencies': [
+                f"{len(high_confidence_recs)} historically-proven zone changes",
+                "2+ years of historical validation data",
+                "Immediate implementation possible"
+            ],
+            'six_week_feasibility': 'ACHIEVABLE' if turnaround_week <= 6 else 'REQUIRES_MORE_AGGRESSIVE_ACTION'
+        }
+
+    def _extract_historical_volume_impact(self, recommendation: Dict) -> float:
+        volume_at_stake = recommendation.get('total_volume_at_stake', 0)
+        confidence = recommendation.get('confidence', 0.5)
+        if recommendation.get('type') == 'HISTORICAL_PROVEN':
+            if confidence >= 0.9:   return volume_at_stake * 0.25
+            if confidence >= 0.8:   return volume_at_stake * 0.20
+            if confidence >= 0.7:   return volume_at_stake * 0.15
+        return volume_at_stake * 0.10
+
+    def save_learning_state(self, filepath: str):
+        """Save the current learning state for persistence"""
+        
+        state = {
+            'zone_performance': dict(self.zone_performance),
+            'zone_change_outcomes': list(self.zone_change_outcomes),
+            'granularity_needs': dict(self.granularity_needs),
+            'price_sensitivity_patterns': dict(self.price_sensitivity_patterns),
+            'saved_at': datetime.now().isoformat()
+        }
+        
+        with open(filepath, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+    
+    def load_learning_state(self, filepath: str):
+        """Load previously saved learning state"""
+        
+        if os.path.exists(filepath):
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            
+            self.zone_performance = defaultdict(lambda: {
+                'volume_elasticity': 0.0,
+                'customer_elasticity': 0.0,
+                'optimal_zone_estimate': 5.0,
+                'zone_effectiveness_curve': {},
+                'sample_count': 0,
+                'confidence': 0.0,
+                'last_updated': datetime.now(),
+                'historical_performance': []
+            }, state.get('zone_performance', {}))
+            
+            self.zone_change_outcomes = deque(state.get('zone_change_outcomes', []), maxlen=500)
+            self.granularity_needs = defaultdict(lambda: {
+                'needs_expansion': False,
+                'recommended_zones_between_0_1': 0,
+                'zero_recommendations_count': 0,
+                'evidence_score': 0.0
+            }, state.get('granularity_needs', {}))
+            self.price_sensitivity_patterns = defaultdict(list, state.get('price_sensitivity_patterns', {}))
+            
+            
+def _normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return None
+
+    # DO NOT rename the customer id
+    ren = {
+        'Pounds CY': 'Pounds_CY',
+        'Pounds PY': 'Pounds_PY',
+        'Delta Pounds YoY': 'Delta_YoY_Lbs',
+        'Zone Suffix': 'Zone_Suffix',
+        'Fiscal Week Number': 'Fiscal Week Number',  # keep name consistent
+        # 'Company Customer Number': 'Distinct_Customers_CY',  # <- REMOVE THIS
+    }
+
+    out = df.copy()
+
+    # 1) rename (safe)
+    for k, v in ren.items():
+        if k in out.columns and v not in out.columns:
+            out = out.rename(columns={k: v})
+
+    # 2) coerce numeric columns used downstream (customer id is NOT here)
+    num_cols = [
+        'Pounds_CY', 'Pounds_PY', 'Delta_YoY_Lbs',
+        'Zone_Suffix_Numeric', 'Fiscal Week Number',
+        'Distinct_Customers_CY', 'Distinct_Customers_PY'  # only if these already exist
+    ]
+    for c in num_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors='coerce')
+
+    # 2b) ensure customer id stays string
+    if 'Company Customer Number' in out.columns:
+        out['Company Customer Number'] = out['Company Customer Number'].astype(str)
+
+    # 3) fill sensible defaults
+    if 'Distinct_Customers_CY' in out.columns and 'Distinct_Customers_PY' not in out.columns:
+        out['Distinct_Customers_PY'] = out['Distinct_Customers_CY']
+
+    # 4) zeros for NaNs in key numeric fields
+    for c in ['Pounds_CY', 'Pounds_PY', 'Delta_YoY_Lbs', 'Distinct_Customers_CY', 'Distinct_Customers_PY']:
+        if c in out.columns:
+            out[c] = out[c].fillna(0)
+
+    return out
+
+
+from typing import Dict, Any, Optional
+
+def integrate_zone_optimization_with_historical_data(
+    status_df: pd.DataFrame,
+    raw_df: pd.DataFrame,
+    historical_df: Optional[pd.DataFrame] = None
+) -> Dict[str, Any]:
+    """
+    Runs the full zone optimization flow using current (status_df), raw_df,
+    and optional historical_df. DMA is NOT used in keys. Business Center is NOT used.
+    CPA-only + no exceptions/discounts are enforced via _apply_scope_filters.
+    """
+    # 1) Create engine
+    engine = ZoneOptimizationEngine(historical_analysis_mode=True)
+
+    # 2) Apply scope filters (free function, not self.*)
+    status_df = _apply_scope_filters(status_df)
+    raw_df    = _apply_scope_filters(raw_df)
+    if historical_df is not None:
+        historical_df = _apply_scope_filters(historical_df)
+
+    # 3) Feature extraction & analysis
+    zone_df = engine.extract_zone_features(status_df)
+    zone_analysis = engine.analyze_zone_effectiveness(zone_df)
+
+
+    required = {'Company Customer Number', 'Fiscal Week Number', 'Price Source Type'}
+    missing = required - set(raw_df.columns)
+    print(f"[Behavior input check] missing={missing}, rows={len(raw_df):,}")
+    if not missing:
+        # Show a tiny sample of non-null rates
+        nn = raw_df[["Company Customer Number","Fiscal Week Number","Pounds_CY"]].notna().mean().round(3)
+        print(f"[Behavior input check] not-null ratios: {nn.to_dict()}")
+
+    # 4) Recommendations + timeline prediction
+    if historical_df is not None and len(historical_df) > 0:
+        print("Historical data provided - analyzing patterns...")
+        engine.analyze_historical_zone_changes(historical_df)  # learn patterns
+
+        # NEW: pass granular CURRENT data so behavior signals can be computed
+        recommendations = engine.generate_immediate_high_confidence_recommendations(raw_df)
+
+        current_trend = {
+            'volume_decline_rate_pct': float(zone_df['Volume_Growth_Rate'].mean()) if 'Volume_Growth_Rate' in zone_df else 0.0,
+            'total_volume': float(zone_df['Pounds_CY'].sum()) if 'Pounds_CY' in zone_df else 0.0,
+        }
+        turnaround_prediction = engine.predict_historical_turnaround_timeline(recommendations, current_trend)
+    else:
+        print("No historical data - using current analysis only...")
+
+        # NEW: still compute recs from current behavior-aware features using granular CURRENT data
+        recommendations = engine.generate_immediate_high_confidence_recommendations(raw_df)
+
+        current_trend = {
+            'volume_decline_rate_pct': float(zone_df['Volume_Growth_Rate'].mean()) if 'Volume_Growth_Rate' in zone_df else 0.0,
+            'total_volume': float(zone_df['Pounds_CY'].sum()) if 'Pounds_CY' in zone_df else 0.0,
+        }
+        turnaround_prediction = engine.predict_volume_turnaround_timeline(recommendations, current_trend)
+
+
+    # 5) Executive dashboard
+    executive_dashboard = engine.generate_executive_dashboard(recommendations, turnaround_prediction)
+
+    # 6) Return payload
+    zone_assignments = zone_df['Company_Combo_Key'].tolist() if 'Company_Combo_Key' in zone_df.columns else []
+    return {
+        'zone_analysis': zone_analysis,
+        'recommendations': recommendations,
+        'turnaround_prediction': turnaround_prediction,
+        'executive_dashboard': executive_dashboard,
+        'historical_analysis_used': (historical_df is not None and len(historical_df) > 0),
+        'historical_patterns_count': len(getattr(engine, 'historical_patterns', {})),
+        'zone_assignments': zone_assignments,
+    }
+
+def add_zone_optimization_to_excel(xw, zone_optimization_results):
+    """
+    Add zone optimization tabs to your existing Excel file
+    Call this function from within your write_excel function
+    """
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    if not zone_optimization_results:
+        return
+
+    dashboard = zone_optimization_results['executive_dashboard']
+
+    # --- Helper for column widths ---
+    def autofit_columns(ws, min_width=12, max_width=80):
+        """Auto-size columns based on max length in each column."""
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except Exception:
+                    pass
+            # Pad a little, cap at max_width
+            adjusted_width = min(max(max_len + 2, min_width), max_width)
+            ws.column_dimensions[col_letter].width = adjusted_width
+
+    # --- 10 - Zone Dashboard ---
+    exec_df = pd.DataFrame([dashboard['executive_summary']])
+    exec_df.to_excel(xw, sheet_name="10_Zone_Dashboard", index=False, startrow=0)
+
+    ws = xw.book["10_Zone_Dashboard"]
+    autofit_columns(ws)   # auto-fit after writing
+
+    # Continue with your Immediate Action Items, Alerts, etc.
+    next_row = exec_df.shape[0] + 3
+
+    # Immediate action items (optional)
+    if dashboard['immediate_action_items']:
+        ws.cell(row=next_row, column=1, value="IMMEDIATE ACTION ITEMS - TOP PRIORITIES")
+        ws.cell(row=next_row, column=1).font = Font(bold=True)
+        actions_df = pd.DataFrame(dashboard['immediate_action_items'])
+        actions_df.to_excel(xw, sheet_name="10_Zone_Dashboard", index=False, startrow=next_row + 1)
+        next_row = next_row + 1 + actions_df.shape[0] + 3  # advance pointer
+
+    # Granularity expansion alerts (optional)
+    if dashboard['granularity_expansion_alerts']:
+        ws.cell(row=next_row, column=1, value="⚠️ ZONE 0 ALERTS - GRANULARITY EXPANSION NEEDED")
+        ws.cell(row=next_row, column=1).font = Font(bold=True, color="FF0000")
+        alerts_df = pd.DataFrame(dashboard['granularity_expansion_alerts'])
+        alerts_df.to_excel(xw, sheet_name="10_Zone_Dashboard", index=False, startrow=next_row + 1)
+        next_row = next_row + 1 + alerts_df.shape[0] + 3
+
+    # 11 - Detailed Zone Recommendations
+    recs_df = pd.DataFrame(zone_optimization_results['recommendations'])
+    # After: recs_df = pd.DataFrame(zone_optimization_results['recommendations'])
+    if not recs_df.empty:
+        # Flatten nested dicts
+        for side in ("behavior_current", "behavior_recommended"):
+            if side in recs_df.columns:
+                flat = pd.json_normalize(recs_df[side]).add_prefix(f"{side}.")
+                recs_df = pd.concat([recs_df.drop(columns=[side]), flat], axis=1)
+
+        # Ensure expected columns exist for Excel logic
+        needed = [
+            "behavior_current.repeat_buyer_rate","behavior_current.retention_4w","behavior_current.active_buyer_share",
+            "behavior_recommended.repeat_buyer_rate","behavior_recommended.retention_4w","behavior_recommended.active_buyer_share",
+            "behavior_current.BehaviorScore","behavior_recommended.BehaviorScore"
+        ]
+        for c in needed:
+            if c not in recs_df.columns: recs_df[c] = None
+
+        recs_df.to_excel(xw, sheet_name="11_Zone_Recommendations", index=False)
+
+    # After writing 11_Zone_Recommendations
+    if "11_Zone_Recommendations" in xw.book.sheetnames:
+        ws = xw.book["11_Zone_Recommendations"]
+
+        # Add a boolean column: Behavior_NonInferior (true if our guardrail passed)
+        cur_rb = _col_index_by_header(ws, "behavior_current.repeat_buyer_rate")
+        rec_rb = _col_index_by_header(ws, "behavior_recommended.repeat_buyer_rate")
+        cur_rt = _col_index_by_header(ws, "behavior_current.retention_4w")
+        rec_rt = _col_index_by_header(ws, "behavior_recommended.retention_4w")
+        cur_ab = _col_index_by_header(ws, "behavior_current.active_buyer_share")
+        rec_ab = _col_index_by_header(ws, "behavior_recommended.active_buyer_share")
+
+        if min(cur_rb, rec_rb, cur_rt, rec_rt, cur_ab, rec_ab) > 0:
+            new_c = ws.max_column + 1
+            ws.cell(1, new_c, "Behavior_NonInferior?")
+            eps = ALLOW_UPZONE_EPSILON
+            for r in range(2, ws.max_row + 1):
+                ws.cell(
+                    r, new_c,
+                    f"=AND("
+                    f"{get_column_letter(rec_rb)}{r}>={get_column_letter(cur_rb)}{r}+{eps},"
+                    f"{get_column_letter(rec_rt)}{r}>={get_column_letter(cur_rt)}{r}+{eps},"
+                    f"{get_column_letter(rec_ab)}{r}>={get_column_letter(cur_ab)}{r}+{eps})"
+                )
+            # Shade TRUE green, FALSE red
+            rng = f"{get_column_letter(new_c)}2:{get_column_letter(new_c)}{ws.max_row}"
+            ws.conditional_formatting.add(rng, CellIsRule(operator='equal', formula=['TRUE'], fill=None, font=None, stopIfTrue=False))
+            ws.conditional_formatting.add(rng, ColorScaleRule(start_type='min', start_color='FFC7CE', end_type='max', end_color='C6EFCE'))
+    
+    # --- Conditional formatting: 11b_Behavior_Compare ---
+    if "11b_Behavior_Compare" in xw.book.sheetnames:
+        ws = xw.book["11b_Behavior_Compare"]
+
+        # Build (or find) Delta columns
+        deltas = []
+        for metric in ["Repeat_Buyer_Rate", "Retention_4w", "Active_Buyer_Share", "BehaviorScore"]:
+            new_c = _add_delta_column(
+                ws,
+                f"Current_{metric}",
+                f"Recommended_{metric}",
+                f"Δ_{metric}"
+            )
+            if new_c > 0:
+                deltas.append(new_c)
+
+        # 3-color scale on each Δ_ column (red=low, yellow=mid, green=high)
+        for c in deltas:
+            col_letter = get_column_letter(c)
+            rng = f"{col_letter}2:{col_letter}{ws.max_row}"
+            ws.conditional_formatting.add(
+                rng,
+                ColorScaleRule(
+                    start_type='num', start_value=-0.05, start_color='FFC7CE',  # red
+                    mid_type='num', mid_value=0.0,  mid_color='FFEB9C',        # yellow
+                    end_type='num', end_value=0.05, end_color='C6EFCE'         # green
+                )
+            )
+
+        # Data bars on Recommended_BehaviorScore so high scores stand out
+        rec_bs_c = _col_index_by_header(ws, "Recommended_BehaviorScore")
+        if rec_bs_c > 0:
+            rng = f"{get_column_letter(rec_bs_c)}2:{get_column_letter(rec_bs_c)}{ws.max_row}"
+            ws.conditional_formatting.add(rng, DataBarRule(showValue=True))
+            # For the row-bold “winner” highlight:
+            dxf_bold = DifferentialStyle(font=Font(bold=True))
+            rule = Rule(type="expression", dxf=dxf_bold, stopIfTrue=False,
+                        formula=["$A2=$B2"])  # your formula here
+            ws.conditional_formatting.add(f"A2:Z{ws.max_row}", rule)
+
+    # 12 - Zone Performance Analysis
+    zone_analysis = zone_optimization_results['zone_analysis']
+    if zone_analysis:
+        analysis_rows = []
+        for company_combo, analysis in zone_analysis.items():
+            base_row = {
+                'Company_Combo': company_combo,
+                'Company_Name': analysis['company_name'],
+                'Combo_Description': analysis['combo_key'],
+                'Current_Optimal_Zone': analysis['optimal_zone'],
+                'Optimal_Performance_Score': analysis['optimal_performance'],  # now BehaviorScore if you patched earlier
+                'Price_Elasticity': analysis['price_elasticity'],
+                'Total_Volume': analysis['total_volume'],
+                'Zones_Tested': ', '.join(map(str, analysis['current_zones_tested'])),
+                'Analysis_Type': analysis['needs_analysis']['type'],
+                'Confidence': analysis['needs_analysis']['confidence'],
+                'Priority': analysis['needs_analysis']['priority']
+            }
+
+            for zone_perf in analysis['zone_performance_curve']:
+                row = base_row.copy()
+                # Existing fields
+                row['Zone_Number'] = zone_perf.get('Zone_Suffix_Numeric')
+                row['Zone_Volume_Performance'] = zone_perf.get('Volume_Performance')
+                row['Zone_Volume_Growth_Rate'] = zone_perf.get('Volume_Growth_Rate')
+                row['Zone_Customer_Growth_Rate'] = zone_perf.get('Customer_Growth_Rate')
+                row['Zone_Combined_Score'] = zone_perf.get('Combined_Performance_Score')
+
+                # === NEW behavior metrics (safe .get calls) ===
+                row['Zone_Repeat_Buyer_Rate']   = zone_perf.get('repeat_buyer_rate')
+                row['Zone_Retention_4w']        = zone_perf.get('retention_4w')
+                row['Zone_Active_Buyer_Share']  = zone_perf.get('active_buyer_share')
+                row['Zone_Avg_Freq']            = zone_perf.get('avg_freq')
+                row['Zone_Avg_Recency']         = zone_perf.get('avg_recency')
+                row['Zone_Avg_Margin_per_LB']   = zone_perf.get('avg_margin_per_lb')
+                row['Zone_BehaviorScore']       = zone_perf.get('BehaviorScore')
+
+                analysis_rows.append(row)
+
+        if analysis_rows:
+            perf_df = pd.DataFrame(analysis_rows)
+
+            # Make sure columns exist even if some combos lack behavior data
+            must_have = [
+                'Zone_Repeat_Buyer_Rate','Zone_Retention_4w','Zone_Active_Buyer_Share',
+                'Zone_Avg_Freq','Zone_Avg_Recency','Zone_Avg_Margin_per_LB','Zone_BehaviorScore'
+            ]
+            for c in must_have:
+                if c not in perf_df.columns:
+                    perf_df[c] = None
+
+            perf_df.to_excel(xw, sheet_name="12_Zone_Performance", index=False)
+    # --- Conditional formatting: 12_Zone_Performance ---
+    if "12_Zone_Performance" in xw.book.sheetnames:
+        ws = xw.book["12_Zone_Performance"]
+
+        # Data bars on BehaviorScore and Volume to see curve shape quickly
+        for header in ["Zone_BehaviorScore", "Total_Volume", "Zone_Combined_Score"]:
+            c = _col_index_by_header(ws, header)
+            if c > 0:
+                rng = f"{get_column_letter(c)}2:{get_column_letter(c)}{ws.max_row}"
+                ws.conditional_formatting.add(rng, DataBarRule(showValue=True))
+                # For the row-bold “winner” highlight:
+                dxf_bold = DifferentialStyle(font=Font(bold=True))
+                ws.conditional_formatting.add(
+                    f"A{r}:{last_col_letter}{r}",
+                    FormulaRule(formula=[f"${get_column_letter(znum_c)}{r}=${get_column_letter(optz_c)}{r}"], dxf=dxf_bold)
+                )
+                
+        # 3-color scale on Zone_Repeat_Buyer_Rate and Zone_Retention_4w (red→yellow→green)
+        for header in ["Zone_Repeat_Buyer_Rate", "Zone_Retention_4w"]:
+            c = _col_index_by_header(ws, header)
+            if c > 0:
+                rng = f"{get_column_letter(c)}2:{get_column_letter(c)}{ws.max_row}"
+                ws.conditional_formatting.add(
+                    rng,
+                    ColorScaleRule(
+                        start_type='num', start_value=0.0, start_color='FFC7CE',
+                        mid_type='num', mid_value=0.5, mid_color='FFEB9C',
+                        end_type='num', end_value=1.0, end_color='C6EFCE'
+                    )
+                )
+
+        # Bold the rows where Zone_Number == Current_Optimal_Zone (visual “winner”)
+        znum_c = _col_index_by_header(ws, "Zone_Number")
+        optz_c = _col_index_by_header(ws, "Current_Optimal_Zone")
+        if znum_c > 0 and optz_c > 0:
+            # Apply a formula rule across the whole row range
+            last_col_letter = get_column_letter(ws.max_column)
+            for r in range(2, ws.max_row + 1):
+                ws.conditional_formatting.add(
+                    f"A{r}:{last_col_letter}{r}",
+                    FormulaRule(
+                        formula=[f"${get_column_letter(znum_c)}{r}=${get_column_letter(optz_c)}{r}"],
+                        stopIfTrue=False,
+                        font={'bold': True}
+                    )
+                )
+
+    # 13 - Timeline Prediction
+    timeline = zone_optimization_results['turnaround_prediction']
+    if timeline and 'error' not in timeline:
+        timeline_df = pd.DataFrame([{
+            'Current_Decline_Rate_Pct': timeline.get('current_decline_rate_pct', 0) * 100,
+            'Total_Volume_Base': timeline.get('total_volume_base', timeline.get('total_volume', 0)),
+            'Potential_Volume_Lift': timeline.get('potential_volume_lift', 0),
+            'Immediate_Impact_Volume': timeline.get('immediate_impact_volume', 0),
+            'Medium_Term_Impact_Volume': timeline.get('medium_term_impact_volume', 0),
+            'Long_Term_Impact_Volume': timeline.get('long_term_impact_volume', 0),
+            'Predicted_Turnaround_Week': timeline.get('predicted_turnaround_week'),
+            'Prediction_Confidence': timeline.get('confidence', 0) * 100
+        }])
+        timeline_df.to_excel(xw, sheet_name="13_Timeline_Prediction", index=False)
+
+        if 'key_dependencies' in timeline:
+            deps_df = pd.DataFrame(timeline['key_dependencies'], columns=['Key_Dependencies'])
+            deps_start = timeline_df.shape[0] + 3
+            deps_df.to_excel(xw, sheet_name="13_Timeline_Prediction", index=False, startrow=deps_start)
+
+
+def create_enhanced_email_body(zone_optimization_results, source_file_name: str) -> str:
+    base_body = f"Auto-generated report for {source_file_name} at {datetime.now():%Y-%m-%d %H:%M}."
+    if not zone_optimization_results:
+        return base_body
+    zone_summary = zone_optimization_results['executive_dashboard']['executive_summary']
+    enhanced_body = f"""{base_body}
+
+ZONE OPTIMIZATION INSIGHTS:
+• {zone_summary['total_zone_opportunities']} zone optimization opportunities identified
+• {zone_summary['high_priority_actions']} high-priority actions recommended
+• {zone_summary['granularity_expansions_needed']} combos need granularity expansion (flagged Zone 0)
+• Predicted volume turnaround: Week {zone_summary['predicted_turnaround_week']}
+
+Key Actions Needed:
+""" + "\n".join(
+        f"• {action['company']}: {action['action']}"
+        for action in zone_optimization_results['executive_dashboard']['immediate_action_items'][:3]
+    )
+    return enhanced_body
+
+
+def add_zone_optimization_summary(summary_kpi_df: pd.DataFrame, zone_optimization_results: dict) -> pd.DataFrame:
+    if not zone_optimization_results:
+        return summary_kpi_df
+    exec_summary = zone_optimization_results['executive_dashboard']['executive_summary']
+    zone_summary_row = pd.DataFrame([{
+        'KPI': 'Zone Optimization Summary',
+        'Value': f"{exec_summary['total_zone_opportunities']} opportunities",
+        'High_Priority_Actions': exec_summary['high_priority_actions'],
+        'Granularity_Expansions_Needed': exec_summary['granularity_expansions_needed'],
+        'Predicted_Turnaround_Week': exec_summary['predicted_turnaround_week']
+    }])
+    return pd.concat([summary_kpi_df, zone_summary_row], ignore_index=True)
+
+
+if __name__ == "__main__":
+    # 0) Historical file paths
+    hist_paths = [
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\historical_shrimp_1.csv",
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\historical_shrimp_2.csv",
+    ]
+
+    # 1) Load & combine historicals
+    hist_list = []
+    for p in hist_paths:
+        if os.path.exists(p):
+            df = pd.read_csv(p, low_memory=False)
+            hist_list.append(df)
+            print(f"Loaded {os.path.basename(p)}: {len(df):,} rows")
+        else:
+            print(f"WARNING: not found -> {p}")
+
+    if not hist_list:
+        raise FileNotFoundError("No historical files loaded. Check paths.")
+
+    historical = pd.concat(hist_list, ignore_index=True)
+    historical = _normalize_cols(historical)
+
+    # 2) Ensure week is numeric and present
+    if 'Fiscal Week Number' not in historical.columns:
+        raise KeyError("Historical files must include 'Fiscal Week Number'.")
+    historical['Fiscal Week Number'] = pd.to_numeric(
+        historical['Fiscal Week Number'], errors='coerce'
+    )
+    historical = historical.dropna(subset=['Fiscal Week Number'])
+    historical['Fiscal Week Number'] = historical['Fiscal Week Number'].astype(int)
+
+    # 3) Build CURRENT snapshot from latest available week in historicals
+    latest_week = historical['Fiscal Week Number'].max()
+    print(f"Using latest fiscal week from historicals as CURRENT: {latest_week}")
+    latest = historical[historical['Fiscal Week Number'] == latest_week].copy()
+    latest = _normalize_cols(latest)  # <-- important to avoid str vs int errors
+
+    # 4) Aggregate CURRENT snapshot to combo level
+    group_cols = ['Company Name', 'NPD Cuisine Type', 'Attribute Group ID', 'Price Source Type']
+    for gc in group_cols:
+        if gc not in latest.columns:
+            latest[gc] = "UNKNOWN"
+
+    # build aggregation map with normalized names
+    agg_map = {}
+    if 'Pounds_CY' in latest.columns:     agg_map['Pounds_CY'] = 'sum'
+    if 'Pounds_PY' in latest.columns:     agg_map['Pounds_PY'] = 'sum'
+    if 'Delta_YoY_Lbs' in latest.columns: agg_map['Delta_YoY_Lbs'] = 'sum'
+
+    # distinct customers (prefer an id column if present)
+    cust_id_col = None
+    for cand in ['Company Customer Number', 'Customer Number', 'Customer ID']:
+        if cand in latest.columns:
+            cust_id_col = cand
+            break
+    if cust_id_col:
+        agg_map[cust_id_col] = 'nunique'
+
+    current_aggregated = latest.groupby(group_cols, dropna=False).agg(agg_map).reset_index()
+    current_aggregated = _normalize_cols(current_aggregated)
+
+    # 5) Bring representative Zone & Week back to the aggregated frame
+    zref_cols = [c for c in ['Price Zone ID', 'Zone_Suffix', 'Fiscal Week Number'] if c in latest.columns]
+    zref = latest[group_cols + zref_cols].copy()
+
+    if 'Price Zone ID' in zref.columns:
+        zref = zref.groupby(group_cols, dropna=False).agg({
+            'Price Zone ID': lambda s: s.mode().iat[0] if not s.mode().empty
+                                      else (s.dropna().iat[0] if s.dropna().size else None),
+            'Fiscal Week Number': 'max' if 'Fiscal Week Number' in zref.columns else 'max'
+        }).reset_index()
+    else:
+        # fallback: use Zone_Suffix and synthesize a Price Zone ID
+        zref = zref.groupby(group_cols, dropna=False).agg({
+            'Zone_Suffix': lambda s: s.mode().iat[0] if not s.mode().empty
+                                     else (s.dropna().iat[0] if s.dropna().size else None),
+            'Fiscal Week Number': 'max' if 'Fiscal Week Number' in zref.columns else 'max'
+        }).reset_index()
+        if 'Zone_Suffix' in zref.columns:
+            zref['Price Zone ID'] = zref['Zone_Suffix'].astype(str)
+
+    current_aggregated = current_aggregated.merge(
+        zref[[*group_cols, 'Price Zone ID', 'Fiscal Week Number']].drop_duplicates(),
+        on=group_cols, how='left'
+    )
+
+    # 6) Run the engine (learns from full historical, recommends on current)
+    results = integrate_zone_optimization_with_historical_data(
+        status_df=current_aggregated,
+        raw_df=latest,
+        historical_df=historical
+    )
+
+    print("Executive summary:", results['executive_dashboard']['executive_summary'])
+    
+        # --- SAVE ARTIFACTS ---
+    # 1) CSV of recommendations
+    pd.DataFrame(results['recommendations']).to_csv(
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\zone_recommendations.csv",
+        index=False
+    )
+
+    # 2) CSV of detailed zone analysis
+    za = results['zone_analysis']
+    if isinstance(za, dict) and za:
+        rows = []
+        for k, a in za.items():
+            base = {
+                'Company_Combo': k,
+                'Company_Name': a['company_name'],
+                'Combo_Description': a['combo_key'],
+                'Current_Optimal_Zone': a['optimal_zone'],
+                'Optimal_Performance_Score': a['optimal_performance'],
+                'Price_Elasticity': a['price_elasticity'],
+                'Total_Volume': a['total_volume'],
+                'Zones_Tested': ', '.join(map(str, a['current_zones_tested'])),
+                'Analysis_Type': a['needs_analysis']['type'],
+                'Confidence': a['needs_analysis']['confidence'],
+                'Priority': a['needs_analysis']['priority'],
+            }
+            for zp in a['zone_performance_curve']:
+                row = base.copy()
+                row.update({
+                    'Zone_Number': zp['Zone_Suffix_Numeric'],
+                    'Zone_Volume_Performance': zp['Volume_Performance'],
+                    'Zone_Volume_Growth_Rate': zp['Volume_Growth_Rate'],
+                    'Zone_Customer_Growth_Rate': zp['Customer_Growth_Rate'],
+                    'Zone_Combined_Score': zp['Combined_Performance_Score'],
+                })
+                rows.append(row)
+        pd.DataFrame(rows).to_csv(
+            r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\zone_performance_detail.csv",
+            index=False
+        )
+
+
+    # 3) Excel dashboard tabs
+    from openpyxl import Workbook
+    from pandas import ExcelWriter
+    with ExcelWriter(
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\zone_dashboard.xlsx",
+        engine="openpyxl"
+    ) as xw:
+        add_zone_optimization_to_excel(xw, results)
+    print("Artifacts saved: CSVs + Excel dashboard.")
+
