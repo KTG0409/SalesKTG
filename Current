@@ -1833,7 +1833,12 @@ class FoodserviceZoneEngine:
             lapsed_pct = lapsed_customers / total_customers if total_customers > 0 else 0
             
             total_volume = combo_data['Pounds_CY'].sum()
-            
+
+            # Skip if no volume AND no lapsed customers to recover
+            if total_volume == 0 and lapsed_customers == 0:
+                print(f"   ⏭️  SKIPPED: No volume and no customers to recover")
+                continue
+
             print(f"   Customers: {total_customers} total, {active_customers} active, {lapsed_customers} lapsed ({lapsed_pct:.1%})")
             print(f"   Volume: {total_volume:,.0f} lbs")
             
@@ -2273,10 +2278,10 @@ def create_reactive_pricing_alerts(reactive_flags: Dict) -> pd.DataFrame:
             'What_Happened': flag['stakeholder_message'],
             'High_Zone_Used': flag['from_zone'],
             'Panic_Drop_To': flag['to_zone'],
-            'Customers_Lost_First': flag['customers_lapsed_before_drop'],
+            'Volume_Decline_Before': f"{flag['pre_decline_pct']:.1%}",
+            'Volume_Recovery_After': f"{flag['post_recovery_pct']:.1%}",
             'Likely_True_Optimal': flag['likely_true_optimal'],
-            'Recovery_Rate': f"{flag['volume_recovery_rate']:+.1%}",
-            'Trust_Level': flag['trust_level']
+            'Trust_Level': 'MEDIUM - Based on volume trends'
         })
     
     return pd.DataFrame(alerts)
@@ -3136,9 +3141,15 @@ if __name__ == "__main__":
     latest_week = combined['Fiscal Week Number'].max()
     print(f"\n   📅 Latest week in data: {latest_week}")
 
-    # Extract current - BEFORE normalization!
-    current_df = combined[combined['Fiscal Week Number'] == latest_week].copy()
-    print(f"   📊 Using this as 'current' baseline")
+    # Extract current - LAST 8 WEEKS (not just Week 52!)
+    lookback_weeks = 8
+    current_week_start = latest_week - lookback_weeks + 1
+
+    current_df = combined[
+        combined['Fiscal Week Number'].between(current_week_start, latest_week)
+    ].copy()
+
+    print(f"   📊 Using weeks {current_week_start}-{latest_week} as 'current' baseline (last {lookback_weeks} weeks)")
     print(f"   ✅ Current baseline: {len(current_df):,} rows")
 
     # Save to temp WITH ORIGINAL COLUMN NAMES
