@@ -984,8 +984,20 @@ def classify_customer_activity_from_weeks(df: pd.DataFrame,
     print(f"      Customer classification:")
     for status, count in status_counts.items():
         print(f"         • {status}: {count:,}")
-    
+
+    # Check if Last Invoice mapping worked
+    if 'Weeks_Since_Any_Purchase' in df.columns:
+        active_but_lapsed = df[
+            (df['Customer_Status'] == 'LAPSED_FROM_CATEGORY') & 
+            (df['Weeks_Since_Any_Purchase'] <= 8)
+        ]
+        print(f"      ✅ Last Invoice mapping worked")
+        print(f"      🎯 Found {len(active_but_lapsed):,} rows where customer lapsed from category but still active")
+    else:
+        print(f"      ❌ Last Invoice Date NOT mapped - all customers may look lost!")
+
     return df
+    
 
 def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) -> pd.DataFrame:
     """
@@ -2866,7 +2878,7 @@ def write_stakeholder_excel(recommendations: List[Dict],
             {'Metric': 'Customers We Can Win Back', 'Value': exec_summary['customers_to_win_back']},
             {'Metric': 'Total Volume at Stake', 'Value': exec_summary['total_volume_at_stake']},
             {'Metric': '', 'Value': ''},  # Spacer
-            {'Metric': '📊 YEAR-OVER-YEAR CUSTOMER METRICS', 'Value': ''},
+            {'Metric': 'YEAR-OVER-YEAR CUSTOMER METRICS', 'Value': ''},
             {'Metric': 'Distinct Customers This Year', 'Value': exec_summary.get('distinct_customers_this_year', 'N/A')},
             {'Metric': 'Distinct Customers Last Year', 'Value': exec_summary.get('distinct_customers_last_year', 'N/A')},
             {'Metric': 'Customer Change', 'Value': exec_summary.get('customer_change_count', 'N/A')},
@@ -3278,25 +3290,26 @@ if __name__ == "__main__":
             print(f"   ✅ Loaded {os.path.basename(path)}: {len(df):,} rows")
 
     combined = pd.concat(all_hist, ignore_index=True)
-    # DON'T NORMALIZE YET - we need original column names for validation
-
-    # Find latest week
-    combined['Fiscal Week Number'] = pd.to_numeric(
-        combined['Fiscal Week Number'], 
-        errors='coerce'
-    )
-    latest_week = combined['Fiscal Week Number'].max()
-    print(f"\n   📅 Latest week in data: {latest_week}")
-
-    # Extract current - LAST 8 WEEKS (not just Week 52!)
+    # Find latest week using COMBINED format (YYYYWW)
+    combined['Fiscal_Year'] = pd.to_numeric(combined['Fiscal Year Key'], errors='coerce').fillna(0).astype(int)
+    combined['Fiscal_Week_Num'] = pd.to_numeric(combined['Fiscal Week Number'], errors='coerce').fillna(0).astype(int)
+    combined['Fiscal_Week_Combined'] = (combined['Fiscal_Year'] * 100 + combined['Fiscal_Week_Num']).astype(int)
+    
+    latest_week_combined = combined['Fiscal_Week_Combined'].max()
+    latest_week = latest_week_combined % 100  # Keep this for compatibility
+    fiscal_year = latest_week_combined // 100
+    
+    print(f"\n   📅 Latest week in data: {latest_week_combined} (FY{fiscal_year} Week {latest_week})")
+    
+    # Extract current - LAST 8 WEEKS using combined identifier
     lookback_weeks = 8
-    current_week_start = latest_week - lookback_weeks + 1
-
+    current_week_start = latest_week_combined - lookback_weeks + 1
+    
     current_df = combined[
-        combined['Fiscal Week Number'].between(current_week_start, latest_week)
+        combined['Fiscal_Week_Combined'].between(current_week_start, latest_week_combined)
     ].copy()
-
-    print(f"   📊 Using weeks {current_week_start}-{latest_week} as 'current' baseline (last {lookback_weeks} weeks)")
+    
+    print(f"   📊 Using weeks {current_week_start}-{latest_week_combined} as 'current' baseline (last {lookback_weeks} weeks)")
     print(f"   ✅ Current baseline: {len(current_df):,} rows")
 
     # Save to temp WITH ORIGINAL COLUMN NAMES
@@ -3314,7 +3327,7 @@ if __name__ == "__main__":
     # STEP 3: Generate reports by Company Number
     # ==========================================
     
-    company_ids = ['13']  # Keep the full format with zeros
+    company_ids = ['']  # Keep the full format with zeros
 
     for company_id in company_ids:
         print(f"\n{'='*60}")
@@ -3339,12 +3352,12 @@ if __name__ == "__main__":
         recommendations, reactive_flags = run_foodservice_zone_optimization(
             current_data_path=temp_current_path,
             historical_data_paths=HISTORICAL_DATA,
-            output_name=f'{safe_company_name}_{company_id}_{CATEGORY_NAME}_zones',
+            output_name=f'ALL_COMPANIES_{CATEGORY_NAME}_zones',
             data_config=data_config,
             enable_learning=True,
             yoy_lookback_weeks=8,
-            filter_company_number=company_id,  # ✅ CORRECT NAME
-            filter_company_region_id=None  # ✅ CORRECT NAME
+            filter_company_number=None,
+            filter_company_region_id=None
         )
         
         print(f"\n✅ Report complete for {company_name} (Company #: {company_id})")
