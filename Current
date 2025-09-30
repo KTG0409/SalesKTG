@@ -1430,22 +1430,22 @@ def calculate_yoy_customer_metrics(df: pd.DataFrame,
     df = df.copy()
     
     # Ensure we have fiscal week data
-    if config.data_config.fiscal_week_column not in df.columns:
+    if 'Fiscal_Week' not in df.columns:
         print("   ⚠️  Warning: No fiscal week column, can't calculate YoY with lookback")
         return {}
     
     # Ensure numeric
-    df['Fiscal_Week'] = pd.to_numeric(df[config.data_config.fiscal_week_column], errors='coerce')
+    df['Fiscal_Week'] = pd.to_numeric(df['Fiscal_Week'], errors='coerce')
     df = df.dropna(subset=['Fiscal_Week'])
     df['Fiscal_Week'] = df['Fiscal_Week'].astype(int)
     
     # Ensure we have Pounds columns
-    if 'Pounds_CY' not in df.columns or config.data_config.pounds_py_column not in df.columns:
+    if 'Pounds_CY' not in df.columns or 'Pounds_PY' not in df.columns:
         print("   ⚠️  Warning: Missing Pounds_CY or Pounds_PY column")
         return {}
     
     df['Pounds_CY'] = pd.to_numeric(df['Pounds_CY'], errors='coerce').fillna(0)
-    df['Pounds_PY'] = pd.to_numeric(df[config.data_config.pounds_py_column], errors='coerce').fillna(0)
+    df['Pounds_PY'] = pd.to_numeric(df['Pounds_PY'], errors='coerce').fillna(0)
     
     # Get latest week and calculate lookback window
     latest_week = df['Fiscal_Week'].max()
