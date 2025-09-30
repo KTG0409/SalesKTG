@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+Complete Validation - Checks data prep AND recommendation outputs
+Usage: python validate_all.py comparison_file.csv [optional: historical.csv current.csv]
+"""
+
+import pandas as pd
+import sys
+from pathlib import Path
+
+def validate_recommendations(comparison_file):
+    """Validate recommendation outputs."""
+    print("\n" + "="*60)
+    print("PART 1: RECOMMENDATION QUALITY CHECK")
+    print("="*60)
+    
+    df = pd.read_csv(comparison_file)
+    issues = []
+    warnings = []
+    passes = []
+    
+    print(f"\nAnalyzing {len(df)} recommendations...")
+    
+    # Zone direction
+    bad_moves = df[df['recommended_zone'] > df['current_zone']]
+    if len(bad_moves) > 0:
+        issues.append(f"CRITICAL: {len(bad_moves)} recs INCREASE zones")
+    else:
+        passes.append(f"All {len(df)} recs move to lower zones")
+    
+    # Volume
+    zero_vol = df[df['total_volume_baseline'] == 0]
+    if len(zero_vol) > 0:
+        issues.append(f"CRITICAL: {len(zero_vol)} recs have ZERO volume")
+    
+    low_vol = df[(df['total_volume_baseline'] > 0) & (df['total_volume_baseline'] < 100)]
+    if len(low_vol) > 0:
+        warnings.append(f"{len(low_vol)} recs have <100 lbs volume")
+    
+    # Customers
+    few_customers = df[df['active_customers_baseline'] < 5]
+    if len(few_customers) > 0:
+        warnings.append(f"{len(few_customers)} recs have <5 customers")
+    
+    good_customers = df[df['active_customers_baseline'] >= 10]
+    if len(good_customers) > 0:
+        passes.append(f"{len(good_customers)} recs have 10+ customers")
+    
+    # Zones
+    zone_zero = df[(df['recommended_zone'] == 0) | (df['current_zone'] == 0)]
+    if len(zone_zero) > 0:
+        warnings.append(f"{len(zone_zero)} recs involve Zone 0")
+    
+    invalid = df[(df['recommended_zone'] > 5) | (df['current_zone'] > 5)]
+    if len(invalid) > 0:
+        issues.append(f"CRITICAL: {len(invalid)} recs have invalid zones (>5)")
+    
+    # Report Part 1
+    print("\nPASSED:")
+    for p in passes:
+        print(f"  - {p}")
+    
+    if warnings:
+        print("\nWARNINGS:")
+        for w in warnings:
+            print(f"  - {w}")
+    
+    if issues:
+        print("\nCRITICAL ISSUES:")
+        for i in issues:
+            print(f"  - {i}")
+    
+    return len(issues) == 0
+
+def validate_data_prep(hist_path, curr_path):
+    """Validate data preparation."""
+    print("\n" + "="*60)
+    print("PART 2: DATA PREPARATION CHECK")
+    print("="*60)
+    
+    hist = pd.read_csv(hist_path, low_memory=False)
+    curr = pd.read_csv(curr_path, low_memory=False)
+    
+    issues = []
+    passes = []
+    
+    # Historical columns
+    hist_required = ['Pounds_CY', 'Pounds_PY', 'Fiscal_Week_Combined', 'Zone_Suffix_Numeric']
+    for col in hist_required:
+        if col not in hist.columns:
+            issues.append(f"Historical missing: {col}")
+    
+    if not issues:
+        passes.append("Historical has all normalized columns")
+    
+    # Fiscal week format
+    if 'Fiscal_Week_Combined' in hist.columns:
+        max_week = hist['Fiscal_Week_Combined'].max()
+        if max_week < 10000:
+            issues.append(f"Fiscal weeks not YYYYWW format")
+        else:
+            passes.append(f"Fiscal weeks correct (range: {hist['Fiscal_Week_Combined'].min()}-{max_week})")
+    
+    # Data volume
+    if len(hist) > 100000:
+        passes.append(f"Historical volume good ({len(hist):,} rows)")
+    
+    if len(curr) > 10000:
+        passes.append(f"Current volume good ({len(curr):,} rows)")
+    
+    # Report Part 2
+    print("\nPASSED:")
+    for p in passes:
+        print(f"  - {p}")
+    
+    if issues:
+        print("\nISSUES:")
+        for i in issues:
+            print(f"  - {i}")
+    
+    return len(issues) == 0
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python validate_all.py comparison_file.csv [historical.csv current.csv]")
+        sys.exit(1)
+    
+    comparison_file = sys.argv[1]
+    
+    # Part 1: Always check recommendations
+    recs_ok = validate_recommendations(comparison_file)
+    
+    # Part 2: Check data prep if files provided
+    data_ok = True
+    if len(sys.argv) >= 4:
+        hist_file = sys.argv[2]
+        curr_file = sys.argv[3]
+        data_ok = validate_data_prep(hist_file, curr_file)
+    
+    # Overall verdict
+    print("\n" + "="*60)
+    if recs_ok and data_ok:
+        print("OVERALL: ALL CHECKS PASSED")
+    elif not recs_ok:
+        print("OVERALL: FIX RECOMMENDATION ISSUES")
+    else:
+        print("OVERALL: FIX DATA PREP ISSUES")
+    print("="*60 + "\n")
+
+if __name__ == "__main__":
+    main()
