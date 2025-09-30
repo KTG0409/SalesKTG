@@ -114,16 +114,10 @@ class DataConfiguration:
 
 @dataclass
 class InputConfiguration:
-    """
-    Configure input file paths.
+    """Configure input file paths."""
     
-    Simple explanation:
-    "Tell the system where your data files are. Paste the file paths here."
-    """
-    
-    # Current week data (required)    
     current_data_path: str = ""
-    historical_data_paths: List[str] = None  # ✅ Use None as default
+    historical_data_paths: List[str] = None
     
     # Output settings
     output_directory: str = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing"
@@ -1669,6 +1663,145 @@ def detect_reactive_pricing_failures(df: pd.DataFrame,
     
     return flags
 
+def load_fiscal_calendar(calendar_path: str) -> pd.DataFrame:
+    """Load and prepare fiscal calendar for date-to-week conversion."""
+    cal = pd.read_csv(calendar_path)
+    
+    # Parse dates
+    cal['week_start_date'] = pd.to_datetime(cal['week start date'], errors='coerce')
+    cal['week_end_date'] = pd.to_datetime(cal['week end date'], errors='coerce')
+    
+    # Create combined fiscal week ID (YYYYWW)
+    cal['fiscal_week_combined'] = cal['fiscal year'] * 100 + cal['fiscal week number']
+    
+    return cal[['fiscal_week_combined', 'fiscal year', 'fiscal week number', 
+                'week_start_date', 'week_end_date']]
+
+
+def map_date_to_fiscal_week(dates: pd.Series, fiscal_calendar: pd.DataFrame) -> pd.Series:
+    """
+    Convert calendar dates to fiscal week numbers.
+    
+    Args:
+        dates: Series of datetime dates
+        fiscal_calendar: DataFrame from load_fiscal_calendar()
+    
+    Returns:
+        Series of fiscal week numbers (1-52)
+    """
+    
+    result = pd.Series(index=dates.index, dtype='Int64')
+    
+    for idx, date in dates.items():
+        if pd.isna(date):
+            result[idx] = pd.NA
+            continue
+        
+        # Find which fiscal week this date falls into
+        mask = (fiscal_calendar['week_start_date'] <= date) & (date <= fiscal_calendar['week_end_date'])
+        matching_weeks = fiscal_calendar[mask]
+        
+        if len(matching_weeks) > 0:
+            result[idx] = matching_weeks.iloc[0]['fiscal week number']
+        else:
+            result[idx] = pd.NA
+    
+    return result
+
+
+def classify_customer_activity_from_weeks(df: pd.DataFrame, 
+                                          config: FoodserviceConfig,
+                                          fiscal_calendar: pd.DataFrame = None) -> pd.DataFrame:
+    """
+    Classify customers using fiscal weeks consistently.
+    
+    Simple explanation:
+    "Based on fiscal weeks since their last purchase:
+    - 0-6 weeks ago = ACTIVE (still buying)
+    - 7-8 weeks ago but bought OTHER stuff = LAPSED (THE OPPORTUNITY!)
+    - 9+ weeks ago = LOST (gone too long)"
+    """
+    
+    print("\n   🏷️  Classifying customers by purchase recency...")
+    
+    df = df.copy()
+    
+    # Ensure we have the weeks column for THIS category
+    if 'Weeks_Since_Last_Purchase' not in df.columns:
+        df = create_last_purchase_week(df, config)
+    
+    df['Has_CY_Volume'] = df['Pounds_CY'] > 0
+    
+    # Check if Last Invoice Date exists and convert to fiscal week
+    has_last_invoice = config.data_config.last_invoice_date_column in df.columns
+    
+    if has_last_invoice and fiscal_calendar is not None:
+        print("      📅 Converting Last Invoice Date to fiscal weeks...")
+        
+        df['Last_Invoice_Date'] = pd.to_datetime(
+            df[config.data_config.last_invoice_date_column],
+            errors='coerce'
+        )
+        
+        # Map Last Invoice Date to fiscal week
+        df['Last_Invoice_Fiscal_Week'] = map_date_to_fiscal_week(
+            df['Last_Invoice_Date'], 
+            fiscal_calendar
+        )
+        
+        # Calculate weeks since ANY purchase (using fiscal weeks)
+        max_week = df['Fiscal_Week'].max()
+        df['Weeks_Since_Any_Purchase'] = max_week - df['Last_Invoice_Fiscal_Week']
+        df['Weeks_Since_Any_Purchase'] = df['Weeks_Since_Any_Purchase'].fillna(999)
+        
+        print(f"      ✅ Mapped Last Invoice Date to fiscal weeks")
+    
+    # Classification logic
+    def classify(row):
+        weeks_since_category = row['Weeks_Since_Last_Purchase']
+        has_volume = row['Has_CY_Volume']
+        
+        # If they have current volume, they're active
+        if has_volume:
+            return 'ACTIVE_BUYER'
+        
+        # Use Last Invoice fiscal week if available
+        if has_last_invoice and fiscal_calendar is not None:
+            weeks_since_any = row.get('Weeks_Since_Any_Purchase', 999)
+            
+            if weeks_since_category >= 8:  # 8+ weeks since THIS category
+                if weeks_since_any <= 8:  # But bought OTHER stuff within 8 weeks
+                    return 'LAPSED_FROM_CATEGORY'  # THE OPPORTUNITY!
+                else:
+                    return 'LOST_CUSTOMER'  # Gone entirely
+            else:
+                return 'ACTIVE_BUYER'
+        else:
+            # Fallback if no Last Invoice Date
+            if weeks_since_category <= 6:
+                return 'ACTIVE_BUYER'
+            elif weeks_since_category <= 8:
+                return 'LAPSED_FROM_CATEGORY'
+            else:
+                return 'LOST_CUSTOMER'
+    
+    df['Customer_Status'] = df.apply(classify, axis=1)
+    
+    # Recovery potential
+    df['Recovery_Potential'] = df['Customer_Status'].map({
+        'ACTIVE_BUYER': 0,
+        'LAPSED_FROM_CATEGORY': 10,  # HIGH PRIORITY
+        'LOST_CUSTOMER': 2
+    })
+    
+    # Count by status
+    status_counts = df['Customer_Status'].value_counts()
+    print(f"      Customer classification:")
+    for status, count in status_counts.items():
+        print(f"         • {status}: {count:,}")
+    
+    return df
+
 # ============================================================================
 # ZONE OPTIMIZATION ENGINE
 # ============================================================================
@@ -1691,11 +1824,18 @@ class FoodserviceZoneEngine:
         
         df = df.copy()
         
+        # STEP 0: Load fiscal calendar
+        calendar_path = os.path.join(
+            r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing",
+            "calendar.csv"
+        )
+        fiscal_calendar = load_fiscal_calendar(calendar_path)
+        
         # STEP 1: Create Last Purchase Week from fiscal week data
         df = create_last_purchase_week(df, self.config)
         
-        # STEP 2: Classify customers by recency
-        df = classify_customer_activity_from_weeks(df, self.config)
+        # STEP 2: Classify customers by recency (NOW WITH FISCAL CALENDAR)
+        df = classify_customer_activity_from_weeks(df, self.config, fiscal_calendar)
         
         # STEP 3: Calculate purchase consistency (THE GREEN FLAG!)
         self.consistency_analysis = calculate_purchase_consistency(df, self.config)
@@ -1707,7 +1847,8 @@ class FoodserviceZoneEngine:
         # STEP 5: Store for later use
         self.customer_analysis = self._build_customer_summary(df)
         
-        return df
+        return df  # ← CRITICAL: Must return the dataframe!
+        
     
     def _build_customer_summary(self, df: pd.DataFrame) -> pd.DataFrame:
         """Aggregate customer metrics by combo and zone."""
@@ -2893,7 +3034,7 @@ def create_comparison_export(recommendations: List[Dict],
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
-
+CATEGORY_NAME = "groundfish"
 def run_foodservice_zone_optimization(
     current_data_path: str,
     historical_data_paths: Optional[List[str]] = None,
@@ -3192,7 +3333,7 @@ if __name__ == "__main__":
         recommendations, reactive_flags = run_foodservice_zone_optimization(
             current_data_path=temp_current_path,
             historical_data_paths=HISTORICAL_DATA,
-            output_name=f'{safe_company_name}_{company_id}_shrimp_zones',
+            output_name=f'{safe_company_name}_{company_id}_{CATEGORY_NAME}_zones',
             data_config=data_config,
             enable_learning=True,
             yoy_lookback_weeks=8,
