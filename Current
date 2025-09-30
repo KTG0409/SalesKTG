@@ -1920,12 +1920,18 @@ class FoodserviceZoneEngine:
             journey_df = track_customer_zone_journeys(historical_df, self.config)
             
             if not journey_df.empty:
-                # Calculate weighted zone scores
-                zone_scores = calculate_weighted_zone_scores(journey_df, self.config)
+                # Calculate lapse penalties
+                lapse_penalty_df = calculate_lapse_penalty(historical_df, self.config)
+                # Calculate weighted zone scores WITH penalties
+                zone_scores = calculate_weighted_zone_scores(journey_df, self.config, lapse_penalty_df)
             else:
                 # Fallback to simple scoring if journey tracking fails
                 print("      ⚠️  Journey tracking empty, using simple scoring")
                 zone_scores = calculate_simple_zone_scores(historical_df, self.config)
+            
+            # Calculate YoY customer metrics (MOVED OUTSIDE if/else!)
+            print("\n📊 Calculating YoY customer metrics...")
+            self.yoy_customer_metrics = calculate_yoy_customer_metrics(historical_df, self.config)
             
             # Detect reactive pricing
             self.reactive_flags = detect_reactive_pricing_simple(historical_df, self.config)
