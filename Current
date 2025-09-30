@@ -890,23 +890,34 @@ def create_last_purchase_week(df: pd.DataFrame, config: FoodserviceConfig) -> pd
     
     df = df.copy()
     
-    # Ensure numeric
-    df['Fiscal_Week_Numeric'] = pd.to_numeric(
-        df[config.data_config.fiscal_week_column], 
-        errors='coerce'
-    )
+    # Use existing Fiscal_Week_Combined if available, otherwise create Fiscal_Week_Numeric
+    if 'Fiscal_Week_Combined' in df.columns:
+        week_column = 'Fiscal_Week_Combined'
+    elif 'Fiscal_Week' in df.columns:
+        week_column = 'Fiscal_Week'
+    else:
+        df['Fiscal_Week_Numeric'] = pd.to_numeric(
+            df[config.data_config.fiscal_week_column], 
+            errors='coerce'
+        )
+        week_column = 'Fiscal_Week_Numeric'
     df['Pounds_CY'] = pd.to_numeric(df['Pounds_CY'], errors='coerce').fillna(0)
     
     # Get latest week in dataset
-    max_week = df['Fiscal_Week_Numeric'].max()
-    print(f"      Latest week in data: {int(max_week)}")
+    max_week = df[week_column].max()
+    if max_week > 10000:  # Combined format (YYYYWW)
+        fy = int(max_week // 100)
+        fw = int(max_week % 100)
+        print(f"      Latest week in data: FY{fy} Week {fw} (YYYYWW: {int(max_week)})")
+    else:  # Just week number
+        print(f"      Latest week in data: Week {int(max_week)}")
     
     # For each customer, find their LAST purchase week (where Pounds CY > 0)
     active_purchases = df[df['Pounds_CY'] > 0].copy()
     
     last_purchase = active_purchases.groupby(
         config.data_config.customer_id_column
-    )['Fiscal_Week_Numeric'].max().reset_index()
+    )[week_column].max().reset_index()
     
     last_purchase.columns = [config.data_config.customer_id_column, 'Last_Purchase_Week']
     
@@ -1251,9 +1262,9 @@ def calculate_lapse_penalty(df: pd.DataFrame, config: FoodserviceConfig) -> pd.D
     customer_zones.columns = ['combo', 'zone', 'customer', 'last_category_week']
     
     # Get Last Invoice Date for each customer (from full df, not filtered)
-    if config.data_config.last_invoice_date_column in df.columns:
+    if 'Last_Invoice_Date' in df.columns:
         last_invoice = df.groupby(config.data_config.customer_id_column)[
-            config.data_config.last_invoice_date_column
+            'Last_Invoice_Date'
         ].max().reset_index()
         last_invoice.columns = ['customer', 'last_any_purchase_date']
         
@@ -1440,7 +1451,14 @@ def calculate_yoy_customer_metrics(df: pd.DataFrame,
     """
     
     df = df.copy()
-    
+
+    # DEBUG: Check what we received
+    print(f"   🔍 DEBUG: DataFrame has {len(df):,} rows")
+    print(f"   🔍 DEBUG: Columns available: {list(df.columns[:10])}...")  # First 10 columns
+    print(f"   🔍 DEBUG: Has Fiscal_Week_Combined? {'Fiscal_Week_Combined' in df.columns}")
+    if 'Fiscal_Week_Combined' in df.columns:
+        print(f"   🔍 DEBUG: Week range: {df['Fiscal_Week_Combined'].min()}-{df['Fiscal_Week_Combined'].max()}")
+        
     # Ensure we have fiscal week data
     if 'Fiscal_Week' not in df.columns:
         print("   ⚠️  Warning: No fiscal week column, can't calculate YoY with lookback")
@@ -1459,16 +1477,23 @@ def calculate_yoy_customer_metrics(df: pd.DataFrame,
     df['Pounds_CY'] = pd.to_numeric(df['Pounds_CY'], errors='coerce').fillna(0)
     df['Pounds_PY'] = pd.to_numeric(df['Pounds_PY'], errors='coerce').fillna(0)
     
-    # Get latest week and calculate lookback window
-    latest_week = df['Fiscal_Week'].max()
-    lookback_weeks = config.YOY_LOOKBACK_WEEKS
-    cutoff_week = latest_week - lookback_weeks + 1
-    
-    print(f"   📅 Comparing Weeks {cutoff_week}-{latest_week} (last {lookback_weeks} weeks)")
-    
-    # Filter to lookback window
-    recent_data = df[df['Fiscal_Week'] >= cutoff_week].copy()
-    
+    # Use COMBINED fiscal week (YYYYWW)
+    if 'Fiscal_Week_Combined' in df.columns:
+        latest_week_combined = df['Fiscal_Week_Combined'].max()  # Gets 202613
+        lookback_weeks = config.YOY_LOOKBACK_WEEKS
+        cutoff_week = latest_week_combined - lookback_weeks + 1  # 202613 - 8 + 1 = 202606
+
+        print(f"   🔍 DEBUG: cutoff_week = {cutoff_week}, latest = {latest_week_combined}")
+        print(f"   🔍 DEBUG: Fiscal_Week_Combined dtype = {df['Fiscal_Week_Combined'].dtype}")
+        print(f"   📅 Comparing Weeks {cutoff_week}-{latest_week_combined} (last {lookback_weeks} weeks)")
+        # Filter to lookback window
+        recent_data = df[df['Fiscal_Week_Combined'] >= cutoff_week].copy()
+    else:
+        # Fallback if combined column doesn't exist
+        latest_week = df['Fiscal_Week'].max()
+        lookback_weeks = config.YOY_LOOKBACK_WEEKS
+        cutoff_week = latest_week - lookback_weeks + 1
+        recent_data = df[df['Fiscal_Week'] >= cutoff_week].copy()                 
     if recent_data.empty:
         print("   ⚠️  No data in lookback window")
         return {}
@@ -1485,7 +1510,7 @@ def calculate_yoy_customer_metrics(df: pd.DataFrame,
     # Overall metrics
     overall = {
         'lookback_weeks': lookback_weeks,
-        'week_range': f"{cutoff_week}-{latest_week}",
+        'week_range': f"{cutoff_week}-{cutoff_week + lookback_weeks - 1}",
         'distinct_customers_cy': len(cy_customers),
         'distinct_customers_py': len(py_customers),
         'customer_change': len(cy_customers) - len(py_customers),
@@ -1745,13 +1770,13 @@ def classify_customer_activity_from_weeks(df: pd.DataFrame,
     df['Has_CY_Volume'] = df['Pounds_CY'] > 0
     
     # Check if Last Invoice Date exists and convert to fiscal week
-    has_last_invoice = config.data_config.last_invoice_date_column in df.columns
+    has_last_invoice = 'Last_Invoice_Date' in df.columns
     
     if has_last_invoice and fiscal_calendar is not None:
         print("      📅 Converting Last Invoice Date to fiscal weeks...")
         
         df['Last_Invoice_Date'] = pd.to_datetime(
-            df[config.data_config.last_invoice_date_column],
+            df['Last_Invoice_Date'],
             errors='coerce'
         )
         
@@ -2650,10 +2675,11 @@ def _normalize_columns(df: pd.DataFrame, config: DataConfiguration) -> pd.DataFr
             df['Fiscal_Year'] = pd.to_numeric(df['Fiscal Year Key'], errors='coerce').fillna(0).astype(int)
             
             # Create YYYYWW format for proper sorting across years
-            df['Fiscal_Week_Combined'] = (df['Fiscal_Year'] * 100 + df['Fiscal_Week']).astype(int)
-            
-            print(f"      ✅ Combined fiscal identifier created:")
-            print(f"         Latest: Year {df['Fiscal_Year'].max()}, Week {df['Fiscal_Week'].max()} (Combined: {df['Fiscal_Week_Combined'].max()})")
+            df['Fiscal_Week_Combined'] = (df['Fiscal_Year'] * 100 + df['Fiscal_Week']).astype(int)        
+            fiscal_year = df['Fiscal_Year'].max()
+            fiscal_week = df['Fiscal_Week'].max()
+            combined = df['Fiscal_Week_Combined'].max()
+            print(f"      ✅ Combined fiscal identifier: FY{fiscal_year} Week {fiscal_week} (YYYYWW: {combined})")
         else:
             df['Fiscal_Week_Combined'] = df['Fiscal_Week']
             print(f"      ✅ Using fiscal week only (no year column found)")
@@ -2919,6 +2945,7 @@ def write_stakeholder_excel(recommendations: List[Dict],
             if not alerts.empty:
                 alerts.to_excel(writer, sheet_name='4_REACTIVE_ALERTS', index=False)
         
+        
         # ==========================================
         # TAB 5: Implementation Timeline
         # ==========================================
@@ -3174,7 +3201,48 @@ def run_foodservice_zone_optimization(
     # Get reactive flags
     reactive_flags = engine.reactive_flags
     print(f"   ⚠️  Found {len(reactive_flags)} reactive pricing patterns")
-    
+    # ==========================================
+    # FILTER TO HIGH-IMPACT RECOMMENDATIONS ONLY
+    # ==========================================
+    print("\n🎯 Filtering to high-impact recommendations...")
+
+    original_count = len(recommendations)
+
+    # Define impact thresholds
+    MIN_VOLUME = 50  
+    MIN_CUSTOMERS = 3  
+    MIN_PRIORITY = 60  
+    MIN_VOLUME_PER_CUSTOMER = 150  # High-value customer threshold
+
+    high_impact = []
+
+    for rec in recommendations:
+        volume_potential = rec['total_volume']
+        if rec['lapsed_customers'] > 0:
+            volume_potential += rec['total_volume'] * 0.3  
+        
+        # Calculate volume per customer
+        total_customers = rec['total_customers']
+        volume_per_customer = volume_potential / total_customers if total_customers > 0 else 0
+        
+        # Check all criteria
+        meets_volume = volume_potential >= MIN_VOLUME
+        meets_priority = rec['implementation_priority'] >= MIN_PRIORITY
+        
+        # Need 3+ customers AND EITHER 5+ customers OR high volume per customer
+        meets_customers = (
+            rec['total_customers'] >= MIN_CUSTOMERS and
+            (rec['total_customers'] >= 5 or volume_per_customer >= MIN_VOLUME_PER_CUSTOMER)
+        )
+        
+        if meets_volume and meets_customers and meets_priority:
+            high_impact.append(rec)
+
+    print(f"   📊 Filtered from {original_count} → {len(high_impact)} recommendations")
+    print(f"   🎯 Focus: Volume ≥{MIN_VOLUME} lbs, Priority ≥{MIN_PRIORITY}, Customers ≥3 (with 5+ OR {MIN_VOLUME_PER_CUSTOMER}+ lbs/customer)")
+
+    # Replace recommendations with filtered list
+    recommendations = high_impact
     # Save to learning system
     if learning_engine:
         print("\n💾 Saving recommendations to learning system...")
@@ -3236,6 +3304,16 @@ def run_foodservice_zone_optimization(
 
 
 if __name__ == "__main__":
+    
+    # ==========================================
+    # CONFIGURATION
+    # ==========================================
+    
+    # Set to specific company number to filter, or None for all companies
+    TARGET_COMPANY = None  # Change to '13' to filter to Company 13
+    
+    # Enable/disable learning system persistence
+    ENABLE_LEARNING_PERSISTENCE = False  # Set to True to track recommendations over time
     
     # ==========================================
     # STEP 1: Configure your data columns
@@ -3321,49 +3399,66 @@ if __name__ == "__main__":
     print(f"   💾 Saved current baseline: {temp_current_path}")
 
     # NOW normalize for filtering
-    combined = _normalize_columns(combined, data_config)  # Only normalize after saving temp
-    
-    # ==========================================
-    # STEP 3: Generate reports by Company Number
-    # ==========================================
-    
-    company_ids = ['']  # Keep the full format with zeros
+    combined = _normalize_columns(combined, data_config)
 
-    for company_id in company_ids:
+    # TEMP: Save normalized historical for audit
+    normalized_hist_path = os.path.join(
+        r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing",
+        "temp_normalized_historical.csv"
+    )
+    combined.to_csv(normalized_hist_path, index=False)
+    print(f"   💾 Saved normalized historical for audit: {normalized_hist_path}")
+    
+# ==========================================
+# STEP 3: Generate report
+# ==========================================
+
+    if TARGET_COMPANY:
         print(f"\n{'='*60}")
-        print(f"Processing Company Number: {company_id}")
+        print(f"Processing Company Number: {TARGET_COMPANY}")
         print('='*60)
         
-        # Look up company name - STRIP LEADING ZEROS FOR COMPARISON
+        # Look up company name
         filtered_data = combined[
-            combined[data_config.company_number_column].astype(str).str.strip().str.lstrip('0') == str(company_id).lstrip('0')  # ← Strip zeros from both sides
+            combined[data_config.company_number_column].astype(str).str.strip().str.lstrip('0') == str(TARGET_COMPANY).lstrip('0')
         ]
         
         if filtered_data.empty:
-            print(f"   ❌ No data found for Company Number '{company_id}'")
-            continue
+            print(f"   ❌ No data found for Company Number '{TARGET_COMPANY}'")
+            exit()
         
         company_name = filtered_data[data_config.company_column].iloc[0]
-        print(f"   📍 Company Name: {company_name}")
-        
         safe_company_name = str(company_name).replace(' ', '_').replace('/', '_')
+        output_name = f'{safe_company_name}_{TARGET_COMPANY}_{CATEGORY_NAME}_zones'
         
-        # Run analysis
-        recommendations, reactive_flags = run_foodservice_zone_optimization(
-            current_data_path=temp_current_path,
-            historical_data_paths=HISTORICAL_DATA,
-            output_name=f'ALL_COMPANIES_{CATEGORY_NAME}_zones',
-            data_config=data_config,
-            enable_learning=True,
-            yoy_lookback_weeks=8,
-            filter_company_number=None,
-            filter_company_region_id=None
-        )
-        
-        print(f"\n✅ Report complete for {company_name} (Company #: {company_id})")
+        print(f"   📍 Company Name: {company_name}")
+    else:
+        print(f"\n{'='*60}")
+        print(f"Processing ALL Companies - Aggregated Opportunities")
+        print('='*60)
+        output_name = f'ALL_COMPANIES_{CATEGORY_NAME}_zones'
+
+    # Run analysis
+    recommendations, reactive_flags = run_foodservice_zone_optimization(
+        current_data_path=temp_current_path,
+        historical_data_paths=HISTORICAL_DATA,
+        output_name=output_name,
+        data_config=data_config,
+        enable_learning=ENABLE_LEARNING_PERSISTENCE,  
+        filter_company_number=TARGET_COMPANY,
+        filter_company_region_id=None
+    )
+
+    if TARGET_COMPANY:
+        print(f"\n✅ Report complete for {company_name} (Company #: {TARGET_COMPANY})")
+    else:
+        print(f"\n✅ Aggregated report complete for ALL companies")
     
-    # Cleanup
-    if os.path.exists(temp_current_path):
-        os.remove(temp_current_path)
-    
+    # Cleanup (KEEP FILES FOR AUDIT)
+    print("\n📋 FILES SAVED FOR LOGIC AUDIT:")
+    print(f"   • Historical: {normalized_hist_path}")
+    print(f"   • Current: {temp_current_path}")
     print("\n🎉 ALL DONE!")
+    print("\n💡 Run audit with:")
+    print(f"   python logic_audit.py {normalized_hist_path} {temp_current_path}")
+    
