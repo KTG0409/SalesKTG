@@ -12,7 +12,6 @@ import smtplib
 from email.message import EmailMessage
 from pathlib import Path
 
-
 # Triggered by file addition
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -22,9 +21,17 @@ from threading import Timer
 from openpyxl.chart import LineChart, BarChart, Reference  # type: ignore
 from openpyxl.utils.dataframe import dataframe_to_rows  # type: ignore
 from openpyxl.styles import Font  # type: ignore
-from openpyxl.styles import numbers  # type: ignore
 from openpyxl.chart import LineChart, BarChart, Reference
-from openpyxl.worksheet.dimensions import RowDimension
+from openpyxl.chart.text import RichText
+from openpyxl.drawing.text import Paragraph, ParagraphProperties, CharacterProperties
+from openpyxl.chart.shapes import GraphicalProperties 
+
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from pptx.chart.data import CategoryChartData
+from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.dml.color import RGBColor
 
 # Load .env configuration for email message
 from dotenv import load_dotenv
@@ -97,85 +104,42 @@ def send_email_with_attachments(subject: str, body: str, attachments: list[str])
         print(f"    ✓ Email sent to {len(MAIL_TO)} recipient(s).")
     except Exception as e:
         print(f"    ❌ Email send failed: {e}")
-
+        
 # ================= USER CONFIG =================
-# CLI args still override these if provided.
+BASE_PATH = r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Lawrence\Shrimp_Prawns"
+
 DEFAULTS = {
-    "source": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\groundfish.csv",
-    "alignment":  r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Alignment.csv",
-    "outdir":     r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\output",
-    "company": None,              # e.g. "55" or "Jackson" (matches Company Number OR Company Name, see filter below)
-    "attr_groups": None,          # e.g. "538,550"
-    "vendors": None,              # e.g. "4074,1260"
-    "forecast_method": "linear",  # or "runrate"
-
-    # NEW: Leads controls
-    "leads_company": "67",        # e.g. '"55","Jackson"' -> ONLY build Sales Leads for these sites (Number or Name)
-    "leads_acct_types": 'TRS,LCC',# Sales Leads only for these Customer Account Types (csv list)
-    "vendor_leads_active": "Y",   # "Y" or "N" — when Y, create vendor-specific leads CSVs (TRS accounts ONLY)
-    "min_ytd_per_week": 20,       # <-- NEW: gentler threshold for leads (vs 50)
-    "vendor_leads_respect_site_filter": "N",  # <-- NEW: vendor leads ignore --leads-company by default
-
+    "source": None,  # ← Change from specific file to None
+    "alignment": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Lawrence\Shrimp_Prawns\Alignment550.csv",
+    "outdir": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Lawrence\Shrimp_Prawns\Outputs",
+    "watch_dir": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Lawrence\Shrimp_Prawns\Inputs",  
+    
+    # SITE FILTERING 
+    "company": '37',  # ← Confirm: Site 37 only? Or None for all sites?
+    
+    # Category filtering
+    "attr_groups": None,  # All categories in the 550 file
+    "vendors": None,  # All vendors
+    
+    # Forecast method for weekly projections
+    "forecast_method": "linear",
+    
+    # ========== SALES LEADS CONFIGURATION ==========
+    "leads_company": None,  # Uses company filter above (Site 37)
+    "leads_acct_types": 'TRS,LCC',  # TRS + LCC accounts
+    "min_ytd_per_week": 20,  # 20 lbs/week minimum
+    
+    # ========== VENDOR LEAD SPLITS CONFIGURATION ==========
+    "vendor_leads_active": "Y",  # Yes, create vendor CSVs
+    "vendor_leads_respect_site_filter": "N",  # Vendors see ALL sites (not just 37)
+    
+    # ========== WIN-BACK TARGETS CONFIGURATION ==========
+    "active_customer_weeks": 8,  # 8 weeks = "active"
+    
+    # ========== PRESENTATION CONFIGURATION ==========
+    "create_powerpoint": "Y",  # Yes, create PowerPoint
+    "ppt_top_n_targets": 10,  # Top 10 targets on slide
 }
-
-# ---------------------------- Email via .env ----------------------------
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASS = os.getenv("SMTP_PASS", "")
-
-# Recipients can be comma or semicolon separated in .env
-def _split_recipients(s: str) -> list[str]:
-    return [e.strip() for e in (s or "").replace(",", ";").split(";") if e.strip()]
-
-MAIL_TO = _split_recipients(os.getenv("MAIL_TO", ""))
-MAIL_CC = _split_recipients(os.getenv("MAIL_CC", ""))
-MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
-MAIL_SUBJECT = os.getenv("MAIL_SUBJECT", "[Auto] Category Report")
-EMAIL_ENABLED = os.getenv("EMAIL_ENABLED", "1") == "1"
-
-def send_email_with_attachments(subject: str, body: str, attachments: list[str]) -> None:
-    if not EMAIL_ENABLED:
-        print("    ⛔ Email disabled by EMAIL_ENABLED in .env — skipping.")
-        return
-    if not (SMTP_USER and SMTP_PASS and MAIL_TO):
-        print("    ⚠ Email not configured (need SMTP_USER, SMTP_PASS, MAIL_TO). Skipping.")
-        return
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = subject
-        msg["From"] = MAIL_FROM or SMTP_USER
-        msg["To"] = ", ".join(MAIL_TO)
-        if MAIL_CC:
-            msg["Cc"] = ", ".join(MAIL_CC)
-        msg.set_content(body or "")
-
-        for ap in attachments or []:
-            p = Path(ap)
-            if not p.exists():
-                continue
-            data = p.read_bytes()
-            ext = p.suffix.lower()
-            maintype, subtype = ("application", "octet-stream")
-            if ext == ".pdf":
-                maintype, subtype = ("application", "pdf")
-            elif ext == ".csv":
-                maintype, subtype = ("text", "csv")
-            elif ext == ".xlsx":
-                maintype, subtype = ("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=p.name)
-
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-
-        print(f"    ✓ Email sent to {len(MAIL_TO)} recipient(s){' + CC' if MAIL_CC else ''}.")
-    except Exception as e:
-        print(f"    ❌ Email sending failed: {e}")
-
-
 # ---------------------------- Helpers ----------------------------
 def _clean_str(x):
     if pd.isna(x): return ""
@@ -311,20 +275,22 @@ def compute_windows(df):
     # current week
     current_week = int(pd.to_numeric(df.get("Fiscal Week Number", 0), errors="coerce").fillna(0).max()) if len(df) else 0
 
-    # Ensure the account-type column exists so we can aggregate by it
+    # Ensure the account-type column exists
     if "Customer Account Type Code" not in df.columns:
         df["Customer Account Type Code"] = "UNKNOWN"
 
-    # REQUIRED grouping keys (now includes Account Type)
+    # REQUIRED grouping keys (DEDENT THIS - same level as the if statement above)
     key = [
         "Company Number","Company Name",
         "Customer Name","Company Customer Number",
-        "Customer Account Type Code",        # <-- NEW: add account type to the key
+        "Customer Account Type Code",
         "Lot Number","Lot Description",
         "Attribute Group ID","Attribute Group Name",
+        "Business Center Name",
         "Alignment Key",
         "SUPC","SUVC","Supplier Name"
     ]
+    
     missing = [c for c in key if c not in df.columns]
     if missing:
         raise SystemExit(f"compute_windows(): required columns missing: {missing}")
@@ -332,7 +298,6 @@ def compute_windows(df):
     df = df.copy()
     for col in ["Pounds CY","Pounds PY"]:
         if col not in df.columns: df[col] = 0.0
-
     # Aligned flags & derived lbs
     both_flag = ((df.get("IsAlignedItem", 0).astype(int)) & (df.get("IsAlignedVendor", 0).astype(int))).astype(int)
     df["ItemAligned_Lbs"] = df["Pounds CY"] * df.get("IsAlignedItem", 0)
@@ -521,22 +486,68 @@ def build_sales_leads(status, raw_df, min_ytd):
     return out
 
 def vendor_splits(leads_df, vendors_filter, outdir):
-    os.makedirs(os.path.join(outdir, "Vendor_Leads"), exist_ok=True)
+    """
+    Create individual CSV files for each vendor with their TRS-only leads.
+    
+    NOTE: Vendor splits are ALWAYS filtered to TRS accounts only.
+    
+    Args:
+        leads_df: Full leads dataframe
+        vendors_filter: Comma-separated vendor numbers to include (None = all)
+        outdir: Output directory
+    """
+    vendor_dir = os.path.join(outdir, "Vendor_Leads")
+    os.makedirs(vendor_dir, exist_ok=True)
+    
     if "Aligned Vendor (SUVC)" not in leads_df.columns:
+        print("    ⚠ No 'Aligned Vendor (SUVC)' column - skipping vendor splits")
         return []
-    files = []
-    subset = leads_df[leads_df["Aligned Vendor (SUVC)"].notna() & (leads_df["Aligned Vendor (SUVC)"]!="")]
+    
+    # HARDCODED: Vendor splits are ALWAYS TRS only
+    subset = leads_df.copy()
+    if "Customer Account Type Code" in subset.columns:
+        subset = subset[subset["Customer Account Type Code"] == "TRS"]
+        print(f"    Vendor splits: TRS only ({len(subset)} leads)")
+    else:
+        print(f"    ⚠ Customer Account Type Code not found - cannot filter to TRS")
+        return []
+    
+    # Get valid vendors
+    subset = subset[subset["Aligned Vendor (SUVC)"].notna() & (subset["Aligned Vendor (SUVC)"]!="")]
+    
+    if subset.empty:
+        print("    ℹ No TRS leads found for vendor splits")
+        return []
+    
     aligned_vendors = subset["Aligned Vendor (SUVC)"].dropna().unique().tolist()
+    
+    # Apply vendor filter if specified
     if vendors_filter:
         keep = set([v.strip() for v in vendors_filter.split(",") if v.strip()])
         aligned_vendors = [v for v in aligned_vendors if v in keep]
-
+        print(f"    Vendor splits filtered to vendors: {keep}")
+    
+    files = []
     for v in aligned_vendors:
         dfv = subset[subset["Aligned Vendor (SUVC)"] == v].copy()
-        if dfv.empty: continue
-        fname = os.path.join(outdir, "Vendor_Leads", f"vendor_{v}_leads.csv")
+        if dfv.empty: 
+            continue
+
+        # Remove vendor's own number/name from their leads file
+        cols_to_drop = ["True Vendor Number", "True Vendor Name"]
+        dfv = dfv.drop(columns=cols_to_drop, errors='ignore')
+        
+        # Add vendor name to filename if available
+        vendor_name = dfv["Aligned Supplier Name"].iloc[0] if "Aligned Supplier Name" in dfv.columns else "Unknown"
+        vendor_name = str(vendor_name)  # Convert to string (handles int vendor IDs)
+        # Clean name for filename
+        safe_name = "".join(c for c in vendor_name if c.isalnum() or c in (' ', '-', '_')).strip()[:30]
+        
+        fname = os.path.join(vendor_dir, f"Vendor_{v}_{safe_name}_TRS_leads.csv")
         dfv.to_csv(fname, index=False)
         files.append(fname)
+        print(f"    ✓ Vendor {v} ({safe_name}): {len(dfv)} TRS leads")
+    
     return files
 
 def build_summary(status, current_week):
@@ -754,175 +765,178 @@ def _write_account_tab(xw, tab_name, df):
 
 def _write_weekly_chart_only_tab(xw, sheet_name, weekly_df, forecast_method_desc):
     from openpyxl.chart import BarChart, LineChart, Reference
-    from openpyxl.worksheet.dimensions import RowDimension, ColumnDimension
-
-    df_out = weekly_df.copy()
-    DATA_START = 199  # header at Excel row 200
-    df_out.to_excel(xw, sheet_name=sheet_name, index=False, startrow=DATA_START)
-
-    ws = xw.book[sheet_name]
-    ws.sheet_view.showGridLines = False
-
-    # locate headers in the hidden table (row 200)
-    headers = {cell.value: cell.col_idx for cell in ws[DATA_START + 1] if cell.value is not None}
-    col_week  = headers.get("Fiscal Week Number")
-    col_delta = headers.get("Delta_YoY_Lbs") or headers.get("Delta Pounds YoY")
-    col_yoy   = headers.get("YoY_Pct") or headers.get("YoY %")
-    if not all([col_week, col_delta, col_yoy]):
-        return
-
-    n = df_out.shape[0]
-    header_row = DATA_START + 1
-    first_row  = header_row + 1
-    last_row   = header_row + n
-
-    # bar: Δ YoY lbs
-    bar = BarChart()
-    bar.title = f"Weekly Δ YoY lbs + YoY% ({forecast_method_desc})"
-    bar.y_axis.title = "Δ YoY lbs"
-    bar.x_axis.title = "Fiscal Week"
-    bar.style = 10
-    bar.width, bar.height = 32, 16
-
-    bar_data = Reference(ws, min_col=col_delta, min_row=header_row, max_row=last_row)
-    bar.add_data(bar_data, titles_from_data=True)
-    x_ref = Reference(ws, min_col=col_week, min_row=first_row, max_row=last_row)
-    bar.set_categories(x_ref)
-
-    # line: YoY % on secondary axis
-    line = LineChart()
-    line.y_axis.axId = 200
-    line.y_axis.crosses = "max"
-    line.y_axis.title = "YoY %"
-    line.smooth = True
-    try:
-        line.y_axis.number_format = "0%"
-        line.y_axis.majorUnit = 0.1
-        line.y_axis.scaling.min = -0.5
-        line.y_axis.scaling.max = 0.5
-    except Exception:
-        pass
-
-    line_data = Reference(ws, min_col=col_yoy, min_row=header_row, max_row=last_row)
-    line.add_data(line_data, titles_from_data=True)
-    bar += line
-    # after `bar += line`
-    try:
-        bar.y_axis.number_format = '#,##0'
-        bar.y_axis.title = "Δ YoY lbs"
-        bar.x_axis.title = "Fiscal Week"
-
-        line.y_axis.number_format = '0%'
-        line.y_axis.title = "YoY %"
-        line.y_axis.majorUnit = 0.1
-        line.y_axis.scaling.min = -0.5
-        line.y_axis.scaling.max = 0.5
-        line.smooth = True
-    except Exception:
-        pass
-    ws.add_chart(bar, "A1")
-    ws.sheet_view.showGridLines = False
-
-
-    # hide the support table so the sheet looks truly “chart only”
-    for r in range(header_row, last_row + 1):
-        ws.row_dimensions[r] = RowDimension(ws, r, hidden=True)
-    for c in range(min(col_week, col_delta, col_yoy), max(col_week, col_delta, col_yoy) + 1):
-        ws.column_dimensions[ws.cell(row=1, column=c).column_letter] = ColumnDimension(ws, ws.cell(row=1, column=c).column_letter, hidden=True)
-
-
-def _write_weekly_combo_chart(ws, data_start_row: int, n_data_rows: int, title: str):
-    """
-    Combo chart with secondary axis.
-    Table layout starting at data_start_row (0-based for header row):
-      A: Fiscal Week Number
-      B: CY
-      C: PY
-      D: Delta_YoY_Lbs
-      E: YoY_Pct
-    """
-    if n_data_rows < 1:
-        return
-
-    header_row = data_start_row + 1      # 1-indexed row of headers in Excel
-    first_data = header_row + 1          # first data row (under header)
-    last_data  = header_row + n_data_rows
-
-    # Bars: Delta YoY (col D) on primary axis
-    bar = BarChart()
-    bar.title = title
-    bar.y_axis.title = "Delta Pounds YoY"
-    bar.x_axis.title = "Fiscal Week"
-    bar.y_axis.axId = 100
-
-    x_ref = Reference(ws, min_col=1, min_row=first_data, max_row=last_data)   # A
-    y_bar = Reference(ws, min_col=4, min_row=first_data, max_row=last_data)   # D
-    bar.add_data(y_bar, titles_from_data=False)
-    bar.set_categories(x_ref)
-
-    # Line: YoY % (col E) on secondary axis
-    line = LineChart()
-    line.y_axis.axId = 200
-    line.y_axis.title = "YoY %"
-    line.y_axis.scaling.max = 1.0
-    line.y_axis.scaling.min = -1.0
-    y_line = Reference(ws, min_col=5, min_row=first_data, max_row=last_data)  # E
-    line.add_data(y_line, titles_from_data=False)
-    line.y_axis.crosses = "max"
-
-    # Combine
-    bar += line
-
-    # ----- readable axes & size -----
-    try:
-        bar.y_axis.number_format = '#,##0'   # commas for Δ YoY lbs
-        bar.y_axis.title = "Δ YoY lbs"
-
-        line.y_axis.number_format = '0%'     # percent for YoY%
-        line.y_axis.title = "YoY %"
-        line.smooth = True
-    except Exception:
-        pass
-
-    bar.style = 10
-    bar.width = 32
-    bar.height = 16
-
-    ws.add_chart(bar, f"A{last_data + 2}")
-
-def _write_weekly_tab(xw, sheet_name, weekly_df, forecast_method_desc):
-    """
-    Writes the weekly table at row 1, then appends notes, then a combo chart.
-    """
+    from openpyxl.chart.shapes import GraphicalProperties
+    
+    # Write data at top
     df_out = weekly_df.copy()
     df_out.to_excel(xw, sheet_name=sheet_name, index=False, startrow=0)
+    
     ws = xw.book[sheet_name]
-
-    # data rows = len(df_out); header is at row 1 in Excel
-    n_data_rows = df_out.shape[0]
-    if n_data_rows >= 1:
-        _write_weekly_combo_chart(
-            ws,
-            data_start_row=0,        # header row index for Excel (0 -> row 1)
-            n_data_rows=n_data_rows,
-            title=f"Weekly Δ YoY lbs + YoY% ({sheet_name})"
-        )
-
-    # optional notes under the table
-    notes_row = n_data_rows + 3
+    
+    # Find columns
+    headers = {cell.value: cell.col_idx for cell in ws[1] if cell.value is not None}
+    col_week = headers.get("Fiscal Week Number")
+    col_cy = headers.get("CY")
+    col_delta = headers.get("Delta_YoY_Lbs")
+    col_yoy = headers.get("YoY_Pct")
+    col_type = headers.get("Type")
+    
+    if not all([col_week, col_delta, col_yoy]):
+        print(f"      ⚠ Missing columns for chart in {sheet_name}")
+        return
+    
+    n_rows = df_out.shape[0]
+    actual_count = df_out[df_out['Type'] == 'Actual'].shape[0] if col_type else n_rows
+    
+    # === CREATE HELPER COLUMNS FOR POSITIVE/NEGATIVE BARS ===
+    ws.cell(1, 12, value="Delta (Positive)")
+    ws.cell(1, 13, value="Delta (Negative)")
+    
+    for i in range(2, n_rows+2):
+        val = ws.cell(i, col_delta).value
+        if val and float(val) >= 0:
+            ws.cell(i, 12, value=val)  # Positive values in col 12
+            ws.cell(i, 13, value=None)
+        else:
+            ws.cell(i, 12, value=None)
+            ws.cell(i, 13, value=val)  # Negative values in col 13
+    
+    # === BAR CHART ===
+    bar = BarChart()
+    bar.type = "col"
+    bar.grouping = "clustered"
+    bar.title = f"Weekly Performance & {forecast_method_desc}"
+    bar.width = 30
+    bar.height = 18
+    bar.gapWidth = 30
+    
+    # POSITIVE bars (green)
+    pos_data = Reference(ws, min_col=12, min_row=1, max_row=n_rows+1)
+    bar.add_data(pos_data, titles_from_data=True)
+    bar.series[0].graphicalProperties.solidFill = "92D050"  # Light green
+    bar.series[0].graphicalProperties.line.noFill = True
+    
+    # NEGATIVE bars (red)
+    neg_data = Reference(ws, min_col=13, min_row=1, max_row=n_rows+1)
+    bar.add_data(neg_data, titles_from_data=True)
+    bar.series[1].graphicalProperties.solidFill = "FF6B6B"  # Light red
+    bar.series[1].graphicalProperties.line.noFill = True
+    
+    # X-axis
+    x_ref = Reference(ws, min_col=col_week, min_row=2, max_row=n_rows+1)
+    bar.set_categories(x_ref)
+    
+    # === PRIMARY Y-AXIS ===
+    bar.y_axis.title = "Delta Pounds YoY"
+    bar.y_axis.number_format = '#,##0'
+    bar.y_axis.delete = False
+    
+    from openpyxl.chart.axis import ChartLines
+    bar.y_axis.majorGridlines = ChartLines()
+    
+    # === X-AXIS ===
+    bar.x_axis.title = "Fiscal Week"
+    bar.x_axis.delete = False
+    bar.x_axis.tickLblPos = "low"
+    
+    # === ACTUAL CY LINE ===
+    actual_line = LineChart()
+    actual_line.y_axis.axId = 100
+    
+    ws.cell(1, 10, value="CY Pounds (Actual)")
+    actual_data = Reference(ws, min_col=10, min_row=1, max_row=actual_count+1)
+    for i in range(2, actual_count+2):
+        ws.cell(i, 10, value=ws.cell(i, col_cy).value)
+    
+    actual_line.add_data(actual_data, titles_from_data=True)
+    actual_line.set_categories(Reference(ws, min_col=col_week, min_row=2, max_row=actual_count+1))
+    
+    try:
+        actual_line.series[0].graphicalProperties.line.width = 30000
+        actual_line.series[0].graphicalProperties.line.solidFill = "4472C4"
+    except:
+        pass
+    
+    bar += actual_line
+    
+    # === FORECAST LINE ===
+    if actual_count < n_rows:
+        forecast_line = LineChart()
+        forecast_line.y_axis.axId = 100
+        
+        ws.cell(1, 11, value="CY Pounds (Forecast)")
+        forecast_data = Reference(ws, min_col=11, min_row=1, max_row=n_rows+1)
+        
+        ws.cell(actual_count+1, 11, value=ws.cell(actual_count+1, col_cy).value)
+        for i in range(actual_count+2, n_rows+2):
+            ws.cell(i, 11, value=ws.cell(i, col_cy).value)
+        
+        forecast_line.add_data(forecast_data, titles_from_data=True)
+        forecast_line.set_categories(Reference(ws, min_col=col_week, min_row=actual_count+1, max_row=n_rows+1))
+        
+        try:
+            forecast_line.series[0].graphicalProperties.line.width = 35000
+            forecast_line.series[0].graphicalProperties.line.dashStyle = "dash"
+            forecast_line.series[0].graphicalProperties.line.solidFill = "ED7D31"
+        except:
+            pass
+        
+        bar += forecast_line
+    
+    # === YoY % LINE ===
+    yoy_line = LineChart()
+    yoy_line.y_axis.axId = 200
+    yoy_line.y_axis.crosses = "max"
+    yoy_line.y_axis.title = "YoY % Change"
+    yoy_line.y_axis.number_format = '0%'
+    yoy_line.y_axis.delete = False
+    yoy_line.y_axis.majorGridlines = ChartLines()
+    
+    yoy_data = Reference(ws, min_col=col_yoy, min_row=1, max_row=n_rows+1)
+    yoy_line.add_data(yoy_data, titles_from_data=True)
+    yoy_line.set_categories(x_ref)
+    
+    try:
+        yoy_line.series[0].graphicalProperties.line.width = 25000
+        yoy_line.series[0].graphicalProperties.line.solidFill = "70AD47"
+    except:
+        pass
+    
+    bar += yoy_line
+    
+    # === LEGEND ===
+    bar.legend.position = 'tr'
+    try:
+        bar.legend.spPr = GraphicalProperties(solidFill="FFFFFF")
+    except:
+        pass
+    
+    ws.add_chart(bar, f"A{n_rows + 4}")
+    
+    # Notes
+    notes_row = n_rows + 38
     notes = [
-        ["Notes"],
-        ["- Clustered bar shows Delta Pounds YoY; line (right axis) shows YoY%."],
-        [f"- Includes 12-week {forecast_method_desc} appended for CY pounds (YoY calcs blank for forecast rows)."]
+        ["CHART GUIDE:"],
+        ["• Green Bars = Positive Delta (growth vs last year)"],
+        ["• Red Bars = Negative Delta (decline vs last year)"],
+        ["• Blue Line = CY Pounds Actual"],
+        ["• Orange Dashed = CY Pounds Forecast"],
+        ["• Green Line = YoY % (right axis)"],
+        [""],
+        [f"Actual: Weeks 1-{actual_count}  |  Forecast: Weeks {actual_count+1}-{n_rows}"]
     ]
+    
     for i, row in enumerate(notes):
-        ws.cell(row=notes_row + i, column=1, value=row[0])
+        cell = ws.cell(row=notes_row + i, column=1, value=row[0])
         if i == 0:
-            ws.cell(row=notes_row + i, column=1).font = Font(bold=True)
-
+            cell.font = Font(bold=True, size=12)
+    
+    print(f"      ✓ Chart with color-coded bars (green=positive, red=negative)")
     
 def _format_table_at(ws, header_row_0idx: int, n_rows: int,
                      number_headers=None, percent_headers=None):
+    from openpyxl.styles import Alignment  # Add this import
+    
     number_headers = set(number_headers or [])
     percent_headers = set(percent_headers or [])
     header_row_1idx = header_row_0idx + 1
@@ -931,7 +945,7 @@ def _format_table_at(ws, header_row_0idx: int, n_rows: int,
     if n_rows <= 0:
         return
 
-    # Map header text in THIS table
+    # Map header text in THIS table only
     header_to_col = {str(c.value).strip(): c.col_idx
                      for c in ws[header_row_1idx] if c.value is not None}
 
@@ -950,14 +964,6 @@ def _format_table_at(ws, header_row_0idx: int, n_rows: int,
         except Exception:
             pass
 
-    # Clear any stale formats in only the targeted columns
-    for h in (number_headers | percent_headers):
-        col = header_to_col.get(h)
-        if not col:
-            continue
-        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
-            row[0].number_format = "General"
-
     # Numbers
     for h in number_headers:
         col = header_to_col.get(h)
@@ -975,7 +981,36 @@ def _format_table_at(ws, header_row_0idx: int, n_rows: int,
         for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
             _coerce(row[0], as_percent=True)
             row[0].number_format = "0.0%"
+    
+    # NEW: Text wrapping for all cells in this table
+    for row in ws.iter_rows(min_row=header_row_1idx, max_row=last_data):
+        for cell in row:
+            if cell.value and isinstance(cell.value, str) and len(str(cell.value)) > 30:
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
 
+def _autosize_columns(ws, min_width=10, max_width=50):
+    """Auto-fit column widths based on content."""
+    from openpyxl.utils import get_column_letter
+    
+    for column in ws.columns:
+        max_length = 0
+        column_letter = get_column_letter(column[0].column)
+        
+        for cell in column:
+            try:
+                if cell.value:
+                    # Handle wrapped text - use first line for width
+                    cell_value = str(cell.value)
+                    if '\n' in cell_value:
+                        cell_value = cell_value.split('\n')[0]
+                    max_length = max(max_length, len(cell_value))
+            except:
+                pass
+        
+        # Set width with constraints
+        adjusted_width = min(max(max_length + 2, min_width), max_width)
+        ws.column_dimensions[column_letter].width = adjusted_width
+        
 # ---------------------------- Write workbook (extended) ----------------------------
 def write_excel(
     excel_path,
@@ -983,8 +1018,11 @@ def write_excel(
     status, leads, vendor_index,
     company_yoy=None,
     all_weekly=None, trs_weekly=None,
+    cmu_weekly=None,  
+    lcc_weekly=None,  
     forecast_method="linear",
-    status_raw=None
+    status_raw=None,
+    alignment_df=None
 ):
     forecast_desc = "Linear Trend Forecast" if (forecast_method or "linear").lower() == "linear" \
                     else "Run-Rate Forecast (Last 4 Weeks Avg)"
@@ -1001,29 +1039,84 @@ def write_excel(
         ]})
         explain_start = summary_kpi.shape[0] + 2
         explain.to_excel(xw, sheet_name="Summary", index=False, startrow=explain_start)
+        
+        # Overall YoY metrics
+        overall_start = explain_start + explain.shape[0] + 3
+        ws_summary = xw.book["Summary"]
+        ws_summary.cell(overall_start, 1, value="All Account Type Volume YoY").font = Font(bold=True, size=12)
+
+        overall_yoy = _overall_yoy(status)
+        overall_yoy.to_excel(xw, sheet_name="Summary", index=False, startrow=overall_start+1)
+        _format_table_at(
+            ws_summary,
+            header_row_0idx=overall_start+1,
+            n_rows=overall_yoy.shape[0],
+            number_headers={"Pounds CY", "Pounds PY", "Delta Pounds YoY"},
+            percent_headers={"YoY %"}
+        )
+
+        # Sysco Brand split
+        brand_start = overall_start + overall_yoy.shape[0] + 4
+        ws_summary.cell(brand_start, 1, value="Sysco Brand YoY, All Account Types").font = Font(bold=True, size=12)
+
+        if status_raw is not None and "Sysco Brand Indicator" in status_raw.columns:
+            # Aggregate raw data by brand
+            brand_agg = status_raw.groupby("Sysco Brand Indicator", dropna=False).agg({
+                "Pounds CY": "sum",
+                "Pounds PY": "sum"
+            }).reset_index()
+            brand_agg.columns = ["Sysco Brand Indicator", "Pounds_CY", "Pounds_PY"]
+            brand_agg["Delta_YoY_Lbs"] = brand_agg["Pounds_CY"] - brand_agg["Pounds_PY"]
+            brand_agg["YoY_Pct"] = np.where(
+                brand_agg["Pounds_PY"] > 0,
+                brand_agg["Delta_YoY_Lbs"] / brand_agg["Pounds_PY"],
+                np.nan
+            )
+            brand_split = brand_agg
+        else:
+            brand_split = pd.DataFrame(columns=["Sysco Brand Indicator","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+
+        brand_split.to_excel(xw, sheet_name="Summary", index=False, startrow=brand_start+1)
+        _format_table_at(
+            ws_summary,
+            header_row_0idx=brand_start+1,
+            n_rows=brand_split.shape[0],
+            number_headers={"Pounds_CY", "Pounds_PY", "Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
 
         # (re)add lag tables so Summary has CY/PY/Delta columns visible on that sheet
         lag_out = lag_sites.rename(columns={"d":"Delta_YoY_Lbs"})
-        lag_start = explain_start + explain.shape[0] + 3
+        lag_start = brand_start + brand_split.shape[0] + 3
         lag_out.to_excel(xw, sheet_name="Summary", index=False, startrow=lag_start)
 
         cust_out = cust_losses.rename(columns={"d":"Delta_YoY_Lbs"})
         cust_start = lag_start + lag_out.shape[0] + 3
         cust_out.to_excel(xw, sheet_name="Summary", index=False, startrow=cust_start)
 
-        _format_sheet_by_headers(
+        # Format each table on Summary individually
+        _format_table_at(
             xw.book["Summary"],
+            header_row_0idx=0,  # KPI table at top
+            n_rows=summary_kpi.shape[0],
+            number_headers={"Value"},
+            percent_headers={"% Any Item aligned", "% Any Vendor aligned", "% Item+Vendor aligned", "% Item-only", "% Vendor-only", "% Neither"}
+        )
+
+        _format_table_at(
+            xw.book["Summary"],
+            header_row_0idx=lag_start,  # lag_sites table
+            n_rows=lag_out.shape[0],
             number_headers={"CY", "PY", "Delta_YoY_Lbs"},
             percent_headers={"Loss_%_of_total"}
         )
 
-        # after cust_out.to_excel(...)
         _format_table_at(
             xw.book["Summary"],
-            header_row_0idx=cust_start,
+            header_row_0idx=cust_start,  # customer losses table
             n_rows=cust_out.shape[0],
-            number_headers={"CY","PY","Delta_YoY_Lbs"},
-            percent_headers={"Loss_%_of_total"},
+            number_headers={"CY", "PY", "Delta_YoY_Lbs"},
+            percent_headers=set()
         )
 
         # ===== PREP for ACCOUNT TABS =====
@@ -1046,41 +1139,33 @@ def write_excel(
 
         # 01 — ALL ACCOUNTS
         _write_account_tab(xw, "01_All_Accounts", status.copy())
-        _format_sheet_by_headers(
-            xw.book["01_All_Accounts"],
-            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
-            percent_headers={"YoY_Pct","YoY %"}
-        )
 
         # 02 — TRS
         _write_account_tab(xw, "02_TRS", slice_acct(status, {"TRS"}))
-        _format_sheet_by_headers(
-            xw.book["02_TRS"],
-            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
-            percent_headers={"YoY_Pct","YoY %"}
-        )
 
         # 03 — LCC
         _write_account_tab(xw, "03_LCC", slice_acct(status, {"LCC"}))
-        _format_sheet_by_headers(
-            xw.book["03_LCC"],
-            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
-            percent_headers={"YoY_Pct","YoY %"}
-        )
 
         # 04 — CMU
         _write_account_tab(xw, "04_CMU", slice_acct(status, {"CMU"}))
-        _format_sheet_by_headers(
-            xw.book["04_CMU"],
-            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
-            percent_headers={"YoY_Pct","YoY %"}
-        )
 
         # 05b / 07b — chart-only sheets
-        if all_weekly is not None:
-            _write_weekly_chart_only_tab(xw, "05b_All_Weekly_Chart", all_weekly, forecast_method_desc=forecast_desc)
-        if trs_weekly is not None:
-            _write_weekly_chart_only_tab(xw, "07b_TRS_Weekly_Chart", trs_weekly, forecast_method_desc=forecast_desc)
+        print(f"  Checking chart data:")
+        print(f"    all_weekly: exists={all_weekly is not None}, rows={len(all_weekly) if all_weekly is not None else 0}")
+        print(f"    trs_weekly: exists={trs_weekly is not None}, rows={len(trs_weekly) if trs_weekly is not None else 0}")
+
+        # Chart tabs
+        if all_weekly is not None and not all_weekly.empty:
+            _write_weekly_chart_only_tab(xw, "05_All_Weekly_Chart", all_weekly, forecast_method_desc=forecast_desc)
+
+        if trs_weekly is not None and not trs_weekly.empty:
+            _write_weekly_chart_only_tab(xw, "07_TRS_Weekly_Chart", trs_weekly, forecast_method_desc=forecast_desc)  # Keep as 07b
+
+        if cmu_weekly is not None and not cmu_weekly.empty:
+            _write_weekly_chart_only_tab(xw, "08_CMU_Weekly_Chart", cmu_weekly, forecast_method_desc=forecast_desc)
+
+        if lcc_weekly is not None and not lcc_weekly.empty:
+            _write_weekly_chart_only_tab(xw, "09_LCC_Weekly_Chart", lcc_weekly, forecast_method_desc=forecast_desc)
 
 
         # ===== 08 — Vendor/Item alignment =====
@@ -1091,15 +1176,34 @@ def write_excel(
                     percent_headers=set())
 
         # ===== 09 — Award vs Sales =====
-        if status_raw is not None and "Award Volume Annualized" in status_raw.columns:
+        if alignment_df is not None and "Award Volume Annualized" in alignment_df.columns:
+            # Get award volumes directly from alignment (one row per SUPC)
+            alignment_awards = alignment_df[["SUVC", "Supplier Name", "SUPC", "Award Volume Annualized"]].copy()
+            alignment_awards["Award Volume Annualized"] = pd.to_numeric(
+                alignment_awards["Award Volume Annualized"], errors="coerce"
+            ).fillna(0)
+            
+            # Sum by vendor (this matches your pivot table)
+            vendor_awards = alignment_awards.groupby(["SUVC", "Supplier Name"], dropna=False).agg(
+                Award_Volume_Annualized=("Award Volume Annualized", "sum")
+            ).reset_index()
+            
+            # Get sales from status_raw
             by_vendor = status_raw.groupby(["SUVC","Supplier Name"], dropna=False).agg(
                 CY_Lbs=("Pounds CY","sum"),
-                PY_Lbs=("Pounds PY","sum"),
-                Award_Volume_Annualized=("Award Volume Annualized","first")
+                PY_Lbs=("Pounds PY","sum")
             ).reset_index()
-            by_vendor["Award_Volume_Annualized"] = pd.to_numeric(by_vendor["Award_Volume_Annualized"], errors="coerce")
-            by_vendor["% of Award (CY)"] = np.where(by_vendor["Award_Volume_Annualized"]>0,
-                                                    by_vendor["CY_Lbs"]/by_vendor["Award_Volume_Annualized"], np.nan)
+            
+            # Merge
+            by_vendor = by_vendor.merge(vendor_awards, on=["SUVC", "Supplier Name"], how="left")
+            by_vendor["Award_Volume_Annualized"] = by_vendor["Award_Volume_Annualized"].fillna(0)
+            
+            by_vendor["% of Award (CY)"] = np.where(
+                by_vendor["Award_Volume_Annualized"] > 0,
+                by_vendor["CY_Lbs"] / by_vendor["Award_Volume_Annualized"], 
+                np.nan
+            )
+            
             by_vendor.to_excel(xw, sheet_name="09_Award_vs_Sales", index=False)
             _try_format(xw, "09_Award_vs_Sales",
                         number_headers={"CY_Lbs","PY_Lbs","Award_Volume_Annualized"},
@@ -1117,6 +1221,13 @@ def write_excel(
 
         vendor_index.to_excel(xw, sheet_name="Vendor_Leads_Index", index=False)
         # no special formatting needed here
+        
+                # NEW: Auto-size all sheets at the end
+        print("  Formatting worksheets...")
+        for sheet_name in xw.book.sheetnames:
+            ws = xw.book[sheet_name]
+            _autosize_columns(ws)
+        print("  ✓ Auto-sized columns")
 
 # ======= Process report one time only =========
 def process_one_file(source_path: str,
@@ -1135,6 +1246,10 @@ def process_one_file(source_path: str,
         attr_groups=DEFAULTS.get("attr_groups"),
         vendors=DEFAULTS.get("vendors")
     )
+    
+    # Load alignment separately
+    alignment_df = pd.read_csv(alignment_path, dtype=str).fillna("")
+    alignment_df.columns = alignment_df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
 
     status, current_week = compute_windows(raw)
     min_ytd = max(1, int(current_week or 1)) * int(DEFAULTS.get("min_ytd_per_week", 20))
@@ -1179,17 +1294,42 @@ def process_one_file(source_path: str,
     summary_kpi["Recommendations"] = narrative
     company_yoy = build_company_yoy(status)
 
+    # Generate weekly aggregates for forecasting
     all_weekly_hist, _ = build_company_weekly(raw)
     all_weekly = make_12w_forecast(all_weekly_hist, current_week, method=forecast_method)
 
+    # TRS weekly
     if "Customer Account Type Code" in raw.columns:
-        raw_trs = raw[raw["Customer Account Type Code"]=="TRS"].copy()
+        raw_trs = raw[raw["Customer Account Type Code"] == "TRS"].copy()
     else:
         raw_trs = raw.iloc[0:0].copy()
+
     trs_weekly_hist, _ = build_company_weekly(raw_trs) if not raw_trs.empty else (
         pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week
     )
     trs_weekly = make_12w_forecast(trs_weekly_hist, current_week, method=forecast_method)
+
+    # CMU weekly
+    if "Customer Account Type Code" in raw.columns:
+        raw_cmu = raw[raw["Customer Account Type Code"] == "CMU"].copy()
+    else:
+        raw_cmu = raw.iloc[0:0].copy()
+
+    cmu_weekly_hist, _ = build_company_weekly(raw_cmu) if not raw_cmu.empty else (
+        pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week
+    )
+    cmu_weekly = make_12w_forecast(cmu_weekly_hist, current_week, method=forecast_method)
+
+    # LCC weekly
+    if "Customer Account Type Code" in raw.columns:
+        raw_lcc = raw[raw["Customer Account Type Code"] == "LCC"].copy()
+    else:
+        raw_lcc = raw.iloc[0:0].copy()
+
+    lcc_weekly_hist, _ = build_company_weekly(raw_lcc) if not raw_lcc.empty else (
+        pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week
+    )
+    lcc_weekly = make_12w_forecast(lcc_weekly_hist, current_week, method=forecast_method)
 
     # filenames
     fy_guess = "NA"
@@ -1211,8 +1351,11 @@ def process_one_file(source_path: str,
         company_yoy=company_yoy,
         all_weekly=all_weekly,
         trs_weekly=trs_weekly,
+        cmu_weekly=None,  
+        lcc_weekly=None,
         forecast_method=forecast_method,
-        status_raw=raw
+        status_raw=raw,
+        alignment_df=alignment_df  # Use this variable name
     )
     leads.to_csv(leads_csv, index=False)
 
@@ -1277,143 +1420,659 @@ class DebouncedHandler(FileSystemEventHandler):
         except Exception as e:
             print(f"    ❌ Processing failed for {os.path.basename(path)}: {e}")
 
+
+def _create_sysco_cover_slide(prs, current_week, business_center="", attribute_group="", fiscal_period=""):
+    """Create branded Sysco cover slide."""
+    from pptx.util import Pt
+    from pptx.dml.color import RGBColor
+    
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    
+    SYSCO_BLUE = RGBColor(0, 129, 198)
+    SYSCO_GREY = RGBColor(117, 123, 130)
+    
+    # Logo
+    logo_path = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Sysco_Logo_FullColor.png"
+    if os.path.exists(logo_path):
+        slide.shapes.add_picture(logo_path, Inches(0.5), Inches(0.5), height=Inches(0.8))
+    
+    # Accent bar
+    accent_bar = slide.shapes.add_shape(1, Inches(0), Inches(1.5), Inches(10), Inches(0.1))
+    accent_bar.fill.solid()
+    accent_bar.fill.fore_color.rgb = SYSCO_BLUE
+    accent_bar.line.fill.background()
+    
+    # Title (Business Center + Attribute Group)
+    title_box = slide.shapes.add_textbox(Inches(1), Inches(2.2), Inches(8), Inches(2))
+    title_frame = title_box.text_frame
+    
+    p1 = title_frame.paragraphs[0]
+    p1.text = business_center if business_center else "Category Performance"
+    p1.font.size = Pt(40)
+    p1.font.bold = True
+    p1.font.color.rgb = SYSCO_BLUE
+    p1.font.name = "Myriad Pro"
+    p1.alignment = PP_ALIGN.CENTER
+    
+    p2 = title_frame.add_paragraph()
+    p2.text = attribute_group if attribute_group else "Report"
+    p2.font.size = Pt(36)
+    p2.font.bold = True
+    p2.font.color.rgb = SYSCO_GREY
+    p2.font.name = "Myriad Pro"
+    p2.alignment = PP_ALIGN.CENTER
+    
+    # Fiscal period covered
+    period_box = slide.shapes.add_textbox(Inches(1), Inches(4.5), Inches(8), Inches(0.6))
+    period_frame = period_box.text_frame
+    period_frame.text = fiscal_period if fiscal_period else f"Fiscal Week {current_week}"
+    period_frame.paragraphs[0].font.size = Pt(22)
+    period_frame.paragraphs[0].font.color.rgb = SYSCO_GREY
+    period_frame.paragraphs[0].font.name = "Myriad Pro"
+    period_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+    
+    # Report date
+    date_box = slide.shapes.add_textbox(Inches(1), Inches(6.5), Inches(8), Inches(0.5))
+    date_frame = date_box.text_frame
+    date_frame.text = f"Report Generated: {datetime.now().strftime('%B %d, %Y')}"
+    date_frame.paragraphs[0].font.size = Pt(18)
+    date_frame.paragraphs[0].font.color.rgb = SYSCO_GREY
+    date_frame.paragraphs[0].font.name = "Myriad Pro"
+    date_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+    
+def create_table_on_slide(slide, data_df, left, top, width, height, 
+                          number_cols=None, percent_cols=None):
+    """Helper to add a formatted table to a slide."""
+    if data_df.empty:
+        return None
+        
+    number_cols = set(number_cols or [])
+    percent_cols = set(percent_cols or [])
+    
+    rows, cols = data_df.shape[0] + 1, data_df.shape[1]  # +1 for header
+    table = slide.shapes.add_table(rows, cols, left, top, width, height).table
+    
+    # Header row
+    for col_idx, col_name in enumerate(data_df.columns):
+        cell = table.cell(0, col_idx)
+        cell.text = str(col_name)
+        cell.text_frame.paragraphs[0].font.bold = True
+        cell.text_frame.paragraphs[0].font.size = Pt(10)
+        cell.fill.solid()
+        cell.fill.fore_color.rgb = RGBColor(68, 114, 196)  # Blue header
+        cell.text_frame.paragraphs[0].font.color.rgb = RGBColor(255, 255, 255)
+    
+    # Data rows
+    for row_idx, row in enumerate(data_df.itertuples(index=False), start=1):
+        for col_idx, (col_name, value) in enumerate(zip(data_df.columns, row)):
+            cell = table.cell(row_idx, col_idx)
+            
+            # Format based on column type
+            if pd.isna(value):
+                cell.text = ""
+            elif col_name in percent_cols:
+                try:
+                    cell.text = f"{float(value):.1%}" if value != 0 else "0.0%"
+                except:
+                    cell.text = str(value)
+            elif col_name in number_cols:
+                try:
+                    cell.text = f"{float(value):,.0f}"
+                except:
+                    cell.text = str(value)
+            else:
+                cell.text = str(value)
+            
+            cell.text_frame.paragraphs[0].font.size = Pt(9)
+            
+            # Alternate row colors
+            if row_idx % 2 == 0:
+                cell.fill.solid()
+                cell.fill.fore_color.rgb = RGBColor(242, 242, 242)
+    
+    return table
+
+
+def add_chart_image_to_slide(slide, excel_path, sheet_name, left, top, width, height):
+    """Insert chart from Excel as image into PowerPoint slide."""
+    from openpyxl import load_workbook
+    from openpyxl.drawing.image import Image as XLImage
+    import io
+    from PIL import Image
+    
+    try:
+        # Load the Excel file
+        wb = load_workbook(excel_path)
+        
+        if sheet_name not in wb.sheetnames:
+            print(f"      ⚠ Sheet {sheet_name} not found")
+            return
+        
+        ws = wb[sheet_name]
+        
+        # Get the chart from the sheet
+        if not ws._charts:
+            print(f"      ⚠ No charts found in {sheet_name}")
+            return
+        
+        chart = ws._charts[0]  # First chart
+        
+        # Chart position info
+        chart_anchor = chart.anchor
+        
+        # Create temporary image file
+        temp_image = os.path.join(os.path.dirname(excel_path), f"temp_{sheet_name}.png")
+        
+        # Unfortunately, openpyxl can't export charts directly
+        # We need to use a workaround: open Excel via COM automation
+        
+        # Simpler approach: Create screenshot placeholder
+        # Or use win32com if on Windows
+        
+        import platform
+        if platform.system() == "Windows":
+            # Use COM automation to export chart
+            import win32com.client
+            excel_app = win32com.client.Dispatch("Excel.Application")
+            excel_app.Visible = False
+            
+            wb_com = excel_app.Workbooks.Open(os.path.abspath(excel_path))
+            ws_com = wb_com.Worksheets(sheet_name)
+            
+            if ws_com.ChartObjects().Count > 0:
+                chart_com = ws_com.ChartObjects(1).Chart
+                chart_com.Export(temp_image)
+            
+            wb_com.Close(SaveChanges=False)
+            excel_app.Quit()
+            
+            # Insert image into PowerPoint
+            slide.shapes.add_picture(temp_image, left, top, width=width, height=height)
+            
+            # Clean up
+            os.remove(temp_image)
+            
+        else:
+            # Non-Windows fallback: just show text
+            text_box = slide.shapes.add_textbox(left, top, width, height)
+            text_box.text_frame.text = "Chart available in Excel workbook"
+            
+    except Exception as e:
+        print(f"      ⚠ Chart image insertion failed: {e}")
+        # Fallback: add text
+        text_box = slide.shapes.add_textbox(left, top, width, height)
+        text_box.text_frame.text = "See Excel for chart"
+
+
+def build_active_customer_targets(status, raw_df, min_ytd, active_weeks=6):
+    """
+    Build a list of TRS customers to target based on:
+    - Active within last N weeks (based on Last Invoice Date)
+    - Negative YoY performance
+    - Meaningful volume threshold
+    """
+    # Filter to TRS only
+    if "Customer Account Type Code" not in status.columns:
+        print("    ⚠ Customer Account Type Code not found - skipping win-back targets")
+        return pd.DataFrame()
+    
+    trs_status = status[status["Customer Account Type Code"] == "TRS"].copy()
+    
+    if trs_status.empty:
+        print("    ℹ No TRS accounts found")
+        return pd.DataFrame()
+    
+    # Get last invoice dates from raw data
+    if "Last Invoice Date" in raw_df.columns:
+        # Find most recent invoice per customer
+        invoice_dates = raw_df[["Company Number", "Company Customer Number", "Last Invoice Date"]].copy()
+        invoice_dates["Last Invoice Date"] = pd.to_datetime(
+            invoice_dates["Last Invoice Date"], errors="coerce"
+        )
+        
+        last_invoice = invoice_dates.groupby(
+            ["Company Number", "Company Customer Number"]
+        )["Last Invoice Date"].max().reset_index()
+        
+        # Merge with status
+        trs_status = trs_status.merge(
+            last_invoice, 
+            on=["Company Number", "Company Customer Number"], 
+            how="left"
+        )
+        
+        # Calculate days since last invoice
+        today = pd.Timestamp.now()
+        trs_status["Days_Since_Invoice"] = (
+            today - trs_status["Last Invoice Date"]
+        ).dt.days
+        
+        # Filter to active customers (within threshold weeks)
+        threshold_days = active_weeks * 7
+        active_mask = trs_status["Days_Since_Invoice"] <= threshold_days
+        trs_status = trs_status[active_mask].copy()
+        
+        print(f"    Found {len(trs_status)} active TRS customers (within {active_weeks} weeks)")
+    else:
+        print("    ⚠ Last Invoice Date column not found - including all TRS customers")
+        trs_status["Days_Since_Invoice"] = None
+    
+    # Filter to declining customers with meaningful volume
+    targets = trs_status[
+        (trs_status["Delta_YoY_Lbs"] < 0) &  # Declining
+        (trs_status["Pounds_PY"] >= min_ytd)  # Meaningful volume
+    ].copy()
+    
+    if targets.empty:
+        print("    ℹ No declining TRS customers found")
+        return pd.DataFrame()
+    
+    # Calculate opportunity (absolute value of loss)
+    targets["Opportunity_Lbs"] = abs(targets["Delta_YoY_Lbs"])
+    
+    # Sort by opportunity
+    targets = targets.sort_values("Opportunity_Lbs", ascending=False)
+    
+    # Select key columns for presentation
+    cols = [
+        "Company Name", "Customer Name", "Company Customer Number",
+        "Pounds_CY", "Pounds_PY", "Delta_YoY_Lbs", "YoY_Pct",
+        "Opportunity_Lbs", "Days_Since_Invoice",
+        "Conversion_Status"
+    ]
+    existing_cols = [c for c in cols if c in targets.columns]
+    
+    print(f"    Identified {len(targets)} win-back targets")
+    return targets[existing_cols]
+
+def _add_logo_to_slide(slide):
+    """Add Sysco logo to top right of slide."""
+    logo_path = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Sysco_Logo_FullColor.png"
+    if os.path.exists(logo_path):
+        slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.3), height=Inches(0.6))
+
+def _create_account_metrics_slide(prs, status_df, slide_title):
+    """Metrics-focused slide: tables only, no chart."""
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    _add_logo_to_slide(slide)
+    title = slide.shapes.title
+    title.text = f"{slide_title} - Performance Summary"
+    title.text_frame.paragraphs[0].font.size = Pt(24)  # ADD THIS
+    title.text_frame.paragraphs[0].font.name = "Myriad Pro"  # ADD THIS
+
+    if status_df.empty:
+        text_box = slide.shapes.add_textbox(Inches(2), Inches(3), Inches(6), Inches(1))
+        text_box.text_frame.text = f"No data available for {slide_title}"
+        return
+    
+    # A: Overall metrics (larger)
+    overall = _overall_yoy(status_df)
+    create_table_on_slide(
+        slide, overall,
+        Inches(0.5), Inches(1.5), Inches(4.5), Inches(1),
+        number_cols={"Pounds CY", "Pounds PY", "Delta Pounds YoY"},
+        percent_cols={"YoY %"}
+    )
+    
+    # B: Brand split (larger)
+    brand = _brand_split(status_df)
+    if not brand.empty:
+        create_table_on_slide(
+            slide, brand,
+            Inches(5.5), Inches(1.5), Inches(4), Inches(1.5),
+            number_cols={"Pounds_CY", "Pounds_PY", "Delta_YoY_Lbs"},
+            percent_cols={"YoY_Pct"}
+        )
+    
+    # C: Top 10 sites (bigger fonts)
+    sites = _sites_rank(status_df).head(10)
+    if not sites.empty:
+        create_table_on_slide(
+            slide, sites,
+            Inches(0.5), Inches(3), Inches(9), Inches(4),
+            number_cols={"Pounds_CY", "Pounds_PY", "Delta_YoY_Lbs"},
+            percent_cols={"YoY_Pct"}
+        )
+
+
+def _create_account_chart_slide(prs, weekly_df, slide_title, excel_path, sheet_name):
+    """Chart-focused slide: visualization dominates."""
+    slide = prs.slides.add_slide(prs.slide_layouts[5])
+    _add_logo_to_slide(slide)
+    title = slide.shapes.title
+    title.text = f"{slide_title} - Weekly Trend & Forecast"
+    title.text_frame.paragraphs[0].font.size = Pt(24)
+    title.text_frame.paragraphs[0].font.name = "Myriad Pro"
+    
+    if weekly_df is None or weekly_df.empty:
+        text_box = slide.shapes.add_textbox(Inches(2), Inches(3), Inches(6), Inches(1))
+        text_box.text_frame.text = "Insufficient data for chart"
+        return
+    
+    # Insert chart as image from Excel
+    add_chart_image_to_slide(
+        slide, excel_path, sheet_name,
+        Inches(0.5), Inches(1.5), Inches(9), Inches(5.5)
+    )
+    
+    # Key at bottom
+    text_box = slide.shapes.add_textbox(Inches(1), Inches(7.2), Inches(8), Inches(0.3))
+    text_frame = text_box.text_frame
+    text_frame.text = "Green bars = Growth | Red bars = Decline | Orange dashed = Forecast"
+    text_frame.paragraphs[0].font.size = Pt(10)
+    text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+
+def create_presentation_report(
+    excel_path, status, raw_df, current_week,
+    all_weekly, trs_weekly, cmu_weekly, lcc_weekly,
+    active_weeks=6, min_ytd=100, top_n=15
+):
+    """
+    Create PowerPoint presentation with all required slides.
+    """
+    try:
+        prs = Presentation()
+        prs.slide_width = Inches(10)
+        prs.slide_height = Inches(7.5)
+        
+        # Extract category and date info
+        if 'Business Center Name' in status.columns and len(status) > 0:
+            bc_name = status['Business Center Name'].iloc[0]
+            business_center = f"Business Center: {bc_name}" if bc_name else "Category Performance"
+        else:
+            business_center = "Category Performance"
+
+        attribute_group = status['Attribute Group Name'].iloc[0] if 'Attribute Group Name' in status.columns and len(status) > 0 else "Analysis Report"
+
+        # Build fiscal period string
+        if 'Fiscal Week Number' in status.columns and 'Fiscal Year Key' in status.columns:
+            min_week = int(status['Fiscal Week Number'].min())
+            max_week = int(status['Fiscal Week Number'].max())
+            fiscal_year = int(status['Fiscal Year Key'].mode()[0]) if len(status['Fiscal Year Key'].mode()) > 0 else ""
+            fiscal_period = f"FY{fiscal_year} | Weeks {min_week}-{max_week}"
+        else:
+            fiscal_period = f"Fiscal Week {current_week}"
+
+        # === SLIDE 1: Cover ===
+        _create_sysco_cover_slide(prs, current_week, business_center, attribute_group, fiscal_period)
+                
+        # === SLIDES 2-3: All Account Types ===
+        print("    Creating Slides 2-3: All Account Types...")
+        _create_account_metrics_slide(prs, status, "All Account Types")
+        if all_weekly is not None and not all_weekly.empty:
+            _create_account_chart_slide(prs, all_weekly, "All Account Types", excel_path, "05_All_Weekly_Chart")  # ADD LAST 2 PARAMS
+
+        # === SLIDES 4-5: TRS ===
+        print("    Creating Slides 4-5: TRS Accounts...")
+        trs_status = status[status["Customer Account Type Code"] == "TRS"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
+        _create_account_metrics_slide(prs, trs_status, "TRS Accounts")
+        if trs_weekly is not None and not trs_weekly.empty:
+            _create_account_chart_slide(prs, trs_weekly, "TRS Accounts", excel_path, "07_TRS_Weekly_Chart")  # ADD LAST 2 PARAMS
+
+        # === SLIDES 6-7: CMU ===
+        if cmu_weekly is not None and not cmu_weekly.empty:
+            cmu_status = status[status["Customer Account Type Code"] == "CMU"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
+            _create_account_metrics_slide(prs, cmu_status, "CMU Accounts")
+            _create_account_chart_slide(prs, cmu_weekly, "CMU Accounts", excel_path, "08_CMU_Weekly_Chart")  # ADD LAST 2 PARAMS
+
+        # === SLIDES 8-9: LCC ===
+        if lcc_weekly is not None and not lcc_weekly.empty:
+            lcc_status = status[status["Customer Account Type Code"] == "LCC"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
+            _create_account_metrics_slide(prs, lcc_status, "LCC Accounts")
+            _create_account_chart_slide(prs, lcc_weekly, "LCC Accounts", excel_path, "09_LCC_Weekly_Chart")  # ADD LAST 2 PARAMS
+        
+        # === SLIDE: Items Ranking ===
+        print("    Creating Slide 6: Items Ranking...")
+        items_df = _items_rank(status).head(20)  # Top 30 items
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        title = slide.shapes.title
+        title.text = "Top Items by YoY Decline"
+        title.text_frame.paragraphs[0].font.size = Pt(24)  # ADD THIS
+        title.text_frame.paragraphs[0].font.name = "Myriad Pro"  # ADD THIS
+        
+        if not items_df.empty:
+            display_cols = ["Item", "Item Description", "Delta_YoY_Lbs", "YoY_Pct"]
+            existing = [c for c in display_cols if c in items_df.columns]
+            
+            if existing:
+                create_table_on_slide(
+                    slide,
+                    items_df[existing],
+                    Inches(0.5), Inches(1.5), Inches(9), Inches(5.5),
+                    number_cols={"Delta_YoY_Lbs"},
+                    percent_cols={"YoY_Pct"}
+                )
+        
+        # === SLIDE: TRS Win-Back Targets ===
+        print("    Creating Slide 7: TRS Win-Back Targets...")
+        targets = build_active_customer_targets(status, raw_df, min_ytd, active_weeks)
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        title = slide.shapes.title
+        title.text = "Win-Back Targets: Active Customers to Recover"
+        title.text_frame.paragraphs[0].font.size = Pt(24) 
+        title.text_frame.paragraphs[0].font.name = "Myriad Pro" 
+        
+        if not targets.empty:
+            display_cols = [
+                "Company Name", "Customer Name", "Pounds_PY", "Delta_YoY_Lbs", 
+                "YoY_Pct", "Opportunity_Lbs", "Days_Since_Invoice"
+            ]
+            existing_display = [c for c in display_cols if c in targets.columns]
+            
+            if existing_display:
+                create_table_on_slide(
+                    slide,
+                    targets[existing_display].head(top_n),
+                    Inches(0.3), Inches(1.5), Inches(9.4), Inches(5.5),
+                    number_cols={"Pounds_PY", "Delta_YoY_Lbs", "Opportunity_Lbs", "Days_Since_Invoice"},
+                    percent_cols={"YoY_Pct"}
+                )
+        else:
+            # Add text if no targets found
+            text_box = slide.shapes.add_textbox(
+                Inches(2), Inches(3), Inches(6), Inches(1)
+            )
+            text_frame = text_box.text_frame
+            text_frame.text = "No active TRS customers with declining performance found."
+            text_frame.paragraphs[0].font.size = Pt(18)
+            text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+        
+        # Save presentation
+        pptx_path = excel_path.replace(".xlsx", ".pptx")
+        prs.save(pptx_path)
+        print(f"    ✓ PowerPoint saved: {os.path.basename(pptx_path)}")
+        return pptx_path
+        
+    except Exception as e:
+        print(f"    ❌ PowerPoint generation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 # ---------------------------- Main ----------------------------
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Category Analysis with Excel + PowerPoint outputs")
     ap.add_argument("--source")
     ap.add_argument("--alignment")
     ap.add_argument("--outdir")
-    ap.add_argument("--company")
+    ap.add_argument("--company", help="Filter to specific site(s): '55' or 'Jackson' or '55,67'")
     ap.add_argument("--attr-groups")
-    ap.add_argument("--vendors")
+    ap.add_argument("--vendors", help="Vendor filter for vendor lead splits")
     ap.add_argument("--forecast", choices=["linear", "runrate"])
-    # Extra lead controls (all optional)
-    ap.add_argument("--leads-company")       # quoted CSV of site names/numbers -> only build leads for these
-    ap.add_argument("--leads-acct-types")    # CSV of acct type codes for Sales Leads (default TRS,LCC)
-    ap.add_argument("--vendor-leads-active") # "Y"/"N"
+    
+    # Lead controls
+    ap.add_argument("--leads-company", help="Override site filter for Sales Leads only")
+    ap.add_argument("--leads-acct-types", help="Account types for Sales Leads (default: TRS,LCC)")
+    ap.add_argument("--vendor-leads-active", choices=["Y","N"])
     ap.add_argument("--min-ytd-per-week", type=int)
     ap.add_argument("--vendor-leads-respect-site-filter", choices=["Y","N"])
-    # Added for watcher
-    ap.add_argument("--watch", action="store_true", help="Watch a folder for new CSV files")
-    ap.add_argument("--watch-dir", help="Folder to watch (defaults: WATCH_DIR env or folder of --source)")
-    ap.add_argument("--quiet-seconds", type=int, default=int(os.getenv("QUIET_SECONDS", "8")),
-                    help="Debounce seconds for watcher")
-
+    
+    # Presentation controls
+    ap.add_argument("--active-customer-weeks", type=int, help="Weeks threshold for 'active' customers")
+    ap.add_argument("--create-powerpoint", choices=["Y","N"], help="Generate PowerPoint presentation")
+    ap.add_argument("--ppt-top-n-targets", type=int, help="Number of targets to show in PowerPoint")
+    
+    # Watch mode
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--watch-dir")
+    ap.add_argument("--quiet-seconds", type=int, default=8)
 
     args = ap.parse_args()
 
-    # Watch mode (CLI flag OR WATCH=1 env)
-    watch_mode = args.watch or _as_bool(os.getenv("WATCH", "0"))
-    if watch_mode:
-        # default watch folder: env WATCH_DIR, else the folder of the source file, else outdir
-        watch_dir = args.watch_dir or os.getenv("WATCH_DIR") or (os.path.dirname(source_path) if source_path else outdir_path)
-        start_watcher(
-            watch_dir=watch_dir,
-            alignment_path=alignment_path,
-            outdir_path=outdir_path,
-            quiet_seconds=args.quiet_seconds,
-            forecast_method=forecast_method
-        )
-        return  # do not run single file in watch mode
-
-    # merge with defaults
-    forecast_method = (args.forecast or DEFAULTS.get("forecast_method") or "linear").lower()
-    if forecast_method not in ("linear", "runrate"):
-        raise SystemExit("Invalid --forecast. Use 'linear' or 'runrate'.")
-
+    # Merge CLI with defaults
     source_path = args.source or DEFAULTS.get("source")
-    alignment_path  = args.alignment  or DEFAULTS.get("alignment")
-    outdir_path     = args.outdir     or DEFAULTS.get("outdir")
-    company_filt    = args.company    or DEFAULTS.get("company")
-    attr_groups     = args.attr_groups or DEFAULTS.get("attr_groups")
-    vendors_filter  = args.vendors    or DEFAULTS.get("vendors")
+    alignment_path = args.alignment or DEFAULTS.get("alignment")
+    outdir_path = args.outdir or DEFAULTS.get("outdir")
+    company_filt = args.company or DEFAULTS.get("company")
+    attr_groups = args.attr_groups or DEFAULTS.get("attr_groups")
+    vendors_filter = args.vendors or DEFAULTS.get("vendors")
+    forecast_method = (args.forecast or DEFAULTS.get("forecast_method", "linear")).lower()
+    
+    # Lead configuration
+    leads_company = args.leads_company or DEFAULTS.get("leads_company") or company_filt
+    leads_acct = args.leads_acct_types or DEFAULTS.get("leads_acct_types", "TRS,LCC")
+    vendor_leads_on = (args.vendor_leads_active or DEFAULTS.get("vendor_leads_active","Y")).strip().upper() == "Y"
     min_ytd_per_week = args.min_ytd_per_week or int(DEFAULTS.get("min_ytd_per_week", 20))
     vendor_leads_respect_site = (args.vendor_leads_respect_site_filter or DEFAULTS.get("vendor_leads_respect_site_filter","N")).upper() == "Y"
+    
+    # Presentation configuration
+    active_weeks = args.active_customer_weeks or DEFAULTS.get("active_customer_weeks", 6)
+    create_ppt = (args.create_powerpoint or DEFAULTS.get("create_powerpoint", "Y")).strip().upper() == "Y"
+    ppt_top_n = args.ppt_top_n_targets or DEFAULTS.get("ppt_top_n_targets", 15)
 
-
-    leads_company   = args.leads_company or DEFAULTS.get("leads_company")
-    leads_acct      = args.leads_acct_types or DEFAULTS.get("leads_acct_types", "TRS,LCC")
-    vendor_leads_on = (args.vendor_leads_active or DEFAULTS.get("vendor_leads_active","Y")).strip().upper() == "Y"
-
+    # Validation
     missing = [k for k, v in {"source": source_path,"alignment": alignment_path,"outdir": outdir_path}.items() if not v]
     if missing:
-        raise SystemExit(f"Error: missing required inputs (CLI or DEFAULTS): {', '.join(missing)}")
+        raise SystemExit(f"Error: missing required inputs: {', '.join(missing)}")
 
     os.makedirs(outdir_path, exist_ok=True)
 
-    # Load + join
+    print("\n" + "="*60)
+    print("CONFIGURATION SUMMARY")
+    print("="*60)
+    print(f"Site filter (main):        {company_filt or 'ALL SITES'}")
+    print(f"Sales Leads sites:         {leads_company or 'ALL SITES'}")
+    print(f"Sales Leads acct types:    {leads_acct}")
+    print(f"Vendor splits active:      {vendor_leads_on}")
+    if vendor_leads_on:
+        print(f"  - Account types:         TRS (hardcoded)")  # ← Use this instead
+        print(f"  - Respect site filter:   {vendor_leads_respect_site}")
+    print(f"Min YTD per week:          {min_ytd_per_week}")
+    print(f"Active customer weeks:     {active_weeks}")
+    print(f"Create PowerPoint:         {create_ppt}")
+    print(f"Forecast method:           {forecast_method}")
+    print("="*60 + "\n")
+
+    # Load data
     raw, _ = load_and_prepare(
-        source_path,
-        alignment_path,
+        source_path, alignment_path,
         company=company_filt,
         attr_groups=attr_groups,
         vendors=vendors_filter
     )
 
-    # Compute windows + YoY%
-    status, current_week = compute_windows(raw)
+    # Load alignment separately for Award vs Sales tab
+    alignment_df = pd.read_csv(alignment_path, dtype=str)
+    alignment_df = alignment_df.fillna("")
+    # Clean headers
+    alignment_df.columns = alignment_df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
 
-    # Dynamic threshold for leads
+    status, current_week = compute_windows(raw)
     min_ytd = max(1, int(current_week or 1)) * int(min_ytd_per_week)
 
-
-    # Conversion class + flags
     status = classify_conversion(status, X=0.80, Y=0.80, Z=0.95)
     status = mark_exit_lapsing(status, min_ytd=min_ytd)
 
-    # ---- Sales Leads (filtered by config) ----
+    # ========== SALES LEADS ==========
+    print("\n📋 Building Sales Leads...")
     leads = build_sales_leads(status, raw, min_ytd=min_ytd)
-
-    # NEW: restrict Sales Leads by site names/numbers and by account type codes
+    
+    # Apply Sales Leads site filter (if different from main filter)
     if leads_company:
         site_tokens = [t.strip().strip('"').strip("'") for t in leads_company.split(",") if t.strip()]
         site_tokens_norm = set(_clean_str(t).lower() for t in site_tokens)
+        before = len(leads)
         leads = leads[
             leads["Company Number"].map(_clean_str).str.lower().isin(site_tokens_norm) |
             leads["Company Name"].astype(str).str.strip().str.lower().isin(site_tokens_norm)
         ].copy()
-
-    if leads_acct and "Customer Account Type Code" in raw.columns:
-        acct_keep = set([t.strip() for t in leads_acct.split(",") if t.strip()])
-        # attach account type to leads via raw join
+        print(f"  Filtered to sites: {leads_company} ({before} → {len(leads)} leads)")
+    
+    # Apply account type filter to Sales Leads
+    if leads_acct and "Customer Account Type Code" not in leads.columns:
         cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
         leads = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+    
+    if leads_acct:
+        acct_keep = set([t.strip() for t in leads_acct.split(",") if t.strip()])
+        before = len(leads)
         leads = leads[leads["Customer Account Type Code"].isin(acct_keep)].copy()
+        print(f"  Filtered to account types: {leads_acct} ({before} → {len(leads)} leads)")
 
-    # Vendor leads (TRS ONLY) if active
+    # ========== VENDOR LEAD SPLITS ==========
     vendor_files = []
     if vendor_leads_on:
-        if "Customer Account Type Code" in leads.columns:
-            leads_trs = leads[leads["Customer Account Type Code"]=="TRS"].copy()
+        print("\n📦 Building Vendor Lead Splits...")
+        
+        # Decide which leads go to vendors
+        if vendor_leads_respect_site:
+            vendor_leads_base = leads.copy()
+            print(f"  Using SITE-FILTERED leads for vendor splits ({len(vendor_leads_base)} leads)")
         else:
-            # try to attach again from raw if missing
-            cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
-            leads_trs = leads.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
-            leads_trs = leads_trs[leads_trs["Customer Account Type Code"]=="TRS"].copy()
-        vendor_files = vendor_splits(leads_trs, vendors_filter, outdir_path)
-    vendor_index = pd.DataFrame({"Vendor_File": vendor_files})
+            # Build fresh leads from unfiltered status for vendors
+            vendor_status = status.copy()
+            vendor_leads_base = build_sales_leads(vendor_status, raw, min_ytd=min_ytd)
+            
+            # ADD THIS: Merge in Account Type column for vendor filtering
+            if "Customer Account Type Code" not in vendor_leads_base.columns:
+                cust_types = raw[["Company Number","Company Customer Number","Customer Account Type Code"]].drop_duplicates()
+                vendor_leads_base = vendor_leads_base.merge(cust_types, on=["Company Number","Company Customer Number"], how="left")
+            
+            print(f"  Using ALL-SITES leads for vendor splits ({len(vendor_leads_base)} leads)")
+        
+        vendor_files = vendor_splits(
+            vendor_leads_base,  
+            vendors_filter, 
+            outdir_path
+        )
+        print(f"  ✓ Created {len(vendor_files)} vendor-specific CSV files")
+    
+    vendor_index = pd.DataFrame({"Vendor_File": [os.path.basename(f) for f in vendor_files]})
 
-    # Summary
-    kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
-    kpi["Recommendations"] = narrative
-
-    # Company aggregates + weekly series (+forecast) — ALL and TRS views
+    # ========== SUMMARY & AGGREGATES ==========
+    print("\n📊 Building summaries...")
+    summary_kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
+    summary_kpi["Recommendations"] = narrative
     company_yoy = build_company_yoy(status)
 
+    # Weekly data for all account types
     all_weekly_hist, _ = build_company_weekly(raw)
     all_weekly = make_12w_forecast(all_weekly_hist, current_week, method=forecast_method)
 
-    if "Customer Account Type Code" in raw.columns:
-        raw_trs = raw[raw["Customer Account Type Code"]=="TRS"].copy()
-    else:
-        raw_trs = raw.iloc[0:0].copy()
-    trs_weekly_hist, _ = build_company_weekly(raw_trs) if not raw_trs.empty else (pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"]), current_week)
-    trs_weekly = make_12w_forecast(trs_weekly_hist, current_week, method=forecast_method)
+    # Build weekly for each account type
+    def build_acct_weekly(acct_type):
+        if "Customer Account Type Code" in raw.columns:
+            acct_raw = raw[raw["Customer Account Type Code"] == acct_type].copy()
+        else:
+            acct_raw = raw.iloc[0:0].copy()
+        
+        if acct_raw.empty:
+            return pd.DataFrame(columns=["Fiscal Week Number","CY","PY","Delta_YoY_Lbs","YoY_Pct"])
+        
+        weekly_hist, _ = build_company_weekly(acct_raw)
+        return make_12w_forecast(weekly_hist, current_week, method=forecast_method)
     
-    summary_kpi, lag_sites, cust_losses, narrative = build_summary(status, current_week)
-    summary_kpi["Recommendations"] = narrative
+    trs_weekly = build_acct_weekly("TRS")
+    cmu_weekly = build_acct_weekly("CMU")
+    lcc_weekly = build_acct_weekly("LCC")
+    
+        # After creating the weekly dataframes, add:
+    print(f"\n  Weekly data summary:")
+    print(f"    All Accounts: {len(all_weekly) if all_weekly is not None else 0} rows")
+    print(f"    TRS: {len(trs_weekly) if trs_weekly is not None else 0} rows")
+    print(f"    CMU: {len(cmu_weekly) if cmu_weekly is not None else 0} rows")
+    print(f"    LCC: {len(lcc_weekly) if lcc_weekly is not None else 0} rows")
 
-
+    # ========== FILE NAMING ==========
     fy_guess = "NA"
     if "Fiscal Period ID" in raw.columns and len(raw):
         try:
@@ -1422,46 +2081,89 @@ def main():
             pass
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_path = os.path.join(outdir_path, f"Category_Status_and_Leads_FY{fy_guess}_wk{current_week}_{stamp}.xlsx")
+    
+    # Append site filter to filename if applicable
+    site_suffix = f"_{company_filt.replace(',','_')}" if company_filt else "_AllSites"
+    
+    excel_path = os.path.join(
+        outdir_path, 
+        f"Category_Report{site_suffix}_FY{fy_guess}_wk{current_week}_{stamp}.xlsx"
+    )
+    leads_csv = os.path.join(outdir_path, f"Sales_Leads{site_suffix}.csv")
 
-    # Write workbook + CSV exports
+    # ========== WRITE EXCEL (Manager Tool) ==========
+    print(f"\n📁 Writing Excel workbook: {os.path.basename(excel_path)}")
     write_excel(
         excel_path,
         summary_kpi, lag_sites, cust_losses,
         status, leads, vendor_index,
         company_yoy=company_yoy,
-        all_weekly=all_weekly,         
-        trs_weekly=trs_weekly,          
+        all_weekly=all_weekly,
+        trs_weekly=trs_weekly,
+        cmu_weekly=cmu_weekly,  
+        lcc_weekly=lcc_weekly,
         forecast_method=forecast_method,
-        status_raw=raw
+        status_raw=raw,
+        alignment_df=alignment_df  # Use this variable name
     )
+    
+    leads.to_csv(leads_csv, index=False)
+    print(f"  ✓ Sales Leads CSV: {os.path.basename(leads_csv)}")
+    print(f"  ✓ Vendor lead files: {len(vendor_files)}")
 
-    # one-off run
-    body = f"Auto-generated report for {os.path.basename(source_path)} at {datetime.now():%Y-%m-%d %H:%M}."
-    send_email_with_attachments(MAIL_SUBJECT, body, [excel_path, os.path.join(outdir_path, "Sales_Leads.csv")])
+    # ========== WRITE POWERPOINT (Stakeholder Presentation) ==========
+    pptx_path = None
+    if create_ppt:
+        print(f"\n📊 Creating PowerPoint presentation...")
+        pptx_path = create_presentation_report(
+            excel_path=excel_path,
+            status=status,
+            raw_df=raw,
+            current_week=current_week,
+            all_weekly=all_weekly,
+            trs_weekly=trs_weekly,
+            cmu_weekly=cmu_weekly,
+            lcc_weekly=lcc_weekly,
+            active_weeks=active_weeks,
+            min_ytd=min_ytd,
+            top_n=ppt_top_n
+        )
+        print(f"  ✓ PowerPoint: {os.path.basename(pptx_path)}")
 
-    # --------- Email the outputs (Excel + Leads CSV) ----------
-    attachments = [
-        excel_path,
-        os.path.join(outdir_path, "Sales_Leads.csv"),
-    ]
+    # ========== EMAIL ==========
+    attachments = [excel_path, leads_csv]
+    if pptx_path:
+        attachments.insert(1, pptx_path)  # Add PowerPoint second
+    
     body = (
-        f"Auto-generated report for {Path(source_path).name}\n"
-        f"Built: {datetime.now():%Y-%m-%d %H:%M}\n"
-        f"FY/week: FY{fy_guess}/wk{current_week}\n"
-        f"Rows — status: {len(status):,} | leads: {len(leads):,}\n"
+        f"Category Analysis Report - {Path(source_path).name}\n"
+        f"Generated: {datetime.now():%Y-%m-%d %H:%M}\n"
+        f"FY{fy_guess} Week {current_week}\n\n"
+        f"Site filter: {company_filt or 'ALL SITES'}\n"
+        f"Sales Leads: {len(leads):,} records ({leads_acct} accounts)\n"
+        f"Vendor splits: {len(vendor_files)} files\n\n"
+        f"Attachments:\n"
+        f"  - Excel workbook (manager operational tool)\n"
+        f"  - PowerPoint presentation (stakeholder summary)\n" if pptx_path else ""
+        f"  - Sales Leads CSV\n"
     )
+    
     send_email_with_attachments(MAIL_SUBJECT, body, attachments)
 
-    leads.to_csv(os.path.join(outdir_path, "Sales_Leads.csv"), index=False)
-
-    print(
-        "Done.\n"
-        f"- Excel: {excel_path}\n"
-        f"- Sales Leads CSV: {os.path.join(outdir_path, 'Sales_Leads.csv')}\n"
-        f"- Vendor files: {len(vendor_files)} created."
-    )
-
+    # ========== SUMMARY ==========
+    print("\n" + "="*60)
+    print("✅ PROCESSING COMPLETE")
+    print("="*60)
+    print(f"Excel workbook:      {excel_path}")
+    if pptx_path:
+        print(f"PowerPoint:          {pptx_path}")
+    print(f"Sales Leads CSV:     {leads_csv}")
+    print(f"Vendor lead files:   {len(vendor_files)} in Vendor_Leads/")
+    print(f"Status records:      {len(status):,}")
+    print(f"Sales Leads:         {len(leads):,}")
+    print("="*60 + "\n")
+    
+    
 if __name__ == "__main__":
     pd.options.mode.copy_on_write = True
     main()
