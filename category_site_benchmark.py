@@ -69,6 +69,33 @@ def calculate_site_benchmarks(site_data, company_data):
     
     return pd.DataFrame(rows)
 
+def calculate_site_ranking(site_name, all_sites_df):
+    """Show where this site ranks among all company sites."""
+    
+    # Aggregate by site
+    site_summary = all_sites_df.groupby("Company Name", dropna=False).agg(
+        Pounds_CY=("Pounds_CY", "sum"),
+        Pounds_PY=("Pounds_PY", "sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs", "sum"),
+        Customers_CY=("Distinct_Customers_CY", "sum"),
+        Customers_PY=("Distinct_Customers_PY", "sum")
+    ).reset_index()
+    
+    site_summary["YoY_Pct"] = np.where(
+        site_summary["Pounds_PY"] > 0,
+        site_summary["Delta_YoY_Lbs"] / site_summary["Pounds_PY"],
+        np.nan
+    )
+    
+    # Sort by Delta YoY (ascending = worst first)
+    site_summary = site_summary.sort_values("Delta_YoY_Lbs", ascending=True).reset_index(drop=True)
+    site_summary["Rank"] = range(1, len(site_summary) + 1)
+    
+    # Find this site's rank
+    your_rank = site_summary[site_summary["Company Name"] == site_name]
+    
+    return site_summary, your_rank
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -95,35 +122,48 @@ def main():
     
     # Calculate benchmarks
     benchmarks = calculate_site_benchmarks(site_status, company_status)
+
+    # === DSM SUMMARY FOR THIS SITE ===
+    if not site_status.empty:
+        from final import build_dsm_opportunity_scorecard
+        
+        # Get source path for win-back calculations
+        dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
+            site_status, site_raw, args.source, active_weeks=6, min_ytd=min_ytd
+        )
     
     # Save to Excel
-    output_path = f"{args.outdir}/Site_{args.company}_Benchmark_{datetime.now():%Y%m%d}.xlsx"
+    output_path = f"{args.outdir}/Site_{args.company}_Report_{datetime.now():%Y%m%d}.xlsx"
+
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        
+        # TAB 1: Benchmark Summary
         benchmarks.to_excel(writer, sheet_name="Benchmark", index=False)
         
-        wb = writer.book
-        ws = wb["Benchmark"]
+        # TAB 2: Site Ranking
+        site_ranking, your_rank = calculate_site_ranking(
+            site_status["Company Name"].iloc[0], 
+            company_status
+        )
         
-        # Format headers
-        for cell in ws[1]:
-            cell.font = Font(bold=True, size=11, color="FFFFFF")
-            cell.fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        site_ranking.to_excel(writer, sheet_name="Site_Ranking", index=False)
         
-        # Format numbers and percentages
-        from openpyxl.styles import Font, PatternFill
-        for row in range(2, ws.max_row + 1):
-            for col_idx in [2, 3]:  # Site_CY, Site_PY
-                ws.cell(row, col_idx).number_format = '#,##0'
-            for col_idx in [4, 5, 6, 7, 8, 9]:  # Percentage columns
-                ws.cell(row, col_idx).number_format = '0.00%'
+        # Highlight your site in yellow
+        ws_rank = writer.book["Site_Ranking"]
+        if not your_rank.empty:
+            your_row = your_rank.iloc[0]["Rank"] + 1  # +1 for header
+            for col in range(1, 8):
+                ws_rank.cell(your_row, col).fill = PatternFill(
+                    start_color="FFFF00", end_color="FFFF00", fill_type="solid"
+                )
         
-        # Color-code Gap column (red = underperforming, green = outperforming)
-        for row in range(2, ws.max_row + 1):
-            gap_val = ws.cell(row, 6).value
-            if gap_val and float(gap_val) < 0:
-                ws.cell(row, 6).fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-            elif gap_val and float(gap_val) > 0:
-                ws.cell(row, 6).fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+        # TAB 3: DSM Opportunities (if exists)
+        if not dsm_summary.empty:
+            dsm_summary.to_excel(writer, sheet_name="DSM_Opportunities", index=False)
+        
+        # TAB 4: TRS Leads
+        if not trs_leads.empty:
+            trs_leads.to_excel(writer, sheet_name="Site_Leads", index=False)
         
         # === ADD EXPLAINER TEXT ===
         explain_row = ws.max_row + 3
