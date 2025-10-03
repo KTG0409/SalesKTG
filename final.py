@@ -3462,85 +3462,85 @@ def main():
     )
     leads_csv = os.path.join(outdir_path, f"Sales_Leads{site_suffix}.csv")
 
-# ========== WRITE EXCEL (Manager Tool) ==========
-print(f"\n📁 Writing Excel workbook: {os.path.basename(excel_path)}")
-write_excel(
-    excel_path,
-    summary_kpi, lag_sites, cust_losses,
-    status, leads, vendor_index,
-    company_yoy=company_yoy,
-    all_weekly=all_weekly,
-    trs_weekly=trs_weekly,
-    cmu_weekly=cmu_weekly,
-    lcc_weekly=lcc_weekly,
-    forecast_method=forecast_method,
-    status_raw=raw,
-    alignment_df=alignment_df,
-    filtered_company_name=filtered_company_name,
-    min_ytd=min_ytd,
-    source_path=source_path
-)
-
-# ADDED: Wait for Excel to release file lock
-print("  ⏳ Waiting for Excel to close...")
-time.sleep(3)
-
-leads.to_csv(leads_csv, index=False)
-print(f"  ✓ Sales Leads CSV: {os.path.basename(leads_csv)}")
-print(f"  ✓ Vendor lead files: {len(vendor_files)}")
-
-# ========== WRITE POWERPOINT (Stakeholder Presentation) ==========
-pptx_path = None
-# Build DSM data (needed for both Excel and PowerPoint)
-dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
-    status, raw, source_path, active_weeks=active_weeks, min_ytd=min_ytd
-)
-
-if create_ppt:
-    print(f"\n📊 Creating PowerPoint presentation...")
-    pptx_path = create_presentation_report(
-        excel_path=excel_path,
-        status=status,
-        raw_df=raw,
-        current_week=current_week,
+    # ========== WRITE EXCEL (Manager Tool) ==========
+    print(f"\n📁 Writing Excel workbook: {os.path.basename(excel_path)}")
+    write_excel(
+        excel_path,
+        summary_kpi, lag_sites, cust_losses,
+        status, leads, vendor_index,
+        company_yoy=company_yoy,
         all_weekly=all_weekly,
         trs_weekly=trs_weekly,
         cmu_weekly=cmu_weekly,
         lcc_weekly=lcc_weekly,
-        active_weeks=active_weeks,
+        forecast_method=forecast_method,
+        status_raw=raw,
+        alignment_df=alignment_df,
+        filtered_company_name=filtered_company_name,
         min_ytd=min_ytd,
-        top_n=ppt_top_n,
-        leads=leads,
-        dsm_summary=dsm_summary,
-        territory_detail=territory_detail,
-        winback_targets=winback_targets,
-        conversion_targets=conversion_targets
+        source_path=source_path
     )
-    print(f"  ✓ PowerPoint: {os.path.basename(pptx_path)}")
-    
-    # ADDED: Wait for PowerPoint to close and files to release
-    print("  ⏳ Waiting for file locks to release...")
-    time.sleep(2)
 
-# ========== EMAIL ==========
-attachments = [excel_path, leads_csv]
-if pptx_path:
-    attachments.insert(1, pptx_path)
+    # ADDED: Wait for Excel to release file lock
+    print("  ⏳ Waiting for Excel to close...")
+    time.sleep(3)
 
-body = (
-    f"Category Analysis Report - {Path(source_path).name}\n"
-    f"Generated: {datetime.now():%Y-%m-%d %H:%M}\n"
-    f"FY{fy_guess} Week {current_week}\n\n"
-    f"Site filter: {company_filt or 'ALL SITES'}\n"
-    f"Sales Leads: {len(leads):,} records ({leads_acct} accounts)\n"
-    f"Vendor splits: {len(vendor_files)} files\n\n"
-    f"Attachments:\n"
-    f"  - Excel workbook (manager operational tool)\n"
-    + (f"  - PowerPoint presentation (stakeholder summary)\n" if pptx_path else "")
-    + f"  - Sales Leads CSV\n"
-)
+    leads.to_csv(leads_csv, index=False)
+    print(f"  ✓ Sales Leads CSV: {os.path.basename(leads_csv)}")
+    print(f"  ✓ Vendor lead files: {len(vendor_files)}")
 
-send_email_with_attachments(MAIL_SUBJECT, body, attachments)
+    # ========== WRITE POWERPOINT (Stakeholder Presentation) ==========
+    pptx_path = None
+    # Build DSM data (needed for both Excel and PowerPoint)
+    dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
+        status, raw, source_path, active_weeks=active_weeks, min_ytd=min_ytd
+    )
+
+    if create_ppt:
+        print(f"\n📊 Creating PowerPoint presentation...")
+        pptx_path = create_presentation_report(
+            excel_path=excel_path,
+            status=status,
+            raw_df=raw,
+            current_week=current_week,
+            all_weekly=all_weekly,
+            trs_weekly=trs_weekly,
+            cmu_weekly=cmu_weekly,
+            lcc_weekly=lcc_weekly,
+            active_weeks=active_weeks,
+            min_ytd=min_ytd,
+            top_n=ppt_top_n,
+            leads=leads,
+            dsm_summary=dsm_summary,
+            territory_detail=territory_detail,
+            winback_targets=winback_targets,
+            conversion_targets=conversion_targets
+        )
+        print(f"  ✓ PowerPoint: {os.path.basename(pptx_path)}")
+        
+        # ADDED: Wait for PowerPoint to close and files to release
+        print("  ⏳ Waiting for file locks to release...")
+        time.sleep(2)
+
+    # ========== EMAIL ==========
+    attachments = [excel_path, leads_csv]
+    if pptx_path:
+        attachments.insert(1, pptx_path)
+
+    body = (
+        f"Category Analysis Report - {Path(source_path).name}\n"
+        f"Generated: {datetime.now():%Y-%m-%d %H:%M}\n"
+        f"FY{fy_guess} Week {current_week}\n\n"
+        f"Site filter: {company_filt or 'ALL SITES'}\n"
+        f"Sales Leads: {len(leads):,} records ({leads_acct} accounts)\n"
+        f"Vendor splits: {len(vendor_files)} files\n\n"
+        f"Attachments:\n"
+        f"  - Excel workbook (manager operational tool)\n"
+        + (f"  - PowerPoint presentation (stakeholder summary)\n" if pptx_path else "")
+        + f"  - Sales Leads CSV\n"
+    )
+
+    send_email_with_attachments(MAIL_SUBJECT, body, attachments)
 
     # ========== SUMMARY ==========
     print("\n" + "="*60)
