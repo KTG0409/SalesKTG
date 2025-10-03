@@ -2009,10 +2009,10 @@ def write_excel(
         # Format each table on Summary individually
         _format_table_at(
             xw.book["Summary"],
-            header_row_0idx=0,  # KPI table at top
+            header_row_0idx=0,
             n_rows=summary_kpi.shape[0],
-            number_headers={"Value"},
-            percent_headers={"% Any Item aligned", "% Any Vendor aligned", "% Item+Vendor aligned", "% Item-only", "% Vendor-only", "% Neither"}
+            number_headers={"Value", "Customers CY", "Customers PY"},  # ADDED
+            percent_headers={"% Any Item aligned", "% Any Vendor aligned", "% Item+Vendor aligned", "% Item-only", "% Vendor-only", "% Neither", "Customer Retention %"}  # ADDED
         )
 
         _format_table_at(
