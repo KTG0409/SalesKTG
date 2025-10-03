@@ -237,7 +237,7 @@ def _write_site_account_tab(writer, tab_name, df, site_name):
             percent_headers={"YoY_Pct"}
         )
 
-        
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
@@ -276,18 +276,36 @@ def main():
     
     # Save to Excel
     output_path = f"{args.outdir}/Site_{args.company}_Report_{datetime.now():%Y%m%d}.xlsx"
-
+    
+    from openpyxl.styles import PatternFill, Font
+    
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         
         # TAB 1: Benchmark Summary
         benchmarks.to_excel(writer, sheet_name="Benchmark", index=False)
         
-        # TAB 2: Site Ranking
-        site_ranking, your_rank = calculate_site_ranking(
-            site_status["Company Name"].iloc[0], 
-            company_status
-        )
+        ws_bench = writer.book["Benchmark"]
         
+        # Add title and explanation
+        ws_bench.insert_rows(1, 3)
+        ws_bench.cell(1, 1, value=f"SITE PERFORMANCE BENCHMARK: {site_name}").font = Font(bold=True, size=14, color="0066CC")
+        ws_bench.cell(2, 1, value=f"How this site compares to company-wide average | FY Week {current_week}").font = Font(size=10, italic=True, color="666666")
+        
+        # === ADD EXPLAINER TEXT ===
+        explain_row = ws_bench.max_row + 3
+        
+        ws_bench.cell(explain_row, 1, value="HOW TO READ THIS REPORT:").font = Font(bold=True, size=12, color="0066CC")
+        explain_row += 1
+        
+        ws_bench.cell(explain_row, 1, value="Gap vs Company: Negative (red) = site underperforming company average | Positive (green) = outperforming")
+        explain_row += 1
+        
+        ws_bench.cell(explain_row, 1, value="Market Share Change: Negative = losing share of company volume | Positive = gaining share")
+        explain_row += 1
+        
+        ws_bench.cell(explain_row, 1, value="Hierarchy: Indented rows show account type breakdowns and Sysco vs Non-Sysco brand splits")
+        
+        # TAB 2: Site Ranking
         site_ranking.to_excel(writer, sheet_name="Site_Ranking", index=False)
         
         # Highlight your site in yellow
@@ -298,75 +316,71 @@ def main():
                 ws_rank.cell(your_row, col).fill = PatternFill(
                     start_color="FFFF00", end_color="FFFF00", fill_type="solid"
                 )
+                ws_rank.cell(your_row, col).font = Font(bold=True)
         
-        # TAB 3: DSM Opportunities (if exists)
+        # Add title
+        ws_rank.insert_rows(1, 2)
+        ws_rank.cell(1, 1, value=f"COMPANY-WIDE SITE RANKING (Your Site: {site_name})").font = Font(bold=True, size=14, color="0066CC")
+        ws_rank.cell(2, 1, value=f"All sites ranked by Delta YoY Pounds | Your site highlighted in yellow").font = Font(size=10, italic=True, color="666666")
+        
+        # === ACCOUNT TYPE TABS ===
+        _write_site_account_tab(writer, "03_All_Accounts", site_status.copy(), site_name)
+        
+        # TRS
+        site_trs_full = site_status[site_status["Customer Account Type Code"] == "TRS"].copy() if "Customer Account Type Code" in site_status.columns else pd.DataFrame()
+        if not site_trs_full.empty:
+            _write_site_account_tab(writer, "04_TRS", site_trs_full, site_name)
+        
+        # LCC
+        site_lcc = site_status[site_status["Customer Account Type Code"] == "LCC"].copy() if "Customer Account Type Code" in site_status.columns else pd.DataFrame()
+        if not site_lcc.empty:
+            _write_site_account_tab(writer, "05_LCC", site_lcc, site_name)
+        
+        # CMU
+        site_cmu = site_status[site_status["Customer Account Type Code"] == "CMU"].copy() if "Customer Account Type Code" in site_status.columns else pd.DataFrame()
+        if not site_cmu.empty:
+            _write_site_account_tab(writer, "06_CMU", site_cmu, site_name)
+        
+        # TAB: DSM Opportunities (if exists)
         if not dsm_summary.empty:
-            dsm_summary.to_excel(writer, sheet_name="DSM_Opportunities", index=False)
+            dsm_summary.to_excel(writer, sheet_name="07_DSM_Opportunities", index=False)
+            
+            ws_dsm = writer.book["07_DSM_Opportunities"]
+            ws_dsm.insert_rows(1, 2)
+            ws_dsm.cell(1, 1, value=f"DSM OPPORTUNITIES AT {site_name}").font = Font(bold=True, size=14, color="0066CC")
+            ws_dsm.cell(2, 1, value="Win-Back = Active customers declining | Conversion = Buying but not aligned").font = Font(size=10, italic=True, color="666666")
         
-        # TAB 4: TRS Leads
+        # TAB: TRS Leads
         if not trs_leads.empty:
-            trs_leads.to_excel(writer, sheet_name="Site_Leads", index=False)
-        
-        # === ADD EXPLAINER TEXT ===
-        explain_row = ws.max_row + 3
-        
-        ws.cell(explain_row, 1, value="HOW TO READ THIS REPORT:").font = Font(bold=True, size=12, color="0066CC")
-        explain_row += 1
-        
-        ws.cell(explain_row, 1, value="Gap vs Company: Negative (red) = site underperforming company average | Positive (green) = outperforming")
-        explain_row += 1
-        
-        ws.cell(explain_row, 1, value="Market Share Change: Negative = losing share of company volume | Positive = gaining share")
-        explain_row += 1
-        
-        ws.cell(explain_row, 1, value="Hierarchy: Indented rows show account type breakdowns and Sysco vs Non-Sysco brand splits")
-        explain_row += 2
-        
-        # === GENERATE TRS LEADS ===
-        from category_utils import classify_conversion, build_sales_leads
-        
-        # Only TRS accounts for site leads
-        site_trs = site_status[site_status.get("Customer Account Type Code") == "TRS"].copy()
-        
-        if not site_trs.empty:
-            # Classify conversion status
-            site_trs = classify_conversion(site_trs)
+            trs_leads.to_excel(writer, sheet_name="08_Site_Leads", index=False)
             
-            # Build leads (TRS only, min 20 lbs/week)
-            min_ytd = current_week * 20
-            trs_leads = build_sales_leads(site_trs, site_raw, min_ytd=min_ytd)
+            ws_leads = writer.book["08_Site_Leads"]
+            ws_leads.insert_rows(1, 3)
+            ws_leads.cell(1, 1, value=f"TRS SALES LEADS FOR {site_name}").font = Font(bold=True, size=14, color="0066CC")
+            ws_leads.cell(2, 1, value=f"{len(trs_leads)} opportunities | TRS accounts only | Minimum {min_ytd:,.0f} lbs PY").font = Font(size=10, italic=True)
+            ws_leads.cell(3, 1, value="'Needs Both' = highest priority (neither item nor vendor aligned)")
             
-            if not trs_leads.empty:
-                trs_leads.to_excel(writer, sheet_name="Site_Leads", index=False)
-                
-                ws_leads = wb["Site_Leads"]
-                ws_leads.insert_rows(1, 3)
-                ws_leads.cell(1, 1, value=f"TRS SALES LEADS FOR SITE {args.company}").font = Font(bold=True, size=14, color="0066CC")
-                ws_leads.cell(2, 1, value=f"{len(trs_leads)} opportunities | TRS accounts only | Minimum {min_ytd:,.0f} lbs PY").font = Font(size=10, italic=True)
-                ws_leads.cell(3, 1, value="'Needs Both' = highest priority (neither item nor vendor aligned)")
-                
-                print(f"\n📋 TRS Leads: {len(trs_leads)} opportunities")
-                
-            # === GENERATE VENDOR SPLITS (separate CSV files) ===
-            import os
-            vendor_dir = os.path.join(args.outdir, "Vendor_Leads")
-            os.makedirs(vendor_dir, exist_ok=True)
+            print(f"\n📋 TRS Leads: {len(trs_leads)} opportunities")
+        
+        # === GENERATE VENDOR SPLITS (separate CSV files) ===
+        import os
+        vendor_dir = os.path.join(args.outdir, "Vendor_Leads")
+        os.makedirs(vendor_dir, exist_ok=True)
 
-            if not trs_leads.empty and "Aligned Vendor (SUVC)" in trs_leads.columns:
-                for vendor_code in trs_leads["Aligned Vendor (SUVC)"].dropna().unique():
-                    vendor_leads = trs_leads[trs_leads["Aligned Vendor (SUVC)"] == vendor_code]
-                    vendor_name = vendor_leads["Aligned Supplier Name"].iloc[0] if "Aligned Supplier Name" in vendor_leads.columns else "Unknown"
-                    safe_name = "".join(c for c in str(vendor_name) if c.isalnum() or c in (' ', '-', '_')).strip()[:30]
-                    
-                    csv_path = os.path.join(vendor_dir, f"Site{args.company}_Vendor_{vendor_code}_{safe_name}.csv")
-                    vendor_leads.to_csv(csv_path, index=False)
+        if not trs_leads.empty and "Aligned Vendor (SUVC)" in trs_leads.columns:
+            for vendor_code in trs_leads["Aligned Vendor (SUVC)"].dropna().unique():
+                vendor_leads = trs_leads[trs_leads["Aligned Vendor (SUVC)"] == vendor_code]
+                vendor_name = vendor_leads["Aligned Supplier Name"].iloc[0] if "Aligned Supplier Name" in vendor_leads.columns else "Unknown"
+                safe_name = "".join(c for c in str(vendor_name) if c.isalnum() or c in (' ', '-', '_')).strip()[:30]
                 
-                print(f"📦 Created vendor CSV files in {vendor_dir}")
+                csv_path = os.path.join(vendor_dir, f"Site{args.company}_Vendor_{vendor_code}_{safe_name}.csv")
+                vendor_leads.to_csv(csv_path, index=False)
+            
+            print(f"📦 Created vendor CSV files in {vendor_dir}")
 
     print(f"\n✅ Report saved: {output_path}")
     print("\n📊 Performance Summary:")
-    print(benchmarks.to_string(index=False))
-    
+    print(benchmarks.to_string(index=False))    
 
 if __name__ == "__main__":
     main()
