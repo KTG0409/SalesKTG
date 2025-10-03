@@ -8,6 +8,9 @@ import numpy as np
 from datetime import datetime
 from category_utils import clean_numeric_column, load_and_prepare, compute_windows
 
+# python category_site_benchmark.py --source "C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Inputs\550.csv" --alignment "C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Alignment550.csv" --company "55" --outdir "C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Outputs"
+
+
 def calculate_site_benchmarks(site_data, company_data):
     """
     Compare one site's performance to overall company.
