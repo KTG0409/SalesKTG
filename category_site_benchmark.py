@@ -96,6 +96,148 @@ def calculate_site_ranking(site_name, all_sites_df):
     
     return site_summary, your_rank
 
+def _overall_yoy_site(df):
+    """Calculate overall YoY metrics for site."""
+    row = {
+        "Pounds CY": df["Pounds_CY"].sum(),
+        "Pounds PY": df["Pounds_PY"].sum(),
+        "Delta Pounds YoY": df["Delta_YoY_Lbs"].sum(),
+        "Customers CY": df["Distinct_Customers_CY"].sum(),
+        "Customers PY": df["Distinct_Customers_PY"].sum(),
+        "Delta Customers": df["Delta_Customers"].sum(),
+    }
+    row["YoY %"] = (row["Delta Pounds YoY"]/row["Pounds PY"]) if row["Pounds PY"] else np.nan
+    row["Customer Retention %"] = (row["Customers CY"]/row["Customers PY"]) if row["Customers PY"] > 0 else np.nan
+    row["Avg Lbs/Customer CY"] = (row["Pounds CY"]/row["Customers CY"]) if row["Customers CY"] > 0 else 0
+    row["Avg Lbs/Customer PY"] = (row["Pounds PY"]/row["Customers PY"]) if row["Customers PY"] > 0 else 0
+    return pd.DataFrame([row])
+
+def _brand_split_site(df):
+    """Calculate Sysco vs Non-Sysco split."""
+    if "Sysco Brand Indicator" not in df.columns:
+        return pd.DataFrame(columns=["Sysco Brand Indicator","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+    
+    g = df.groupby("Sysco Brand Indicator", dropna=False).agg(
+        Pounds_CY=("Pounds_CY","sum"),
+        Pounds_PY=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    g["YoY_Pct"] = np.where(g["Pounds_PY"]>0, g["Delta_YoY_Lbs"]/g["Pounds_PY"], np.nan)
+    return g
+
+def _items_rank_site(df):
+    """Rank items by Delta YoY."""
+    keys = []
+    for k in ["Item Number", "Item Description", "Brand ID", "Brand"]:
+        if k in df.columns:
+            keys.append(k)
+    if not keys:
+        return pd.DataFrame(columns=["Item","Item Description","Brand ID","Pounds_CY","Pounds_PY","Delta_YoY_Lbs","YoY_Pct"])
+
+    g = df.groupby(keys, dropna=False).agg(
+        Pounds_CY=("Pounds_CY","sum"),
+        Pounds_PY=("Pounds_PY","sum"),
+        Delta_YoY_Lbs=("Delta_YoY_Lbs","sum")
+    ).reset_index()
+    g["YoY_Pct"] = np.where(g["Pounds_PY"]>0, g["Delta_YoY_Lbs"]/g["Pounds_PY"], np.nan)
+
+    if "Item Number" in g.columns:
+        g.rename(columns={"Item Number":"Item"}, inplace=True)
+
+    return g.sort_values("Delta_YoY_Lbs", ascending=True)
+
+def _format_table_at_site(ws, header_row_0idx, n_rows, number_headers=None, percent_headers=None):
+    """Format table with proper number and percentage formatting."""
+    from openpyxl.styles import Alignment
+    
+    number_headers = set(number_headers or [])
+    percent_headers = set(percent_headers or [])
+    header_row_1idx = header_row_0idx + 1
+    first_data = header_row_1idx + 1
+    last_data = header_row_1idx + n_rows
+    
+    if n_rows <= 0:
+        return
+
+    # Map header text to column index
+    header_to_col = {str(c.value).strip(): c.col_idx
+                     for c in ws[header_row_1idx] if c.value is not None}
+
+    def _coerce(cell, as_percent):
+        v = cell.value
+        if v is None or isinstance(v, (int, float)):
+            return
+        s = str(v).replace(",", "").strip()
+        if not s:
+            return
+        try:
+            if as_percent and s.endswith("%"):
+                cell.value = float(s[:-1]) / 100.0
+            else:
+                cell.value = float(s)
+        except Exception:
+            pass
+
+    # Format numbers
+    for h in number_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
+            _coerce(row[0], as_percent=False)
+            row[0].number_format = "#,##0"
+
+    # Format percents
+    for h in percent_headers:
+        col = header_to_col.get(h)
+        if not col:
+            continue
+        for row in ws.iter_rows(min_row=first_data, max_row=last_data, min_col=col, max_col=col):
+            _coerce(row[0], as_percent=True)
+            row[0].number_format = "0.0%"
+
+def _write_site_account_tab(writer, tab_name, df, site_name):
+    """Write account type tab with metrics."""
+    start = 0
+    
+    # Add site name header
+    ws = writer.book.create_sheet(tab_name)
+    ws.cell(1, 1, value=f"{site_name} - {tab_name.replace('_', ' ')}").font = Font(bold=True, size=14, color="0066CC")
+    start = 2
+    
+    # 1) OVERALL
+    overall = _overall_yoy_site(df)
+    overall.to_excel(writer, sheet_name=tab_name, index=False, startrow=start)
+    _format_table_at_site(
+        ws, header_row_0idx=start, n_rows=overall.shape[0],
+        number_headers={"Pounds CY","Pounds PY","Delta Pounds YoY","Customers CY","Customers PY","Delta Customers","Avg Lbs/Customer CY","Avg Lbs/Customer PY"},
+        percent_headers={"YoY %","Customer Retention %"}
+    )
+    start += overall.shape[0] + 2
+
+    # 2) BRAND SPLIT
+    brand = _brand_split_site(df)
+    if not brand.empty:
+        brand.to_excel(writer, sheet_name=tab_name, index=False, startrow=start)
+        _format_table_at_site(
+            ws, header_row_0idx=start, n_rows=brand.shape[0],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
+        start += brand.shape[0] + 2
+
+    # 3) ITEMS (Top 20)
+    items = _items_rank_site(df).head(20)
+    if not items.empty:
+        ws.cell(start + 1, 1, value="Top 20 Items by Delta YoY").font = Font(bold=True, size=11)
+        items.to_excel(writer, sheet_name=tab_name, index=False, startrow=start + 1)
+        _format_table_at_site(
+            ws, header_row_0idx=start + 1, n_rows=items.shape[0],
+            number_headers={"Pounds_CY","Pounds_PY","Delta_YoY_Lbs"},
+            percent_headers={"YoY_Pct"}
+        )
+
+        
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", required=True)
