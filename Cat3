@@ -199,6 +199,24 @@ OUTPUT_DIR = BASE_PATH / "Outputs" / "Results_Reports"
 CONFIG_DIR = BASE_PATH / "Config"
 REFERENCE_DIR = BASE_PATH / "Reference"
 
+# PATH DIAGNOSTIC - Print on startup
+print("\n" + "="*70)
+print("PATH CONFIGURATION CHECK")
+print("="*70)
+print(f"BASE_PATH:    {BASE_PATH}")
+print(f"  Exists:     {BASE_PATH.exists()}")
+print(f"\nINPUT_DIR:    {INPUT_DIR}")
+print(f"  Exists:     {INPUT_DIR.exists()}")
+print(f"\nOUTPUT_DIR:   {OUTPUT_DIR}")
+print(f"  Exists:     {OUTPUT_DIR.exists()}")
+print(f"\nCONFIG_DIR:   {CONFIG_DIR}")
+print(f"  Exists:     {CONFIG_DIR.exists()}")
+print(f"\nREFERENCE_DIR: {REFERENCE_DIR}")
+print(f"  Exists:     {REFERENCE_DIR.exists()}")
+print(f"  Alignments: {REFERENCE_DIR / 'Alignments'}")
+print(f"    Exists:   {(REFERENCE_DIR / 'Alignments').exists()}")
+print("="*70 + "\n")
+
 DEFAULTS = {
     "dropzone": str(INPUT_DIR),
     "results_reports": str(OUTPUT_DIR),
@@ -3933,18 +3951,6 @@ def main():
     # Load data
     from datetime import datetime as _dt
     import pandas as _pd, time as _t
-
-    print(f"[{_dt.now():%H:%M:%S}] reading CSV: {source_path}", flush=True)
-
-    # QUICK PROBE: read a sample so we know if I/O is the issue
-    _t0 = _t.time()
-    try:
-        _sample = _pd.read_csv(source_path, nrows=200_000)
-        print(f"[{_dt.now():%H:%M:%S}] sample read OK: {_sample.shape[0]:,} rows in {_t.time()-_t0:.1f}s", flush=True)
-        del _sample
-    except Exception as e:
-        print(f"[{_dt.now():%H:%M:%S}] sample read FAILED: {e}", flush=True)
-        raise
 
     print(f"[{_dt.now():%H:%M:%S}] calling load_and_prepare()", flush=True)
     raw, _ = load_and_prepare(
