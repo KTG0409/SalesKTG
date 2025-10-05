@@ -339,78 +339,41 @@ def prepare_run_context(category_config: dict, args=None):
     return run_dir, mail_to, mail_cc, mail_subject
 
 # ---------------------------- Helpers ----------------------------
+# ---------------------------- Helpers ----------------------------
 def read_source_csv(path: str, debug: bool = True):
-    import pandas as pd, csv, time
-
-    def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
-        df.columns = (df.columns.astype(str)
-                      .str.replace(r"\s+", " ", regex=True)
-                      .str.replace("_", " ")
-                      .str.strip())
-        # alias common variants → canonical
-        aliases = {
-            "Company Number": ["Operating Company Number","OpCo Number","Company Nbr","Company No","CompanyNumber"],
-            "Lot Number":     ["Lot Nbr","Lot No","Lot ID","LotNumber","Lot#","Lot Num"],
-        }
-        lower_to_actual = {c.lower(): c for c in df.columns}
-        ren = {}
-        for target, cands in aliases.items():
-            if target in df.columns:
-                continue
-            for cand in [target] + cands:
-                k = cand.lower()
-                if k in lower_to_actual:
-                    ren[lower_to_actual[k]] = target
-                    break
-        if ren:
-            df = df.rename(columns=ren)
-        return df
-
-    # --- detect BOM/encoding quickly
-    with open(path, "rb") as fb:
-        head = fb.read(4)
-    bom_enc = None
-    if head.startswith(b"\xff\xfe"): bom_enc = "utf-16-le"
-    elif head.startswith(b"\xfe\xff"): bom_enc = "utf-16-be"
-    elif head.startswith(b"\xef\xbb\xbf"): bom_enc = "utf-8-sig"
-
-    encodings = [e for e in [bom_enc, "utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"] if e]
-
-    # try: sniff delimiter from a text sample for each encoding, then read with C engine
-    for enc in encodings:
-        try:
-            with open(path, "rb") as fb:
-                sample = fb.read(256 * 1024).decode(enc, errors="replace")
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|", "^", "~"])
-                delim = dialect.delimiter
-            except Exception:
-                # fallback: pick the most frequent candidate
-                counts = {d: sample.count(d) for d in [",", "\t", ";", "|", "^", "~"]}
-                delim = max(counts, key=counts.get)
-
-            t0 = time.time()
-            df = pd.read_csv(path, sep=delim, encoding=enc, engine="c", dtype=str, low_memory=False)
-            if debug:
-                print(f"[read] enc={enc} sep={repr(delim)} -> cols={df.shape[1]} rows={len(df):,} in {time.time()-t0:.1f}s")
-            if df.shape[1] > 1:
-                return _normalize_headers(df)
-        except Exception:
-            pass
-
-    # last-resort: python engine with sep=None (slow but tolerant)
+    """Read CSV - simple like it worked yesterday, with OneDrive check."""
+    import pandas as pd
+    from pathlib import Path
+    import time
+    
+    if debug:
+        print(f"\n[read_source_csv] Reading: {Path(path).name}")
+    
+    # ONLY addition: Check for OneDrive placeholder
     try:
-        df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig",
-                         dtype=str, low_memory=False, on_bad_lines="skip")
-        if df.shape[1] > 1:
-            if debug:
-                print(f"[read] fallback sep=None/python enc=utf-8-sig -> cols={df.shape[1]} rows={len(df):,}")
-            return _normalize_headers(df)
-    except Exception:
+        with open(path, "rb") as f:
+            first_kb = f.read(4096)
+        if first_kb == b'\x00' * len(first_kb):
+            print(f"⚠️  OneDrive placeholder detected. Opening file to trigger download...")
+            # Trigger download
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                _ = f.read(1)
+            # Wait a moment
+            time.sleep(5)
+            print(f"✅ Retrying read...")
+    except:
         pass
-
-    raise SystemExit(f"Could not parse CSV: {path}")
-
+    
+    # Use the SAME simple read that worked yesterday
+    df = pd.read_csv(path, dtype=str)
+    
+    # Header normalization (from yesterday's code)
+    df.columns = df.columns.str.replace(r"\s+", " ", regex=True).str.strip()
+    
+    if debug:
+        print(f"✅ Read: {df.shape[1]} cols, {len(df):,} rows")
+    
+    return df
 
 def resolve_alignment_by_attr(attr_groups_value, search_dirs: list[Path]) -> str:
     """
@@ -3852,18 +3815,6 @@ def main():
 
     print(f"Config loaded. Email to: {os.getenv('MAIL_TO', 'NOT SET')}\n")
     
-    # Recipients: CLI takes precedence, else env that was set by load_category_config()
-    mail_to_list = _norm_list(getattr(args, "mail_to", None)) or _norm_list(os.getenv("MAIL_TO", ""))
-    mail_cc_list = _norm_list(getattr(args, "mail_cc", None)) or _norm_list(os.getenv("MAIL_CC", ""))
-
-    # push config values into DEFAULTS
-    for k, v in cfg.items():
-        if v is not None:
-            DEFAULTS[k] = v
-
-    print(f"Config loaded. Email to: {os.getenv('MAIL_TO', 'NOT SET')}\n")
-
- 
     # 2. Define all variables  (order matters!)
     source_path   = args.source or DEFAULTS.get("source")
     outdir_path   = args.outdir or DEFAULTS.get("outdir")
