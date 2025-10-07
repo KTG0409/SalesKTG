@@ -41,7 +41,11 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / "Shrimp_Prawns" / ".env")
 load_dotenv()  # fallback if the above path isn't found
 
-
+# DEBUG EMAIL CONFIG
+print(f"\n🔍 EMAIL DEBUG:")
+print(f"  SMTP_USER: {os.getenv('SMTP_USER', 'NOT SET')}")
+print(f"  SMTP_PASS: {'*' * len(os.getenv('SMTP_PASS', '')) if os.getenv('SMTP_PASS') else 'NOT SET'}")
+print(f"  MAIL_TO: {os.getenv('MAIL_TO', 'NOT SET')}\n")
 
 # ---------- Email config ----------
 def _as_bool(val) -> bool:
@@ -109,13 +113,14 @@ def send_email_with_attachments(subject: str, body: str, attachments: list[str])
         print(f"    ❌ Email send failed: {e}")
         
 # ================= USER CONFIG =================
-BASE_PATH = r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns"
+BASE_PATH = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis"
 
 DEFAULTS = {
-    "source": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Inputs\550.csv",  # ← Change from specific file to None
-    "alignment": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Alignment550.csv",
-    "outdir": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Outputs",
-    "watch_dir": r"C:\Users\kmor6669\Sysco Corporation\SBC APP - Pictures\Seafood\Shrimp_Prawns\Inputs",  
+    "source": None,  # ← Or leave as None since Power Automate will always provide it
+    "alignment": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Config\Shrimp_Prawns\Alignment550.csv",
+    "outdir": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Outputs\Shrimp_Prawns",
+    "watch_dir": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Inputs\Shrimp_Prawns",
+
     
     # SITE FILTERING 
     "company": '',  # ← Confirm: Site 37 only? Or None for all sites?
@@ -2480,16 +2485,15 @@ def process_one_file(source_path: str,
     leads = build_sales_leads(status, raw, min_ytd=min_ytd)
 
     leads_company = DEFAULTS.get("leads_company")
+    before = len(leads)
     if leads_company:
         print(f"\n🎯 Filtering sales leads to company: '{leads_company}'")
         site_tokens = [t.strip().strip('"').strip("'") for t in leads_company.split(",") if t.strip()]
-        site_tokens_norm = set(_clean_str_numeric(t).lower() for t in site_tokens)  # ← USE _clean_str_numeric
-        before = len(leads)
+        site_tokens_norm = set(_clean_str_numeric(t).lower() for t in site_tokens)  # ← USE _clean_str_numeric  
         leads = leads[
             leads["Company Number"].map(_clean_str_numeric).str.lower().isin(site_tokens_norm) |  # ← ADD .map(_clean_str_numeric)
             leads["Company Name"].astype(str).str.strip().str.lower().isin(site_tokens_norm)
         ].copy()
-    print(f"  Filtered to sites: {leads_company} ({before} → {len(leads)} leads)")
 
     leads_acct = DEFAULTS.get("leads_acct_types", "TRS,LCC")
     if leads_acct and "Customer Account Type Code" in raw.columns:
@@ -2583,16 +2587,82 @@ def process_one_file(source_path: str,
     )
     leads.to_csv(leads_csv, index=False)
 
-    # email (Excel + Leads CSV only; PDF can be added later)
-    body = f"Auto-generated report for {os.path.basename(source_path)} at {datetime.now():%Y-%m-%d %H:%M}."
-    send_email_with_attachments(MAIL_SUBJECT, body, [excel_path, leads_csv])
+    time.sleep(3)
+    # ========== POWERPOINT SETTINGS ==========
+    create_ppt = DEFAULTS.get("create_powerpoint", "Y").strip().upper() == "Y"
+    active_weeks = DEFAULTS.get("active_customer_weeks", 6)
+    ppt_top_n = DEFAULTS.get("ppt_top_n_targets", 15)
+    company_filt = DEFAULTS.get("company")
+    
+    # ========== CREATE POWERPOINT ==========
+    pptx_path = None
+    
+    if create_ppt:
+        print(f"\n📊 Creating PowerPoint presentation...")
+        
+        # Build DSM data for PowerPoint
+        dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
+            status, raw, source_path, 
+            active_weeks=active_weeks,
+            min_ytd=min_ytd
+        )
+        
+        pptx_path = create_presentation_report(
+            excel_path=excel_path,
+            status=status,
+            raw_df=raw,
+            current_week=current_week,
+            all_weekly=all_weekly,
+            trs_weekly=trs_weekly,
+            cmu_weekly=cmu_weekly,
+            lcc_weekly=lcc_weekly,
+            active_weeks=active_weeks,
+            min_ytd=min_ytd,
+            top_n=ppt_top_n,
+            leads=leads,
+            dsm_summary=dsm_summary,
+            territory_detail=territory_detail,
+            winback_targets=winback_targets,
+            conversion_targets=conversion_targets
+        )
+        
+        if pptx_path:
+            print(f"  ✓ PowerPoint: {os.path.basename(pptx_path)}")
+            time.sleep(2)
 
-    print("Done.")
-    print(f"- Excel: {excel_path}")
-    print(f"- Sales Leads CSV: {leads_csv}")
-    print(f"- Vendor files: {len(vendor_files)} created.")
+    # ========== EMAIL ==========
+    attachments = [excel_path, leads_csv]
+    if pptx_path:
+        attachments.insert(1, pptx_path)
+    
+    body = (
+        f"Category Analysis Report - {Path(source_path).name}\n"
+        f"Generated: {datetime.now():%Y-%m-%d %H:%M}\n"
+        f"FY{fy_guess} Week {current_week}\n\n"
+        f"Site filter: {company_filt or 'ALL SITES'}\n"
+        f"Sales Leads: {len(leads):,} records\n"
+        f"Vendor splits: {len(vendor_files)} files\n\n"
+        f"Attachments:\n"
+        f"  - Excel workbook (manager tool)\n"
+        + (f"  - PowerPoint presentation\n" if pptx_path else "")
+        + f"  - Sales Leads CSV\n"
+    )
+    
+    send_email_with_attachments(MAIL_SUBJECT, body, attachments)
+
+    # ========== SUMMARY ==========
+    print("\n" + "="*60)
+    print("✅ PROCESSING COMPLETE")
+    print("="*60)
+    print(f"Excel workbook:      {excel_path}")
+    if pptx_path:
+        print(f"PowerPoint:          {pptx_path}")
+    print(f"Sales Leads CSV:     {leads_csv}")
+    print(f"Vendor lead files:   {len(vendor_files)}")
+    print(f"Sales Leads:         {len(leads):,}")
+    print("="*60 + "\n")
+
     return excel_path, leads_csv
-
 # ---------- Watcher ----------
 ALLOW_EXT = {".csv"}
 def _is_temp_file(p: str) -> bool:
@@ -2656,7 +2726,7 @@ def _create_sysco_cover_slide(prs, current_week, min_week, max_week, fiscal_year
     SYSCO_GREY = RGBColor(117, 123, 130)
     
     # Logo
-    logo_path = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Sysco_Logo_FullColor.png"
+    logo_path = r"C:\Users\kmort\OneDrive - Sysco Corporation\Desktop\Category Script\Sysco_Logo_FullColor.png"
     if os.path.exists(logo_path):
         slide.shapes.add_picture(logo_path, Inches(0.5), Inches(0.5), height=Inches(0.8))
     
@@ -2922,8 +2992,17 @@ def _create_account_metrics_slide(prs, status_df, slide_title):
     overall = _overall_yoy(status_df)
     create_table_on_slide(
         slide, overall,
-        Inches(0.5), Inches(1.3), Inches(9), Inches(0.8),  # Moved down slightly
-        number_cols={"Pounds CY", "Pounds PY", "Delta Pounds YoY", "Customers CY", "Customers PY", "Delta Customers"},
+        Inches(0.5), Inches(1.3), Inches(9), Inches(0.8),
+        number_cols={
+            "Pounds CY", 
+            "Pounds PY", 
+            "Delta Pounds YoY", 
+            "Customers CY", 
+            "Customers PY", 
+            "Delta Customers",
+            "Avg Lbs/Customer CY",    # ← ADD THIS
+            "Avg Lbs/Customer PY"     # ← ADD THIS
+        },
         percent_cols={"YoY %", "Customer Retention %"}
     )
     
@@ -2985,13 +3064,8 @@ def _create_account_chart_slide(prs, weekly_df, slide_title, excel_path, sheet_n
 def _create_executive_insights_slide(prs, status_df, current_week, min_week, max_week, fiscal_year, leads_df=None):
     """Executive Summary with insights and action items."""
     weeks_covered = max_week - min_week + 1
-    
     slide = prs.slides.add_slide(prs.slide_layouts[6])
-
     min_week, max_week, fiscal_year = get_fiscal_period_info(status_df)
-    weeks_covered = max_week - min_week + 1
-    
-    slide = prs.slides.add_slide(prs.slide_layouts[6])  # Blank layout
     _add_logo_to_slide(slide)
     
     # Title
