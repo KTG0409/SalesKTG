@@ -3,7 +3,20 @@
 # Build: Status (YoY) + Brand split + Sites/Items tables + Weekly combo charts (+12w forecast) + Sales/Vendor leads
 # Usage example:
 #   python category_status_and_leads.py --groundfish groundfish.csv --alignment alignment.csv --outdir out --company "55" --attr-groups 538,550 --vendors 4074,1260 --forecast linear
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import sys
+import io
 
+# Fix Windows console encoding for emojis
+if sys.platform == 'win32':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    except:
+        pass
+
+# Your existing imports continue below...
 import argparse, os, sys, math
 from datetime import datetime
 import time
@@ -12,6 +25,7 @@ import numpy as np
 import smtplib
 from email.message import EmailMessage
 from pathlib import Path
+from openpyxl.utils import get_column_letter
 
 # Triggered by file addition
 from watchdog.observers import Observer
@@ -147,6 +161,10 @@ DEFAULTS = {
     # ========== PRESENTATION CONFIGURATION ==========
     "create_powerpoint": "Y",  # Yes, create PowerPoint
     "ppt_top_n_targets": 10,  # Top 10 targets on slide
+
+    # ========== TERRITORY ROUTES ==========
+    "create_territory_routes": "Y",
+    "territory_routes_top_n_dsms": 10,
 }
 
 # ---------------------------- Config Loader ----------------------------
@@ -176,6 +194,8 @@ def load_category_config(category_folder):
         "forecast_method": config.get("Settings", "forecast_method", fallback="linear"),
         "min_ytd_per_week": config.getint("Settings", "min_ytd_per_week", fallback=20),
         "ppt_top_n_targets": config.getint("Settings", "ppt_top_n_targets", fallback=10),
+        "create_territory_routes": config.get("Settings", "create_territory_routes", fallback="Y"),
+        "territory_routes_top_n_dsms": config.getint("Settings", "territory_routes_top_n_dsms", fallback=10),
     }
     
     if config.has_section("Email"):
@@ -188,6 +208,17 @@ def load_category_config(category_folder):
     
     return category_config
 # ---------------------------- Helpers ----------------------------
+# ---------- Progress Indicator ----------
+def print_progress(message, step=None, total=None):
+    """Print progress message with optional step counter."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    if step and total:
+        print(f"[{timestamp}] ({step}/{total}) {message}")
+    else:
+        print(f"[{timestamp}] {message}")
+    sys.stdout.flush()  # Force immediate output
+
+# ---------- Email config ----------
 
 def clean_numeric_column(series):
     """Remove $, %, commas from numeric columns before conversion."""
@@ -299,7 +330,10 @@ def start_watcher(watch_dir: str, alignment_path: str, outdir_path: str,
 
 # ---------------------------- Core (your originals, kept) ----------------------------
 def load_and_prepare(source_path, alignment_path, company=None, attr_groups=None, vendors=None):
+    print_progress("🔄 Loading source data...", 1, 5)
     g = pd.read_csv(source_path, dtype=str)
+    
+    print_progress("🔄 Loading alignment data...", 2, 5)
     a = pd.read_csv(alignment_path, dtype=str)
 
     def _clean_headers(df):
@@ -307,6 +341,7 @@ def load_and_prepare(source_path, alignment_path, company=None, attr_groups=None
         df.columns = cols
         return df
 
+    print_progress("🔄 Cleaning and preparing data...", 3, 5)
     g = _clean_headers(g).fillna("")
     a = _clean_headers(a).fillna("")
 
@@ -772,6 +807,18 @@ def build_summary(status, current_week):
     neither = max(tot - (iv + i_only + v_only), 0)
 
     # KPI row with added “Any” stats
+    # Count UNIQUE customers (not sum of column)
+    if "Company Customer Number" in status.columns:
+        # Group by customer and sum their pounds
+        customer_cy_totals = status.groupby("Company Customer Number")["Pounds_CY"].sum()
+        customers_cy = (customer_cy_totals > 0).sum()
+        
+        customer_py_totals = status.groupby("Company Customer Number")["Pounds_PY"].sum()
+        customers_py = (customer_py_totals > 0).sum()
+    else:
+        customers_cy = 0
+        customers_py = 0
+
     kpi = pd.DataFrame([{
         "KPI": "CY Pounds",
         "Value": tot,
@@ -782,9 +829,9 @@ def build_summary(status, current_week):
         "% Vendor-only": pct(v_only, tot),
         "% Neither": pct(neither, tot),
         "Current Fiscal Week": current_week,
-        "Customers CY": status["Distinct_Customers_CY"].sum(),  # NEW
-        "Customers PY": status["Distinct_Customers_PY"].sum(),  # NEW
-        "Customer Retention %": pct(status["Distinct_Customers_CY"].sum(), status["Distinct_Customers_PY"].sum()),  # NEW
+        "Customers CY": int(customers_cy),  # ← FIXED!
+        "Customers PY": int(customers_py),  # ← FIXED!
+        "Customer Retention %": pct(customers_cy, customers_py),  # ← FIXED!
     }])
 
     # Biggest negative YoY by Company (as % of total loss)
@@ -1097,15 +1144,7 @@ def _write_weekly_chart_only_tab(xw, sheet_name, weekly_df, forecast_method_desc
     bar = BarChart()
     bar.type = "col"
     bar.grouping = "clustered"
-    
-    # DESCRIPTIVE TITLE
-    if filtered_company:
-        bar.title = (f"Weekly Performance - {filtered_company}\n"
-                    f"Bars = Change vs Last Year  |  Lines = Current Year Volume & Forecast  |  Green Line = Growth %")
-    else:
-        bar.title = (f"Weekly Performance & {forecast_method_desc}\n"
-                    f"Bars = Change vs Last Year  |  Lines = Current Year Volume & Forecast  |  Green Line = Growth %")
-    
+        
     bar.width = 30
     bar.height = 18
     bar.gapWidth = 30
@@ -1247,7 +1286,7 @@ def _write_weekly_chart_only_tab(xw, sheet_name, weekly_df, forecast_method_desc
         cell.font = Font(size=11, bold=True, color="C00000")
     
     print(f"      ✓ Chart with color-coded bars and user-friendly labels")
-    
+        
 def _format_table_at(ws, header_row_0idx: int, n_rows: int,
                      number_headers=None, percent_headers=None):
     from openpyxl.styles import Alignment  # Add this import
@@ -1322,14 +1361,28 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     subheader_font = Font(name="Calibri", size=12, bold=True, color="333333")
     body_font = Font(name="Calibri", size=11)
     italic_font = Font(name="Calibri", size=10, italic=True, color="666666")
+
+    def add_section_header(ws, row_num, text):
+        """Add a formatted section header with proper spacing."""
+        cell = ws.cell(row_num, 1, value=text)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=False)
+        ws.merge_cells(f"A{row_num}:G{row_num}")
+        ws.row_dimensions[row_num].height = 30  # Consistent header height
+        return row_num + 1
     
     # === REPORT HEADER ===
     row = 1
-    ws.cell(row, 1, value="📊 HOW TO USE THIS CATEGORY PERFORMANCE REPORT").font = title_font
+    title_cell = ws.cell(row, 1,"📊 HOW TO USE THIS CATEGORY PERFORMANCE REPORT")
+    title_cell.font = title_font
+    title_cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=False)
     ws.merge_cells(f"A{row}:G{row}")
+    ws.row_dimensions[row].height = 50  # Extra tall for impact
     row += 1
     
     ws.cell(row, 1, value=f"Generated: {datetime.now():%B %d, %Y at %I:%M %p}").font = italic_font
+    ws.row_dimensions[row].height = 20
     row += 1
     
     if filtered_company_name:
@@ -1340,11 +1393,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 2
     
     # === SECTION 1: QUICK START ===
-    ws.cell(row, 1, value="🚀 QUICK START: Your Monday Morning Action Plan").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    ws.row_dimensions[row].height = 25 
-    row += 1
+    row = add_section_header(ws, row, "🚀 QUICK START: Your Monday Morning Action Plan")
  
     # Generate top 3 actions based on actual data
     actions = []
@@ -1382,11 +1431,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 1
     
     # === SECTION 2: UNDERSTANDING THE METRICS ===
-    ws.cell(row, 1, value="📖 KEY METRICS EXPLAINED").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    ws.row_dimensions[row].height = 25  
-    row += 1    
+    row = add_section_header(ws, row, "📖 KEY METRICS EXPLAINED")
     metrics_guide = [
         ("Pounds CY / PY", "Current Year vs Prior Year volume in pounds"),
         ("Delta YoY Lbs", "Change from last year (negative = declining, positive = growing)"),
@@ -1406,10 +1451,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 1
     
    # === SECTION 3: TAB-BY-TAB GUIDE ===
-    ws.cell(row, 1, value="📑 HOW TO USE EACH TAB").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    row += 1
+    row = add_section_header(ws, row, "📑 HOW TO USE EACH TAB")
 
     tab_guide = [
         ("Guide (this tab)", "Read this first. Explains metrics, filters, and how to use the report."),
@@ -1436,12 +1478,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 1
     
     # === SECTION 4: WHAT ARE SALES LEADS ===
-    ws.cell(row, 1, value="📋 SALES LEADS TAB: What's Included").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    ws.row_dimensions[row].height = 25  
-    row += 1
-
+    row = add_section_header(ws, row, "📋 SALES LEADS TAB: What's Included")
     ws.cell(row, 1, value="   INCLUDED:").font = Font(bold=True, size=11, color="008000")
     row += 1
     ws.cell(row, 1, value="      • Customers currently buying this category (minimum 20 lbs/week)").font = body_font
@@ -1465,13 +1502,8 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     ws.cell(row, 1, value="   DSM Opportunity Tab (separate): Shows TRS win-back targets + conversion opps by DSM").font = Font(italic=True, size=10, color="666666")
     row += 2
 
-    # Then your existing Growth Formula section continues...
     # === SECTION 5: THE GROWTH FORMULA (CORRECTED) ===
-    ws.cell(row, 1, value="📈 THE CATEGORY GROWTH FORMULA (In Priority Order)").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    row += 1
-    
+    row = add_section_header(ws, row, "📈 THE CATEGORY GROWTH FORMULA (In Priority Order)")    
     ws.cell(row, 1, value="   1. WIN BACK declining customers who are still ACTIVE (HIGHEST PRIORITY)").font = Font(bold=True, size=11, color="C00000")
     row += 1
     ws.cell(row, 1, value="      → Focus on customers down in THIS category but Last Invoice Date shows recent purchases").font = body_font
@@ -1509,11 +1541,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 2
     
     # === SECTION 6: FAQs (CORRECTED) ===
-    ws.cell(row, 1, value="❓ FREQUENTLY ASKED QUESTIONS").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    row += 1
-    
+    row = add_section_header(ws, row, "❓ FREQUENTLY ASKED QUESTIONS")    
     faqs = [
         ("Q: How do I read the Summary tab?", 
          "A: Start with Overall YoY metrics (top section). Then check Sysco Brand split to see if losses are brand-specific. Bottom tables show biggest losing sites and customers - prioritize these."),
@@ -1547,10 +1575,7 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     row += 1
     
     # === SECTION 7: CONTACT INFO ===
-    ws.cell(row, 1, value="📞 NEED HELP?").font = header_font
-    ws.cell(row, 1).fill = header_fill
-    ws.merge_cells(f"A{row}:G{row}")
-    row += 1
+    row = add_section_header(ws, row, "📞 NEED HELP?")
     
     ws.cell(row, 1, value="   Questions about this report? Contact your Category Manager.").font = body_font
     ws.merge_cells(f"A{row}:G{row}")
@@ -1559,41 +1584,32 @@ def create_guide_tab(xw, status_df, weeks_covered, filtered_company_name=None, m
     ws.cell(row, 1, value="   📧 Report generated automatically. Do not reply to notification emails.").font = italic_font
     ws.merge_cells(f"A{row}:G{row}")
     
-    # Auto-size columns
-    ws.column_dimensions['A'].width = 40
-    for col in ['B', 'C', 'D', 'E', 'F', 'G']:
-        ws.column_dimensions[col].width = 25
-    
-    # Set row heights for better readability
-    for row_num in range(1, row + 1):
-        if ws.cell(row_num, 1).font.size and ws.cell(row_num, 1).font.size >= 14:
-            ws.row_dimensions[row_num].height = 25
-        else:
-            ws.row_dimensions[row_num].height = 18
-    
-    # Apply text wrapping to instruction cells
-    for row in ws.iter_rows(min_row=8, max_row=ws.max_row):
-        for cell in row:
-            if cell.value:
-                cell.alignment = Alignment(wrap_text=True, vertical='top')
-                
-    # Row 1: Title (60 pixels = ~45 points)
-    ws.row_dimensions[1].height = 45
-    
-    # Rows 6-7: Coverage info (50 pixels = ~37.5 points)
-    ws.row_dimensions[6].height = 37.5
-    ws.row_dimensions[7].height = 37.5
-    
-    # Section headers (30 pixels = ~22.5 points)
-    for row_num in [5, 9, 18, 32]:
-        ws.row_dimensions[row_num].height = 22.5
-    
-    # Formula section rows (50 pixels = ~37.5 points)
-    for row_num in list(range(48, 52)) + list(range(54, 57)) + list(range(59, 62)):
-        ws.row_dimensions[row_num].height = 37.5
 
-    # Auto-size row heights to fit wrapped text
-    _autosize_rows(ws)
+    # === FINAL FORMATTING ===
+    
+    # Apply text wrapping to all content cells
+    for row_cells in ws.iter_rows(min_row=1, max_row=ws.max_row):
+        for cell in row_cells:
+            if cell.value and not cell.fill.start_color.rgb == "4472C4":  # Not a header
+                cell.alignment = Alignment(wrap_text=True, vertical='top')
+    
+    # Set minimum heights for content rows (not headers)
+    for row_num in range(1, ws.max_row + 1):
+        cell = ws.cell(row_num, 1)
+        
+        # Skip if it's a blue header (already sized)
+        if cell.fill and hasattr(cell.fill, 'start_color') and cell.fill.start_color.rgb == "4472C4":
+            continue
+        
+        # Calculate based on content length
+        if cell.value:
+            text_length = len(str(cell.value))
+            if text_length > 100:  # Long text needs more space
+                ws.row_dimensions[row_num].height = max(30, min(text_length / 4, 80))
+            elif text_length > 50:
+                ws.row_dimensions[row_num].height = 25
+            else:
+                ws.row_dimensions[row_num].height = 18
     
     print("  ✓ Guide tab created")
 
@@ -1676,8 +1692,45 @@ def build_dsm_opportunity_scorecard(status_df, raw_df, source_path, active_weeks
     winback_opps["Opportunity_Lbs"] = abs(winback_opps["Delta_YoY_Lbs"])
 
     print(f"    Win-back (from truly raw): {len(winback_opps)} customers")
-    
-    # ... rest of function unchanged (conversion uses status_df as before)
+
+    if not winback_opps.empty:
+        winback_items = []
+        for _, customer in winback_opps.head(100).iterrows():
+            cust_num = customer["Company Customer Number"]
+            
+            # Get items this customer bought PY but dropped in CY
+            cust_items = truly_raw[truly_raw["Company Customer Number"].str.strip() == cust_num].copy()
+            
+            if not cust_items.empty:
+                item_summary = cust_items.groupby("Item Description").agg({
+                    "Pounds PY": "sum",
+                    "Pounds CY": "sum"
+                }).reset_index()
+                
+                # Items they stopped buying (PY > 0, CY = 0 or very low)
+                lost_items = item_summary[
+                    (item_summary["Pounds PY"] > 0) & 
+                    (item_summary["Pounds CY"] < item_summary["Pounds PY"] * 0.2)
+                ].sort_values("Pounds PY", ascending=False).head(3)
+                
+                if not lost_items.empty:
+                    items_text = " | ".join([
+                        f"{row['Item Description'][:40]} ({row['Pounds PY']:.0f} lbs lost)"
+                        for _, row in lost_items.iterrows()
+                    ])
+                    winback_items.append({
+                        "Company Customer Number": cust_num,
+                        "Items_Lost": items_text
+                    })
+        
+        if winback_items:
+            winback_items_df = pd.DataFrame(winback_items)
+            winback_opps = winback_opps.merge(
+                winback_items_df, 
+                on="Company Customer Number", 
+                how="left"
+            )
+            winback_opps["Items_Lost"] = winback_opps["Items_Lost"].fillna("")
     
     # CONVERSION: Use status_df (needs alignment data)  
     customer_totals = status_df.groupby(
@@ -1711,6 +1764,42 @@ def build_dsm_opportunity_scorecard(status_df, raw_df, source_path, active_weeks
         (customer_totals.get("Conversion_Status", "").isin(["Needs Both", "Needs Item", "Needs Vendor"]))
     ].copy()
     conversion_opps["Opportunity_Lbs"] = conversion_opps["Pounds_CY"]
+    
+    print(f"    Conversion opportunities: {len(conversion_opps):,} customers")
+    
+    # ADD THIS SECTION: Get item details for conversion targets
+    if not conversion_opps.empty and not status_df.empty:
+        conversion_items = []
+        for _, customer in conversion_opps.head(100).iterrows():
+            cust_num = customer["Company Customer Number"]
+            
+            # Get current items needing conversion
+            cust_status = status_df[
+                (status_df["Company Customer Number"] == cust_num) &
+                (status_df["Conversion_Status"].isin(["Needs Both", "Needs Item", "Needs Vendor"]))
+            ].copy()
+            
+            if not cust_status.empty:
+                # Get top 3 items by volume
+                top_items = cust_status.nlargest(3, "Pounds_CY")
+                
+                items_text = " | ".join([
+                    f"{row.get('Item Description', 'Unknown')[:30]} → {row.get('SUPC', 'N/A')} ({row['Pounds_CY']:.0f} lbs)"
+                    for _, row in top_items.iterrows()
+                ])
+                conversion_items.append({
+                    "Company Customer Number": cust_num,
+                    "Items_To_Convert": items_text
+                })
+        
+        if conversion_items:
+            conversion_items_df = pd.DataFrame(conversion_items)
+            conversion_opps = conversion_opps.merge(
+                conversion_items_df,
+                on="Company Customer Number",
+                how="left"
+            )
+            conversion_opps["Items_To_Convert"] = conversion_opps["Items_To_Convert"].fillna("(Item detail not available)")
     
     print(f"    Conversion opportunities: {len(conversion_opps):,} customers")
     
@@ -1756,18 +1845,30 @@ def build_dsm_opportunity_scorecard(status_df, raw_df, source_path, active_weeks
     winback_targets_list = []
     for dsm in dsm_summary["Customer DSM"].head(20):
         dsm_winbacks = winback_opps[winback_opps["Customer DSM"] == dsm].sort_values("Opportunity_Lbs", ascending=False).head(5)
-        winback_targets_list.append(dsm_winbacks[[
+        
+        # Include all available columns including item details
+        cols = [
             "Customer DSM", "Customer Name", "Company Customer Number", "Customer Territory",
             "Opportunity_Lbs", "Pounds_PY", "Pounds_CY", "YoY_Pct"
-        ]])
-    
+        ]
+        if "Items_Lost" in dsm_winbacks.columns:
+            cols.append("Items_Lost")
+        
+        winback_targets_list.append(dsm_winbacks[cols])
+
     conversion_targets_list = []
     for dsm in dsm_summary["Customer DSM"].head(20):
         dsm_conversions = conversion_opps[conversion_opps["Customer DSM"] == dsm].sort_values("Opportunity_Lbs", ascending=False).head(5)
-        conversion_targets_list.append(dsm_conversions[[
+        
+        # Include all available columns including item details
+        cols = [
             "Customer DSM", "Customer Name", "Company Customer Number", "Customer Territory",
             "Opportunity_Lbs", "Pounds_CY", "Conversion_Status"
-        ]])
+        ]
+        if "Items_To_Convert" in dsm_conversions.columns:
+            cols.append("Items_To_Convert")
+        
+        conversion_targets_list.append(dsm_conversions[cols])
     
     winback_targets = pd.concat(winback_targets_list, ignore_index=True) if winback_targets_list else pd.DataFrame()
     conversion_targets = pd.concat(conversion_targets_list, ignore_index=True) if conversion_targets_list else pd.DataFrame()
@@ -1783,6 +1884,159 @@ def build_dsm_opportunity_scorecard(status_df, raw_df, source_path, active_weeks
     print(f"    ✓ DSM Summary: {len(dsm_summary)} DSMs")
     
     return dsm_summary, territory_detail, winback_targets, conversion_targets
+
+def generate_territory_routes(dsm_summary, winback_targets, conversion_targets, top_n_dsms=10):
+    """Generate weekly route plans for top DSMs by territory. ONE visit per customer with item details."""
+    
+    if dsm_summary.empty:
+        return {}
+    
+    print(f"\n🗺️ Building Territory Routes for Top {top_n_dsms} DSMs...")
+    
+    route_plans = {}
+    top_dsms = dsm_summary.head(top_n_dsms)
+    
+    for idx, dsm_row in top_dsms.iterrows():
+        dsm_name = dsm_row["Customer DSM"]
+        rank = dsm_row["Rank"]
+        
+        print(f"  Processing Rank {rank}: {dsm_name}")
+        
+        # Get targets for this DSM
+        dsm_winback = winback_targets[winback_targets["Customer DSM"] == dsm_name].copy() if not winback_targets.empty else pd.DataFrame()
+        dsm_conversion = conversion_targets[conversion_targets["Customer DSM"] == dsm_name].copy() if not conversion_targets.empty else pd.DataFrame()
+        
+        # COMBINE customers (deduplicate by customer number)
+        customer_aggregates = {}
+        
+        # Process win-back targets
+        for _, row in dsm_winback.iterrows():
+            cust_num = row["Company Customer Number"]
+            territory = row.get("Customer Territory", "Unknown")
+            key = (cust_num, territory)
+            
+            if key not in customer_aggregates:
+                customer_aggregates[key] = {
+                    "Customer Name": row["Customer Name"],
+                    "Company Customer Number": cust_num,
+                    "Customer Territory": territory,
+                    "Target_Types": set(),
+                    "Opportunity_Lbs": 0,
+                    "Pounds_PY": row.get("Pounds_PY", 0),
+                    "Pounds_CY": row.get("Pounds_CY", 0),
+                    "Conversion_Status": "",
+                    "Items_Lost": row.get("Items_Lost", ""),
+                    "Items_To_Convert": "",
+                }
+            
+            customer_aggregates[key]["Target_Types"].add("Win-Back")
+            # For win-back, opportunity is the LOSS (PY - CY)
+            winback_opp = abs(row.get("Pounds_PY", 0) - row.get("Pounds_CY", 0))
+            customer_aggregates[key]["Opportunity_Lbs"] = max(
+                customer_aggregates[key]["Opportunity_Lbs"],
+                winback_opp
+            )
+        
+        # Process conversion targets
+        for _, row in dsm_conversion.iterrows():
+            cust_num = row["Company Customer Number"]
+            territory = row.get("Customer Territory", "Unknown")
+            key = (cust_num, territory)
+            
+            if key not in customer_aggregates:
+                customer_aggregates[key] = {
+                    "Customer Name": row["Customer Name"],
+                    "Company Customer Number": cust_num,
+                    "Customer Territory": territory,
+                    "Target_Types": set(),
+                    "Opportunity_Lbs": row.get("Opportunity_Lbs", 0),
+                    "Pounds_PY": 0,
+                    "Pounds_CY": row.get("Pounds_CY", 0),
+                    "Conversion_Status": row.get("Conversion_Status", ""),
+                    "Items_Lost": "",
+                    "Items_To_Convert": row.get("Items_To_Convert", ""),
+                }
+            else:
+                # Customer is BOTH win-back and conversion
+                customer_aggregates[key]["Target_Types"].add("Conversion")
+                customer_aggregates[key]["Conversion_Status"] = row.get("Conversion_Status", "")
+                customer_aggregates[key]["Items_To_Convert"] = row.get("Items_To_Convert", "")
+                # Don't double-count pounds - use the larger opportunity
+                customer_aggregates[key]["Opportunity_Lbs"] = max(
+                    customer_aggregates[key]["Opportunity_Lbs"],
+                    row.get("Opportunity_Lbs", 0)
+                )
+        
+        # Convert to DataFrame with combined target types
+        all_targets = []
+        for key, data in customer_aggregates.items():
+            target_type = " + ".join(sorted(data["Target_Types"]))
+            all_targets.append({
+                "Customer Name": data["Customer Name"],
+                "Company Customer Number": data["Company Customer Number"],
+                "Customer Territory": data["Customer Territory"],
+                "Target_Type": target_type,
+                "Opportunity_Lbs": data["Opportunity_Lbs"],
+                "Pounds_PY": data["Pounds_PY"],
+                "Pounds_CY": data["Pounds_CY"],
+                "Conversion_Status": data["Conversion_Status"],
+                "Items_Lost": data["Items_Lost"],
+                "Items_To_Convert": data["Items_To_Convert"],
+            })
+        
+        if not all_targets:
+            continue
+        
+        targets_df = pd.DataFrame(all_targets)
+        
+        # Group by territory
+        territories = targets_df["Customer Territory"].dropna().unique()
+        
+        for territory in territories:
+            if str(territory).strip() == "" or str(territory).lower() == "unknown":
+                continue
+                
+            territory_targets = targets_df[targets_df["Customer Territory"] == territory].copy()
+            
+            if territory_targets.empty:
+                continue
+            
+            # Sort by opportunity descending (biggest opportunities first)
+            territory_targets = territory_targets.sort_values("Opportunity_Lbs", ascending=False)
+            
+            # Calculate priority score
+            territory_targets["Priority_Score"] = territory_targets["Opportunity_Lbs"]
+            
+            # Distribute across 5 days
+            days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+            targets_per_day = max(1, len(territory_targets) // 5)
+            
+            territory_targets["Recommended_Day"] = ""
+            territory_targets["Visit_Order"] = 0
+            
+            for day_idx, day in enumerate(days):
+                start_idx = day_idx * targets_per_day
+                end_idx = start_idx + targets_per_day if day_idx < 4 else len(territory_targets)
+                
+                for visit_order, idx in enumerate(range(start_idx, end_idx), start=1):
+                    if idx < len(territory_targets):
+                        territory_targets.iloc[idx, territory_targets.columns.get_loc("Recommended_Day")] = day
+                        territory_targets.iloc[idx, territory_targets.columns.get_loc("Visit_Order")] = visit_order
+            
+            # Sort by day then visit order
+            territory_targets = territory_targets.sort_values(["Recommended_Day", "Visit_Order"])
+            
+            # Create route key
+            safe_territory = "".join(c for c in str(territory) if c.isalnum() or c in (' ', '-', '_')).strip()[:30]
+            route_key = f"Rank{rank:02d}_{dsm_name.replace(' ', '')}_{safe_territory}"
+            
+            route_plans[route_key] = territory_targets
+            
+            total_opps = territory_targets["Opportunity_Lbs"].sum()
+            print(f"    ✓ {territory}: {len(territory_targets)} customers, {total_opps:,.0f} lbs")
+    
+    print(f"\n  📋 Created {len(route_plans)} territory route plans")
+    return route_plans
 
 def write_dsm_scorecard_tab(xw, dsm_summary, territory_detail, winback_targets, conversion_targets):
     """
@@ -1875,6 +2129,209 @@ def write_dsm_scorecard_tab(xw, dsm_summary, territory_detail, winback_targets, 
     
     print("  ✓ Combined DSM Opportunity Scorecard created (Win-Back + Conversion)")
 
+def create_territory_routes_workbook(route_plans_dict, outdir, fiscal_year, current_week):
+    """
+    Create a separate Excel workbook for territory routes.
+    Similar to Sales_Leads.csv but organized by territory with route schedules.
+    
+    Args:
+        route_plans_dict: Dictionary of {route_key: route_dataframe}
+        outdir: Output directory
+        fiscal_year: Fiscal year for filename
+        current_week: Current week for filename
+    
+    Returns:
+        Path to created workbook
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from datetime import datetime
+    
+    if not route_plans_dict:
+        print("    ℹ No territory routes to create")
+        return None
+    
+    print(f"\n📗 Creating Territory Routes Workbook...")
+    
+    # Create filename
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    workbook_name = f"Territory_Routes_FY{fiscal_year}_wk{current_week}_{stamp}.xlsx"
+    workbook_path = os.path.join(outdir, workbook_name)
+    
+    # Day colors
+    day_colors = {
+        "Monday": "E8F4F8",
+        "Tuesday": "FFF4E6",
+        "Wednesday": "F0F8E8",
+        "Thursday": "FCE8F3",
+        "Friday": "F3E8FC"
+    }
+    
+    with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        
+        # Create INDEX tab first
+        index_data = []
+        for route_key, route_df in route_plans_dict.items():
+            parts = route_key.split("_", 2)
+            rank = parts[0].replace("Rank", "") if len(parts) > 0 else "?"
+            dsm = parts[1] if len(parts) > 1 else "Unknown"
+            territory = parts[2] if len(parts) > 2 else "Unknown"
+            
+            total_visits = len(route_df)
+            total_opps = route_df["Opportunity_Lbs"].sum()
+            winback = (route_df["Target_Type"] == "Win-Back").sum() if "Target_Type" in route_df.columns else 0
+            conversion = (route_df["Target_Type"] == "Conversion").sum() if "Target_Type" in route_df.columns else 0
+            
+            index_data.append({
+                "Rank": int(rank),
+                "DSM": dsm,
+                "Territory": territory,
+                "Total_Visits": total_visits,
+                "Win_Back": winback,
+                "Conversion": conversion,
+                "Total_Opportunity_Lbs": total_opps,
+                "Tab_Name": route_key[:31]
+            })
+        
+        index_df = pd.DataFrame(index_data).sort_values("Rank")
+        index_df.to_excel(writer, sheet_name="Index", index=False)
+        
+        # Format Index tab
+        ws_index = writer.book["Index"]
+        ws_index.insert_rows(1, 3)
+        ws_index.cell(1, 1, value="TERRITORY ROUTE PLANS INDEX").font = Font(bold=True, size=16, color="0066CC")
+        ws_index.merge_cells("A1:H1")
+        ws_index.cell(2, 1, value=f"Generated: {datetime.now():%B %d, %Y at %I:%M %p} | FY{fiscal_year} Week {current_week}").font = Font(size=10, italic=True, color="666666")
+        ws_index.merge_cells("A2:H2")
+        ws_index.cell(3, 1, value=f"Total Routes: {len(route_plans_dict)} | Click tab names below to view schedules").font = Font(size=11, color="000000")
+        ws_index.merge_cells("A3:H3")
+        
+        # Format index numbers
+        for col_name in ["Rank", "Total_Visits", "Win_Back", "Conversion", "Total_Opportunity_Lbs"]:
+            col_idx = None
+            for cell in ws_index[4]:
+                if cell.value == col_name:
+                    col_idx = cell.col_idx
+                    break
+            if col_idx:
+                for row_idx in range(5, 5 + len(index_df)):
+                    cell = ws_index.cell(row_idx, col_idx)
+                    if cell.value is not None:
+                        try:
+                            cell.value = float(str(cell.value).replace(',', ''))
+                            cell.number_format = '#,##0'
+                        except:
+                            pass
+        
+        # Auto-size Index columns
+        for col_idx in range(1, ws_index.max_column + 1):
+            max_length = 0
+            column_letter = get_column_letter(col_idx)
+            
+            for row in ws_index.iter_rows(min_col=col_idx, max_col=col_idx):
+                cell = row[0]
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+            
+            ws_index.column_dimensions[column_letter].width = min(max_length + 2, 50)
+            
+            for row in ws_index.iter_rows(min_col=col_idx, max_col=col_idx):
+                cell = row[0]
+                try:
+                    if cell.value:
+                        max_length = max(max_length, len(str(cell.value)))
+                except:
+                    pass
+            
+            ws_index.column_dimensions[column_letter].width = min(max_length + 2, 50)
+        
+        # Create individual route tabs
+        for idx, (route_key, route_df) in enumerate(route_plans_dict.items(), start=1):
+            parts = route_key.split("_", 2)
+            rank_part = parts[0] if len(parts) > 0 else "00"
+            dsm_part = parts[1] if len(parts) > 1 else "Unknown"
+            territory_part = parts[2] if len(parts) > 2 else "Territory"
+            
+            # Tab name (31 char limit)
+            sheet_name = route_key[:31]
+            
+            # Write route data
+            route_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=4)
+            
+            ws = writer.book[sheet_name]
+            
+            # Header
+            ws.cell(1, 1, value=f"Weekly Route: {territory_part}").font = Font(bold=True, size=14, color="0066CC")
+            ws.merge_cells("A1:H1")
+            
+            # Summary
+            total_opps = route_df["Opportunity_Lbs"].sum()
+            total_visits = len(route_df)
+            winback_count = (route_df["Target_Type"] == "Win-Back").sum() if "Target_Type" in route_df.columns else 0
+            conversion_count = (route_df["Target_Type"] == "Conversion").sum() if "Target_Type" in route_df.columns else 0
+            
+            ws.cell(2, 1, value=f"DSM: {dsm_part} | Territory Manager: {territory_part}").font = Font(size=11, bold=True)
+            ws.merge_cells("A2:H2")
+            
+            ws.cell(3, 1, value=f"Total: {total_visits} visits | {total_opps:,.0f} lbs opportunity | Win-Back: {winback_count} | Conversion: {conversion_count}").font = Font(size=10, color="666666")
+            ws.merge_cells("A3:H3")
+            
+            # Format numbers
+            header_row = 5
+            col_map = {}
+            for cell in ws[header_row]:
+                if cell.value:
+                    col_map[str(cell.value).strip()] = cell.col_idx
+            
+            for col_name in ["Opportunity_Lbs", "Priority_Score", "Pounds_PY", "Pounds_CY", "Visit_Order"]:
+                if col_name in col_map:
+                    col_idx = col_map[col_name]
+                    for row_idx in range(header_row + 1, header_row + 1 + len(route_df)):
+                        cell = ws.cell(row_idx, col_idx)
+                        if cell.value is not None:
+                            try:
+                                cell.value = float(str(cell.value).replace(',', ''))
+                                cell.number_format = '#,##0'
+                            except:
+                                pass
+            
+            # Color by day
+            if "Recommended_Day" in col_map:
+                day_col = col_map["Recommended_Day"]
+                for row_idx in range(header_row + 1, header_row + 1 + len(route_df)):
+                    day_value = ws.cell(row_idx, day_col).value
+                    if day_value in day_colors:
+                        for col_idx in range(1, len(route_df.columns) + 1):
+                            ws.cell(row_idx, col_idx).fill = PatternFill(
+                                start_color=day_colors[day_value],
+                                end_color=day_colors[day_value],
+                                fill_type="solid"
+                            )
+            
+            # Auto-size
+            for col_idx in range(1, ws.max_column + 1):
+                max_length = 0
+                column_letter = get_column_letter(col_idx)
+                
+                for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+                    cell = row[0]
+                    try:
+                        if cell.value:  # ← SIMPLER - just check if there's a value
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+                
+                adjusted_width = min(max_length + 2, 50)
+                ws.column_dimensions[column_letter].width = adjusted_width
+            
+            print(f"    ✓ Tab {idx}/{len(route_plans_dict)}: {territory_part}")
+    
+    print(f"  ✅ Territory Routes Workbook: {workbook_name}")
+    return workbook_path
+
+
 def write_site_lead_summary_tab(xw, leads_df):
     """
     Create dedicated tab showing sites ranked by lead volume.
@@ -1943,43 +2400,67 @@ def _autosize_columns(ws, min_width=10, max_width=50):
     """Auto-fit column widths based on content."""
     from openpyxl.utils import get_column_letter
     
-    for column in ws.columns:
+    # Auto-size columns (safe version)
+    for col_idx in range(1, ws.max_column + 1):
         max_length = 0
-        column_letter = get_column_letter(column[0].column)
+        column_letter = get_column_letter(col_idx)
         
-        for cell in column:
+        for row in ws.iter_rows(min_col=col_idx, max_col=col_idx):
+            cell = row[0]
             try:
                 if cell.value:
-                    # Handle wrapped text - use first line for width
-                    cell_value = str(cell.value)
-                    if '\n' in cell_value:
-                        cell_value = cell_value.split('\n')[0]
-                    max_length = max(max_length, len(cell_value))
+                    max_length = max(max_length, len(str(cell.value)))
             except:
                 pass
         
-        # Set width with constraints
-        adjusted_width = min(max(max_length + 2, min_width), max_width)
+        adjusted_width = min(max_length + 2, 50)
         ws.column_dimensions[column_letter].width = adjusted_width
 
 def _autosize_rows(ws):
     """Auto-adjust row heights to fit wrapped text."""
     from openpyxl.utils import get_column_letter
     
-    for row in ws.iter_rows():
-        max_height = 15  # Minimum height
-        for cell in row:
-            if cell.value and isinstance(cell.value, str):
-                # Check if text is wrapped
-                if cell.alignment and cell.alignment.wrap_text:
-                    # Estimate height based on text length and column width
-                    col_width = ws.column_dimensions[get_column_letter(cell.column)].width or 10
-                    text_length = len(str(cell.value))
-                    estimated_lines = max(1, text_length / (col_width * 1.2))
-                    estimated_height = estimated_lines * 15
-                    max_height = max(max_height, estimated_height)
+    for row_idx in range(1, ws.max_row + 1):
+        max_height = 15  # Minimum height in points
         
-        ws.row_dimensions[row[0].row].height = max_height
+        for col_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row_idx, col_idx)
+            
+            if not cell.value:
+                continue
+            
+            # Only calculate for wrapped text
+            if cell.alignment and cell.alignment.wrap_text:
+                # Get column width in characters
+                col_letter = get_column_letter(col_idx)
+                col_width = ws.column_dimensions[col_letter].width or 10
+                
+                # Convert to approximate character count
+                chars_per_line = int(col_width * 1.0)  # Rough estimate
+                
+                # Count lines needed
+                text = str(cell.value)
+                text_length = len(text)
+                
+                # Account for explicit line breaks
+                explicit_lines = text.count('\n') + 1
+                
+                # Estimate wrapped lines
+                wrapped_lines = max(1, text_length / chars_per_line) if chars_per_line > 0 else 1
+                
+                # Total lines needed
+                total_lines = max(explicit_lines, wrapped_lines)
+                
+                # Calculate height (approximately 15 points per line)
+                estimated_height = total_lines * 15
+                
+                # Cap at reasonable maximum
+                estimated_height = min(estimated_height, 150)
+                
+                max_height = max(max_height, estimated_height)
+        
+        # Apply the calculated height
+        ws.row_dimensions[row_idx].height = max_height
         
 def write_grouped_sales_leads(xw, leads_df, sheet_name="12_Sales_Leads"):
     """
@@ -2051,7 +2532,11 @@ def write_excel(
     alignment_df=None,
     filtered_company_name=None,
     min_ytd=260,
-    source_path=None
+    source_path=None,
+    dsm_summary=None,              
+    territory_detail=None,         
+    winback_targets=None,          
+    conversion_targets=None       
 ):
     # Debug output
     print(f"\n  Starting Excel write to: {excel_path}")
@@ -2344,25 +2829,18 @@ def write_excel(
 
             # ===== 13 — COMBINED DSM OPPORTUNITY SCORECARD =====
             print("\n📊 Building Combined DSM Opportunity Scorecard...")
-            dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
-                status, 
-                status_raw,
-                source_path,  
-                active_weeks=DEFAULTS.get("active_customer_weeks", 8),
-                min_ytd=min_ytd
-            )
-
-            # Export win-back details for validation
-            if not winback_targets.empty:
-                export_dir = os.path.dirname(excel_path)
-                export_path = os.path.join(export_dir, "WinBack_Detail_Export.csv")
-                winback_targets.to_csv(export_path, index=False)
-                
-            if not dsm_summary.empty:
+            if dsm_summary is not None and not dsm_summary.empty:
                 write_dsm_scorecard_tab(xw, dsm_summary, territory_detail, winback_targets, conversion_targets)
-                print(f"  ✓ Identified {len(dsm_summary)} DSMs with opportunities")
+                
+                # Export win-back details for validation
+                if winback_targets is not None and not winback_targets.empty:
+                    export_dir = os.path.dirname(excel_path)
+                    export_path = os.path.join(export_dir, "WinBack_Detail_Export.csv")
+                    winback_targets.to_csv(export_path, index=False)
+                
+                print(f"  ✓ DSM Opportunity Scorecard: {len(dsm_summary)} DSMs")
             else:
-                print("  ℹ No DSM opportunities found")
+                print("  ℹ No DSM opportunities to write")
 
             vendor_index.to_excel(xw, sheet_name="14_Vendor_Leads_Index", index=False)
 
@@ -2433,6 +2911,99 @@ def write_excel(
         traceback.print_exc()
         raise
 
+def export_all_chart_images(excel_path):
+    """
+    Export all chart images from Excel workbook to Chart_Images folder.
+    Call this AFTER Excel file is closed.
+    """
+    import platform
+    if platform.system() != "Windows":
+        print("    ⚠ Chart export only supported on Windows")
+        return False
+    
+    try:
+        import win32com.client
+        
+        chart_dir = os.path.join(os.path.dirname(excel_path), "Chart_Images")
+        os.makedirs(chart_dir, exist_ok=True)
+        
+        print(f"    📸 Exporting chart images...")
+        
+        # Get or create Excel instance
+        try:
+            excel_app = win32com.client.GetActiveObject("Excel.Application")
+        except:
+            excel_app = win32com.client.Dispatch("Excel.Application")
+        
+        excel_app.DisplayAlerts = False
+        excel_app.Visible = False
+        
+        # Open the workbook
+        wb = excel_app.Workbooks.Open(os.path.abspath(excel_path))
+        
+        # Chart sheet names
+        chart_sheets = [
+            "05_All_Weekly_Chart",
+            "07_TRS_Weekly_Chart", 
+            "08_CMU_Weekly_Chart",
+            "09_LCC_Weekly_Chart"
+        ]
+        
+        exported = 0
+        for sheet_name in chart_sheets:
+            try:
+                ws = wb.Worksheets(sheet_name)
+                if ws.ChartObjects().Count > 0:
+                    chart_path = os.path.join(chart_dir, f"{sheet_name}.png")
+                    chart_obj = ws.ChartObjects(1)
+                    
+                    # PRIMARY METHOD: Clipboard (most reliable for all chart types)
+                    try:
+                        from PIL import ImageGrab
+                        
+                        # Copy chart to clipboard
+                        chart_obj.CopyPicture(1, 2)  # xlScreen, xlBitmap
+                        
+                        # Small delay for clipboard stability
+                        import time
+                        time.sleep(0.2)
+                        
+                        # Grab and save
+                        img = ImageGrab.grabclipboard()
+                        if img:
+                            img.save(chart_path, 'PNG')
+                            print(f"      ✓ {sheet_name}.png")
+                            exported += 1
+                        else:
+                            raise Exception("Clipboard empty")
+                            
+                    except ImportError:
+                        # Pillow not installed - use fallback
+                        print(f"      ⚠ Pillow not installed, using direct export (less reliable)")
+                        chart_obj.Chart.Export(chart_path, "PNG")
+                        print(f"      ✓ {sheet_name}.png (fallback)")
+                        exported += 1
+                        
+                    except Exception as e:
+                        # Clipboard failed - try direct export
+                        print(f"      ⚠ Clipboard method failed, trying direct export: {e}")
+                        chart_obj.Chart.Export(chart_path, "PNG")
+                        print(f"      ✓ {sheet_name}.png (fallback)")
+                        exported += 1
+                        
+            except Exception as e:
+                print(f"      ❌ All methods failed for {sheet_name}: {e}")
+        
+        wb.Close(SaveChanges=False)
+        excel_app.Quit()
+        
+        print(f"    ✅ Exported {exported} chart images")
+        return exported > 0
+        
+    except Exception as e:
+        print(f"    ❌ Chart export failed: {e}")
+        return False
+    
 # ======= Process report one time only =========
 def process_one_file(source_path: str,
                      alignment_path: str,
@@ -2568,7 +3139,19 @@ def process_one_file(source_path: str,
     excel_path = os.path.join(outdir_path, f"Category_Status_and_Leads_FY{fy_guess}_wk{current_week}_{stamp}.xlsx")
     leads_csv  = os.path.join(outdir_path, "Sales_Leads.csv")
 
-    # write outputs
+    # ========== BUILD DSM SCORECARD ==========
+    print("\n📊 Building DSM Opportunity Scorecard...")
+    active_weeks = DEFAULTS.get("active_customer_weeks", 6)
+    dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
+        status, raw, source_path, 
+        active_weeks=active_weeks,
+        min_ytd=min_ytd
+    )
+    
+    if not dsm_summary.empty:
+        print(f"  ✓ Identified {len(dsm_summary)} DSMs with opportunities")
+
+    # ========== WRITE EXCEL ==========
     write_excel(
         excel_path,
         summary_kpi, lag_sites, cust_losses,
@@ -2583,30 +3166,62 @@ def process_one_file(source_path: str,
         alignment_df=alignment_df,
         filtered_company_name=filtered_company_name,
         min_ytd=min_ytd,
-        source_path=source_path  # ADD THIS LINE
+        source_path=source_path,
+        dsm_summary=dsm_summary,
+        territory_detail=territory_detail,
+        winback_targets=winback_targets,
+        conversion_targets=conversion_targets
     )
     leads.to_csv(leads_csv, index=False)
 
     time.sleep(3)
-    # ========== POWERPOINT SETTINGS ==========
+
+    # ========== TERRITORY ROUTE PLANNING ==========
+    territory_routes_workbook = None
+    route_plans = {}
+    create_routes = (DEFAULTS.get("create_territory_routes", "Y").strip().upper() == "Y")
+
+    if create_routes and not dsm_summary.empty:
+        print(f"\n🗺️ Generating Territory Route Plans...")
+        
+        top_n_dsms = DEFAULTS.get("territory_routes_top_n_dsms", 10)
+        print(f"  Processing top {top_n_dsms} DSMs from opportunity scorecard...")
+        
+        route_plans = generate_territory_routes(
+            dsm_summary=dsm_summary,
+            winback_targets=winback_targets,
+            conversion_targets=conversion_targets,
+            top_n_dsms=top_n_dsms
+        )
+        
+        if route_plans:
+            territory_routes_workbook = create_territory_routes_workbook(
+                route_plans_dict=route_plans,
+                outdir=outdir_path,
+                fiscal_year=fy_guess,
+                current_week=current_week
+            )
+            
+            route_dir = os.path.join(outdir_path, "Territory_Routes")
+            os.makedirs(route_dir, exist_ok=True)
+            
+            csv_count = 0
+            for route_key, route_df in route_plans.items():
+                csv_path = os.path.join(route_dir, f"{route_key}.csv")
+                route_df.to_csv(csv_path, index=False)
+                csv_count += 1
+            
+            print(f"  ✅ Created territory routes:")
+            print(f"     • Excel workbook: {os.path.basename(territory_routes_workbook)}")
+            print(f"     • CSV files: {csv_count} in Territory_Routes/ folder")
+
+    # ========== POWERPOINT ==========
     create_ppt = DEFAULTS.get("create_powerpoint", "Y").strip().upper() == "Y"
-    active_weeks = DEFAULTS.get("active_customer_weeks", 6)
     ppt_top_n = DEFAULTS.get("ppt_top_n_targets", 15)
-    company_filt = DEFAULTS.get("company")
-    
-    # ========== CREATE POWERPOINT ==========
     pptx_path = None
     
     if create_ppt:
         print(f"\n📊 Creating PowerPoint presentation...")
-        
-        # Build DSM data for PowerPoint
-        dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
-            status, raw, source_path, 
-            active_weeks=active_weeks,
-            min_ytd=min_ytd
-        )
-        
         pptx_path = create_presentation_report(
             excel_path=excel_path,
             status=status,
@@ -2631,21 +3246,26 @@ def process_one_file(source_path: str,
             time.sleep(2)
 
     # ========== EMAIL ==========
+    company_filt = DEFAULTS.get("company")
     attachments = [excel_path, leads_csv]
     if pptx_path:
         attachments.insert(1, pptx_path)
-    
+    if territory_routes_workbook:
+        attachments.append(territory_routes_workbook)
+
     body = (
         f"Category Analysis Report - {Path(source_path).name}\n"
         f"Generated: {datetime.now():%Y-%m-%d %H:%M}\n"
         f"FY{fy_guess} Week {current_week}\n\n"
         f"Site filter: {company_filt or 'ALL SITES'}\n"
         f"Sales Leads: {len(leads):,} records\n"
-        f"Vendor splits: {len(vendor_files)} files\n\n"
-        f"Attachments:\n"
+        f"Vendor splits: {len(vendor_files)} files\n"
+        + (f"Territory routes: {len(route_plans)} routes created\n" if territory_routes_workbook else "")
+        + "\nAttachments:\n"
         f"  - Excel workbook (manager tool)\n"
         + (f"  - PowerPoint presentation\n" if pptx_path else "")
         + f"  - Sales Leads CSV\n"
+        + (f"  - Territory Routes Workbook\n" if territory_routes_workbook else "")
     )
     
     send_email_with_attachments(MAIL_SUBJECT, body, attachments)
@@ -2829,63 +3449,35 @@ def create_table_on_slide(slide, data_df, left, top, width, height,
 
 
 def add_chart_image_to_slide(slide, excel_path, sheet_name, left, top, width, height):
-    """Insert chart from Excel as image into PowerPoint slide."""
+    """Insert chart image from Chart_Images folder into PowerPoint slide."""
     try:
-        temp_image = os.path.join(os.path.dirname(excel_path), f"temp_{sheet_name}.png")
+        # Look for pre-exported PNG in Chart_Images folder
+        chart_dir = os.path.join(os.path.dirname(excel_path), "Chart_Images")
+        chart_image_path = os.path.join(chart_dir, f"{sheet_name}.png")
         
-        import platform
-        if platform.system() == "Windows":
-            import win32com.client
-            
-            # Try to get existing Excel instance first, or create new one
-            try:
-                excel_app = win32com.client.GetActiveObject("Excel.Application")
-            except:
-                excel_app = win32com.client.Dispatch("Excel.Application")
-            
-            # Set properties in this order
-            excel_app.DisplayAlerts = False  # Do this FIRST
-            try:
-                excel_app.Visible = False
-            except:
-                pass  # Ignore if can't set Visible
-            
-            wb_com = excel_app.Workbooks.Open(os.path.abspath(excel_path))
-            ws_com = wb_com.Worksheets(sheet_name)
-            
-            if ws_com.ChartObjects().Count > 0:
-                chart_com = ws_com.ChartObjects(1).Chart
-                chart_com.Export(temp_image)
-            
-            wb_com.Close(SaveChanges=False)
-            
-            # Only quit if we created a new instance
-            try:
-                excel_app.Quit()
-            except:
-                pass
-            
-            # Insert image into PowerPoint
-            if os.path.exists(temp_image):
-                slide.shapes.add_picture(temp_image, left, top, width=width, height=height)
-                
-                # Clean up
-                import time
-                time.sleep(0.3)
-                try:
-                    os.remove(temp_image)
-                except:
-                    pass
-            
+        if os.path.exists(chart_image_path):
+            # Use pre-exported image
+            slide.shapes.add_picture(chart_image_path, left, top, width=width, height=height)
+            print(f"      ✓ Inserted chart: {sheet_name}")
+            return True
         else:
-            # Non-Windows fallback
+            print(f"      ⚠ Chart image not found: {sheet_name}.png")
+            # Add placeholder text
             text_box = slide.shapes.add_textbox(left, top, width, height)
-            text_box.text_frame.text = "Chart available in Excel workbook"
+            text_frame = text_box.text_frame
+            text_frame.text = f"Chart: {sheet_name}\n(See Excel workbook)"
+            return False
             
     except Exception as e:
-        print(f"      ⚠ Chart image insertion failed: {e}")
-        text_box = slide.shapes.add_textbox(left, top, width, height)
-        text_box.text_frame.text = "See Excel for chart"
+        print(f"      ❌ Chart insertion failed for {sheet_name}: {e}")
+        # Add placeholder text on error
+        try:
+            text_box = slide.shapes.add_textbox(left, top, width, height)
+            text_frame = text_box.text_frame
+            text_frame.text = f"Chart: {sheet_name}\n(See Excel workbook)"
+        except:
+            pass
+        return False
 
 def build_active_customer_targets(status, raw_df, min_ytd, active_weeks=6):
     """
@@ -2970,9 +3562,24 @@ def build_active_customer_targets(status, raw_df, min_ytd, active_weeks=6):
 
 def _add_logo_to_slide(slide):
     """Add Sysco logo to top right of slide."""
-    logo_path = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Analysis\Sysco_Logo_FullColor.png"
+    # Get the slide title for debugging
+    try:
+        slide_title = slide.shapes.title.text if hasattr(slide.shapes, 'title') else "No title"
+    except:
+        slide_title = "Unknown"
+    
+    print(f"    🎨 _add_logo_to_slide called for: '{slide_title}'")
+    
+    logo_path = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Category Script\Sysco_Logo_FullColor.png"
+    
     if os.path.exists(logo_path):
-        slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.3), height=Inches(0.6))
+        try:
+            slide.shapes.add_picture(logo_path, Inches(8.5), Inches(0.3), height=Inches(0.6))
+            print(f"    ✓ Logo added successfully to '{slide_title}'")
+        except Exception as e:
+            print(f"    ❌ ERROR adding logo to '{slide_title}': {e}")
+    else:
+        print(f"    ⚠️ Logo file not found at: {logo_path}")
 
 def _create_account_metrics_slide(prs, status_df, slide_title):
     """Metrics-focused slide: tables stacked vertically for better readability."""
@@ -3072,7 +3679,7 @@ def _create_executive_insights_slide(prs, status_df, current_week, min_week, max
     title_box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(8), Inches(0.6))
     title_frame = title_box.text_frame
     title_frame.text = "Executive Summary: Key Insights & Actions"
-    title_frame.paragraphs[0].font.size = Pt(32)
+    title_frame.paragraphs[0].font.size = Pt(28)
     title_frame.paragraphs[0].font.bold = True
     title_frame.paragraphs[0].font.name = "Myriad Pro"
     
@@ -3117,9 +3724,16 @@ def _create_executive_insights_slide(prs, status_df, current_week, min_week, max
     p.font.color.rgb = RGBColor(89, 89, 89)
     p.space_after = Pt(16)
     
-    # Customer Retention
-    total_cust_cy = status_df["Distinct_Customers_CY"].sum()
-    total_cust_py = status_df["Distinct_Customers_PY"].sum()
+    # Customer Retention (count unique customers)
+    if "Company Customer Number" in status_df.columns:
+        customer_cy_totals = status_df.groupby("Company Customer Number")["Pounds_CY"].sum()
+        total_cust_cy = (customer_cy_totals > 0).sum()
+        
+        customer_py_totals = status_df.groupby("Company Customer Number")["Pounds_PY"].sum()
+        total_cust_py = (customer_py_totals > 0).sum()
+    else:
+        total_cust_cy = 0
+        total_cust_py = 0
     retention_pct = (total_cust_cy / total_cust_py * 100) if total_cust_py > 0 else 0
     
     p = left_frame.add_paragraph()
@@ -3169,15 +3783,27 @@ def _create_executive_insights_slide(prs, status_df, current_week, min_week, max
     p.font.size = Pt(11)
     p.space_after = Pt(8)
     
-    # Insight 3: Top priority
+    # Insight 3: Top priority - with full context
     p = right_frame.add_paragraph()
     p.text = "3. Top Priority Customer"
     p.font.size = Pt(12)
     p.font.bold = True
-    
+
+    # Get customer context
+    cust_name = top_loss.get('Customer Name', 'Unknown')
+    company_name = top_loss.get('Company Name', 'Unknown Site')
+    dsm = top_loss.get('Customer DSM', top_loss.get('Customer Territory', 'Unknown DSM'))
+    loss_amount = abs(top_loss['Delta_YoY_Lbs'])
+
     p = right_frame.add_paragraph()
-    p.text = f"   '{top_loss.get('Company Customer Name', 'N/A')}' down {abs(top_loss['Delta_YoY_Lbs']):,.0f} lbs"
+    p.text = f"   '{cust_name}' at {company_name}"
     p.font.size = Pt(11)
+    p.font.bold = True
+    p.space_after = Pt(2)
+
+    p = right_frame.add_paragraph()
+    p.text = f"   Down {loss_amount:,.0f} lbs | DSM: {dsm}"
+    p.font.size = Pt(10)
     
     # === ACTION PLAN BOX ===
     action_box = slide.shapes.add_textbox(Inches(0.5), Inches(4.0), Inches(8.5), Inches(3.0))
@@ -3196,7 +3822,7 @@ def _create_executive_insights_slide(prs, status_df, current_week, min_week, max
     p.space_after = Pt(12)
     
     actions = [
-        f"1. Win back '{top_loss.get('Company Customer Name', 'Top Customer')}' – Immediate call to DSM to address {abs(top_loss['Delta_YoY_Lbs']):,.0f} lb decline",
+        f"1. Win back '{cust_name}' at {company_name} – Call {dsm} TODAY to address {loss_amount:,.0f} lb decline",
         f"2. Convert {total_cust_cy:,.0f} accounts to aligned products – Sales leads distributed to DSMs",
         f"3. Execute on {len(leads_df) if leads_df is not None else 0:,} qualified sales leads targeting TRS/LCC accounts",
         "4. Monitor weekly trending charts for early warning signs of further decline"
@@ -3356,11 +3982,10 @@ def create_presentation_report(
         _create_executive_insights_slide(prs, status, current_week, min_week, max_week, fiscal_year, leads_df=leads)
 
         # === SLIDES 3-4: All Account Types ===
-        print("    Creating Slides 3-4: All Account Types...")
         _create_account_metrics_slide(prs, status, "All Account Types")
         if all_weekly is not None and not all_weekly.empty:
             _create_account_chart_slide(prs, all_weekly, "All Account Types", excel_path, "05_All_Weekly_Chart") 
-
+       
         # === SLIDES 5-6: TRS ===
         print("    Creating Slides 5-6: TRS Accounts...")
         trs_status = status[status["Customer Account Type Code"] == "TRS"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
@@ -3368,19 +3993,21 @@ def create_presentation_report(
         if trs_weekly is not None and not trs_weekly.empty:
             _create_account_chart_slide(prs, trs_weekly, "TRS Accounts", excel_path, "07_TRS_Weekly_Chart")  
 
-        # === SLIDES 7: CMU ===
+        # === SLIDES 7-8: CMU ===
         if cmu_weekly is not None and not cmu_weekly.empty:
             print("    Creating Slides 7-8: CMU Accounts...")
             cmu_status = status[status["Customer Account Type Code"] == "CMU"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
             _create_account_metrics_slide(prs, cmu_status, "CMU Accounts")
+            _create_account_chart_slide(prs, cmu_weekly, "CMU Accounts", excel_path, "08_CMU_Weekly_Chart")
 
-        # === SLIDES 8: LCC ===
+        # === SLIDES 9-10: LCC ===
         if lcc_weekly is not None and not lcc_weekly.empty:
             print("    Creating Slides 9-10: LCC Accounts...")
             lcc_status = status[status["Customer Account Type Code"] == "LCC"].copy() if "Customer Account Type Code" in status.columns else pd.DataFrame()
             _create_account_metrics_slide(prs, lcc_status, "LCC Accounts")
-        
-       # === SLIDE 9: Items Ranking ===
+            _create_account_chart_slide(prs, lcc_weekly, "LCC Accounts", excel_path, "09_LCC_Weekly_Chart")
+
+       # === SLIDE 11: Items Ranking ===
         print("    Creating Slide 11: Items Ranking...")
         items_df = _items_rank(status).head(20)  # Top 20 items
         slide = prs.slides.add_slide(prs.slide_layouts[5])
@@ -3401,12 +4028,18 @@ def create_presentation_report(
                     number_cols={"Delta_YoY_Lbs"},
                     percent_cols={"YoY_Pct"}
                 )
-        # === SLIDE 10: DSM Opportunities by Site ===
+        # ADD THESE DEBUG LINES:
+        print(f"    DEBUG: Items slide - layout index: 5")
+        print(f"    DEBUG: Items slide - shapes before logo: {len(slide.shapes)}")
+        _add_logo_to_slide(slide)
+        print(f"    DEBUG: Items slide - shapes after logo: {len(slide.shapes)}")
+
+        # === SLIDE 12: DSM Opportunities by Site ===
         if dsm_summary is not None and not dsm_summary.empty:
             print("    Creating DSM Opportunity slide...")
             _create_dsm_opportunity_slide(prs, dsm_summary, territory_detail, winback_targets, conversion_targets)
             
-        # === SLIDE 11: TRS Win-Back Targets ===
+        # === SLIDE 13: TRS Win-Back Targets ===
         print("    Creating Slide 13: TRS Win-Back Targets...")
         targets = build_active_customer_targets(status, raw_df, min_ytd, active_weeks)
         slide = prs.slides.add_slide(prs.slide_layouts[5])
@@ -3439,8 +4072,13 @@ def create_presentation_report(
             text_frame.text = "No active TRS customers with declining performance found."
             text_frame.paragraphs[0].font.size = Pt(18)
             text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+        # ADD THESE DEBUG LINES:
+        print(f"    DEBUG: Win-Back slide - layout index: 5")
+        print(f"    DEBUG: Win-Back slide - shapes before logo: {len(slide.shapes)}")
+        _add_logo_to_slide(slide)
+        print(f"    DEBUG: Win-Back slide - shapes after logo: {len(slide.shapes)}")
 
-        # Creating Slide 12: NPD Cuisine Type Analysis (TRS)
+        # Creating Slide 14: NPD Cuisine Type Analysis (TRS)
         print("    Creating Slide 12: NPD Cuisine Type Analysis...")
 
         # Use raw_df which has NPD Cuisine Type column
@@ -3522,6 +4160,11 @@ def main():
     ap.add_argument("--watch-dir")
     ap.add_argument("--quiet-seconds", type=int, default=8)
 
+    # Territory Route controls
+    ap.add_argument("--create-territory-routes", choices=["Y","N"], help="Generate territory route plans")
+    ap.add_argument("--territory-routes-top-n-dsms", type=int, help="Number of top DSMs to create routes for")
+    ap.add_argument("--territory-route-days", type=int, help="Days to plan routes for (1-5)")
+
     args = ap.parse_args()
     
     # 1. Load category config FIRST
@@ -3554,10 +4197,22 @@ def main():
     vendor_leads_on = (args.vendor_leads_active or DEFAULTS.get("vendor_leads_active","Y")).strip().upper() == "Y"
     min_ytd_per_week = args.min_ytd_per_week or int(DEFAULTS.get("min_ytd_per_week", 20))
     vendor_leads_respect_site = (args.vendor_leads_respect_site_filter or DEFAULTS.get("vendor_leads_respect_site_filter","N")).upper() == "Y"
-    
+
     active_weeks = args.active_customer_weeks or DEFAULTS.get("active_customer_weeks", 6)
     create_ppt = (args.create_powerpoint or DEFAULTS.get("create_powerpoint", "Y")).strip().upper() == "Y"
     ppt_top_n = args.ppt_top_n_targets or DEFAULTS.get("ppt_top_n_targets", 15)
+
+    # Territory Routes (ADD THESE 3 LINES)
+    create_routes = (args.create_territory_routes or DEFAULTS.get("create_territory_routes", "Y")).strip().upper() == "Y" if args.create_territory_routes else DEFAULTS.get("create_territory_routes", "Y").strip().upper() == "Y"
+    top_n_dsms = args.territory_routes_top_n_dsms if args.territory_routes_top_n_dsms else DEFAULTS.get("territory_routes_top_n_dsms", 10)
+    DEFAULTS["create_territory_routes"] = "Y" if create_routes else "N"
+    DEFAULTS["territory_routes_top_n_dsms"] = top_n_dsms
+
+    # ADD THESE:
+    if args.create_territory_routes:
+        DEFAULTS["create_territory_routes"] = args.create_territory_routes
+    if args.territory_routes_top_n_dsms:
+        DEFAULTS["territory_routes_top_n_dsms"] = args.territory_routes_top_n_dsms
 
     # 3. NOW check watch mode (variables exist now)
     if args.watch:
@@ -3758,6 +4413,17 @@ def main():
     )
     leads_csv = os.path.join(outdir_path, f"Sales_Leads{site_suffix}.csv")
 
+    # ========== BUILD DSM SCORECARD ==========
+    print("\n📊 Building DSM Opportunity Scorecard...")
+    dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
+        status, raw, source_path, 
+        active_weeks=active_weeks,
+        min_ytd=min_ytd
+    )
+    
+    if not dsm_summary.empty:
+        print(f"  ✓ Identified {len(dsm_summary)} DSMs with opportunities")
+
     # ========== WRITE EXCEL (Manager Tool) ==========
     print(f"\n📁 Writing Excel workbook: {os.path.basename(excel_path)}")
     write_excel(
@@ -3774,24 +4440,68 @@ def main():
         alignment_df=alignment_df,
         filtered_company_name=filtered_company_name,
         min_ytd=min_ytd,
-        source_path=source_path
+        source_path=source_path,
+        dsm_summary=dsm_summary,
+        territory_detail=territory_detail,
+        winback_targets=winback_targets,
+        conversion_targets=conversion_targets
     )
 
-    # ADDED: Wait for Excel to release file lock
-    print("  ⏳ Waiting for Excel to close...")
-    time.sleep(3)
+    print("  ⏳ Waiting for Excel to fully release...")
+    time.sleep(8)
+    
+    # Export chart images for PowerPoint
+    export_all_chart_images(excel_path)
 
     leads.to_csv(leads_csv, index=False)
     print(f"  ✓ Sales Leads CSV: {os.path.basename(leads_csv)}")
     print(f"  ✓ Vendor lead files: {len(vendor_files)}")
 
-    # ========== WRITE POWERPOINT (Stakeholder Presentation) ==========
-    pptx_path = None
-    # Build DSM data (needed for both Excel and PowerPoint)
-    dsm_summary, territory_detail, winback_targets, conversion_targets = build_dsm_opportunity_scorecard(
-        status, raw, source_path, active_weeks=active_weeks, min_ytd=min_ytd
-    )
+    # ========== TERRITORY ROUTE PLANNING ==========
+    territory_routes_workbook = None
+    route_plans = {}
+    create_routes = (DEFAULTS.get("create_territory_routes", "Y").strip().upper() == "Y")
 
+    if create_routes and not dsm_summary.empty:
+        print(f"\n🗺️ Generating Territory Route Plans...")
+        
+        top_n_dsms = DEFAULTS.get("territory_routes_top_n_dsms", 10)
+        print(f"  Processing top {top_n_dsms} DSMs from opportunity scorecard...")
+        
+        route_plans = generate_territory_routes(
+            dsm_summary=dsm_summary,
+            winback_targets=winback_targets,
+            conversion_targets=conversion_targets,
+            top_n_dsms=top_n_dsms
+        )
+        
+        if route_plans:
+            territory_routes_workbook = create_territory_routes_workbook(
+                route_plans_dict=route_plans,
+                outdir=outdir_path,
+                fiscal_year=fy_guess,
+                current_week=current_week
+            )
+            
+            route_dir = os.path.join(outdir_path, "Territory_Routes")
+            os.makedirs(route_dir, exist_ok=True)
+            
+            csv_count = 0
+            for route_key, route_df in route_plans.items():
+                csv_path = os.path.join(route_dir, f"{route_key}.csv")
+                route_df.to_csv(csv_path, index=False)
+                csv_count += 1
+            
+            print(f"  ✅ Created territory routes:")
+            print(f"     • Excel workbook: {os.path.basename(territory_routes_workbook)}")
+            print(f"     • CSV files: {csv_count} in Territory_Routes/ folder")
+        else:
+            print("  ℹ No territory routes generated (check Customer Territory column)")
+    elif create_routes:
+        print("\n  ℹ Skipping territory routes: No DSM opportunities found")
+
+    # ========== POWERPOINT ==========
+    pptx_path = None
     if create_ppt:
         print(f"\n📊 Creating PowerPoint presentation...")
         pptx_path = create_presentation_report(
@@ -3813,8 +4523,6 @@ def main():
             conversion_targets=conversion_targets
         )
         print(f"  ✓ PowerPoint: {os.path.basename(pptx_path)}")
-        
-        # ADDED: Wait for PowerPoint to close and files to release
         print("  ⏳ Waiting for file locks to release...")
         time.sleep(2)
 
@@ -3822,6 +4530,8 @@ def main():
     attachments = [excel_path, leads_csv]
     if pptx_path:
         attachments.insert(1, pptx_path)
+    if territory_routes_workbook:
+        attachments.append(territory_routes_workbook)
 
     body = (
         f"Category Analysis Report - {Path(source_path).name}\n"
@@ -3829,11 +4539,13 @@ def main():
         f"FY{fy_guess} Week {current_week}\n\n"
         f"Site filter: {company_filt or 'ALL SITES'}\n"
         f"Sales Leads: {len(leads):,} records ({leads_acct} accounts)\n"
-        f"Vendor splits: {len(vendor_files)} files\n\n"
-        f"Attachments:\n"
+        f"Vendor splits: {len(vendor_files)} files\n"
+        + (f"Territory routes: {len(route_plans)} routes created\n" if territory_routes_workbook else "")
+        + "\nAttachments:\n"
         f"  - Excel workbook (manager operational tool)\n"
         + (f"  - PowerPoint presentation (stakeholder summary)\n" if pptx_path else "")
         + f"  - Sales Leads CSV\n"
+        + (f"  - Territory Routes Workbook (weekly schedules for field reps)\n" if territory_routes_workbook else "")
     )
 
     send_email_with_attachments(MAIL_SUBJECT, body, attachments)
@@ -3847,6 +4559,9 @@ def main():
         print(f"PowerPoint:          {pptx_path}")
     print(f"Sales Leads CSV:     {leads_csv}")
     print(f"Vendor lead files:   {len(vendor_files)} in Vendor_Leads/")
+    if territory_routes_workbook:
+        print(f"Territory Routes:    {territory_routes_workbook}")
+        print(f"                     {len(route_plans)} routes in Territory_Routes/")
     print(f"Status records:      {len(status):,}")
     print(f"Sales Leads:         {len(leads):,}")
     print("="*60 + "\n")
