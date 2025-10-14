@@ -1,3 +1,4 @@
+#PZone.py
 #!/usr/bin/env python3
 """
 Foodservice Zone Optimization Engine v9
@@ -41,16 +42,26 @@ class DataConfiguration:
     company_number_column: str = 'Company Number'
     company_region_id_column: str = 'Company Region ID'
     
-    # MARGIN COLUMNS (ADD THESE!)
-    margin_cy_column: str = 'Computer Margin $ Per LB CY'
-    margin_py_column: str = 'Computer Margin $ Per LB PY'
-    has_margin_data: bool = True  
+    # LAYER 1: Extended Totals (for volume calculations)
+    margin_cy_column: str = 'Computer Margin Ext $ CY'
+    margin_py_column: str = 'Computer Margin Ext $ PY'
+    net_sales_cy_column: str = 'Net Sales Ext $ CY'
+    net_sales_py_column: str = 'Net Sales Ext $ PY'
+    has_margin_data: bool = True
+    has_net_sales_data: bool = True
     
-    # NET SALES COLUMNS (ADD THESE!)
-    net_sales_cy_column: str = 'Net Sales Ext $ Per LB CY'
-    net_sales_py_column: str = 'Net Sales Ext $ Per LB PY'
-    has_net_sales_data: bool = True  
+    # LAYER 2: Per-Pound Rates (for pricing sensitivity)
+    margin_per_lb_cy_column: str = 'Computer Margin $ Per LB CY'
+    margin_per_lb_py_column: str = 'Computer Margin $ Per LB PY'
+    net_sales_per_lb_cy_column: str = 'Net Sales Ext $ Per LB CY'
+    net_sales_per_lb_py_column: str = 'Net Sales Ext $ Per LB PY'
+    has_per_lb_rates: bool = True
     
+    # LAYER 3: Margin Percentage (for profitability analysis)
+    margin_pct_cy_column: str = 'Computer Margin Ext $ % Net Sales CY'
+    margin_pct_py_column: str = 'Computer Margin Ext $ % Net Sales PY'
+    has_margin_pct: bool = True
+
     # Optional grouping columns (existing - keep as is)
     use_attribute_group: bool = True
     attribute_group_column: str = 'Attribute Group ID'
@@ -179,6 +190,24 @@ class FoodserviceConfig:
     FILTER_BY_company_number: Optional[str] = None  # Set to specific Company Number or None for all
     FILTER_BY_company_region_id: Optional[str] = None   # Set to specific Company Region ID or None for all
     
+    # ==========================================
+    # LEADS GENERATION CONFIGURATION
+    # ==========================================
+    GENERATE_LEADS_FILE: bool = True  # Toggle to enable/disable
+    LEADS_OUTPUT_PATH: str = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\leads_guide.csv"
+    
+    # Revenue filtering
+    LEADS_MIN_REVENUE_THRESHOLD: float = 10000  # Only customers with $10K+ annual revenue
+    
+    # Number of leads to generate
+    LEADS_TOP_N_ALL_COMPANIES: int = 100  # When NO company filter: top 100 across all companies
+    LEADS_N_FOR_FILTERED_COMPANY: int = 50  # When Company_Number filter IS active: how many for that company
+    
+    # ✅ ADD THESE 3 LINES HERE:
+    has_per_lb_rates: bool = True
+    has_margin_pct: bool = True
+    has_margin_data: bool = True
+
     def __init__(self, 
                  data_config: Optional[DataConfiguration] = None,
                  input_config: Optional[InputConfiguration] = None,
@@ -1990,6 +2019,21 @@ class FoodserviceZoneEngine:
             zone_mode = combo_data['Zone_Suffix_Numeric'].mode()
             current_zone = zone_mode.iloc[0] if len(zone_mode) > 0 else 5
             print(f"   Current Zone: {int(current_zone)}")
+
+            # ✅ ADD THIS: Look up consistency metrics for current zone
+            consistent_buyers_count = 0
+            green_flag_rate = 0.0
+
+            if self.consistency_analysis is not None and not self.consistency_analysis.empty:
+                consistency_row = self.consistency_analysis[
+                    (self.consistency_analysis['Company_Combo_Key'] == combo) & 
+                    (self.consistency_analysis['Zone'] == current_zone)
+                ]
+                
+                if not consistency_row.empty:
+                    consistent_buyers_count = int(consistency_row.iloc[0]['consistent_buyers'])
+                    green_flag_rate = float(consistency_row.iloc[0]['green_flag_rate'])
+                    print(f"   Consistency: {consistent_buyers_count} consistent buyers ({green_flag_rate:.1%} green flag rate)")
             
             # Get optimal zone from scoring
             optimal_zone = current_zone  # Default
@@ -2026,6 +2070,39 @@ class FoodserviceZoneEngine:
             print(f"   Customers: {total_customers} total, {active_customers} active, {lapsed_customers} lapsed ({lapsed_pct:.1%})")
             print(f"   Volume: {total_volume:,.0f} lbs")
             
+            customers_growing = 0
+            customers_declining = 0
+            customers_active = 0
+
+            for customer_id in combo_data[self.config.data_config.customer_id_column].unique():
+                cust_data = combo_data[combo_data[self.config.data_config.customer_id_column] == customer_id]
+                pounds_cy = cust_data['Pounds_CY'].sum()
+                pounds_py = cust_data['Pounds_PY'].sum()
+                
+                if pounds_cy > 0:  # Active this year
+                    customers_active += 1
+                    if pounds_cy > pounds_py:
+                        customers_growing += 1
+                    elif pounds_cy < pounds_py:
+                        customers_declining += 1
+
+            if customers_active > 0:
+                growth_rate = customers_growing / customers_active
+                decline_rate = customers_declining / customers_active
+                
+                print(f"   📊 Growth Analysis: {customers_growing} growing, {customers_declining} declining out of {customers_active} active")
+                print(f"   📈 Growth Rate: {growth_rate:.1%} | Decline Rate: {decline_rate:.1%}")
+                
+                # If >50% of active customers are GROWING, DON'T TOUCH THE ZONE!
+                if growth_rate > 0.50:
+                    print(f"   🎉 KEEPING ZONE: {growth_rate:.1%} of customers GROWING at Zone {int(current_zone)} - DON'T GIVE AWAY MARGIN!")
+                    continue  # Skip to next combo - no recommendation
+                
+                # If <30% lapsed AND majority are growing/stable, KEEP THE ZONE
+                if lapsed_pct < 0.30 and growth_rate >= decline_rate:
+                    print(f"   ✅ KEEPING ZONE: Low lapse rate ({lapsed_pct:.1%}) + stable/growing customers")
+                    continue  # Skip to next combo
+
             # Get journey evidence
             green_flag_count = 0
             reactive_recovery_count = 0
@@ -2067,6 +2144,8 @@ class FoodserviceZoneEngine:
                 'green_flag_customers': int(green_flag_count),
                 'reactive_recovery_customers': int(reactive_recovery_count),
                 'margin_giveaway_count': int(margin_giveaway_count),
+                'consistent_buyers': consistent_buyers_count, 
+                'green_flag_rate': green_flag_rate,  
                 'implementation_priority': 0
             }
             
@@ -2158,61 +2237,222 @@ class FoodserviceZoneEngine:
     
     def _get_consensus_zone(self, combo: str, current_zone: int, 
                             historical_df: pd.DataFrame) -> int:
-            """
-            Find consensus zone from historical data.
-            Now HEAVILY weighted toward zones with HIGH CONSISTENCY (GREEN FLAG!)
-            """
-            
-            # Extract parts
-            parts = combo.split('_')
-            if len(parts) < 3:
-                return current_zone
-            
-            hist = historical_df.copy()
-            hist = classify_customer_activity(hist, self.config)
-            
-            # Calculate consistency for historical data
-            hist_consistency = calculate_purchase_consistency(hist, self.config)
-            
-            # Get all zones for this combo pattern
-            zone_perf = hist.groupby(self.config.data_config.zone_column).agg({
-                'Pounds_CY': 'sum',
-                'Customer_Status': lambda x: (x == 'ACTIVE_BUYER').mean()
-            }).reset_index()
-            
-            zone_perf.columns = ['Zone', 'Total_Volume', 'Active_Rate']
-            
-            # Merge with consistency data
-            zone_perf = zone_perf.merge(
-                hist_consistency[['Zone', 'green_flag_rate', 'avg_consistency_rate']],
-                on='Zone',
-                how='left'
-            ).fillna(0)
-            
-            # NEW SCORING: Heavy weight on consistency (THE GREEN FLAG!)
-            zone_perf['Score'] = (
-                zone_perf['Total_Volume'] * 0.3 +           # Volume still matters (30%)
-                zone_perf['Active_Rate'] * 1000 * 0.3 +     # Active rate (30%)
-                zone_perf['green_flag_rate'] * 2000 * 0.4   # 🟢 GREEN FLAG! (40%)
-            )
-            
-            if zone_perf.empty:
-                return current_zone
-            
-            best_zone = int(zone_perf.loc[zone_perf['Score'].idxmax(), 'Zone'])
-            
-            # Never recommend going UP
-            if best_zone > current_zone:
-                return current_zone
-            
-            return best_zone
+        """Find consensus zone from historical data for THIS SPECIFIC COMBO."""
+        
+        # ✅ FIX 1: Filter to THIS combo only!
+        hist = historical_df[historical_df['Company_Combo_Key'] == combo].copy()
+        
+        if hist.empty:
+            return current_zone
+        
+        hist = classify_customer_activity(hist, self.config)
+        hist_consistency = calculate_purchase_consistency(hist, self.config)
+        
+        # ✅ FIX 2: Include customer count and lapse rate
+        zone_perf = hist.groupby(self.config.data_config.zone_column).agg({
+            'Pounds_CY': 'sum',
+            'Customer_Status': [
+                lambda x: (x == 'ACTIVE_BUYER').mean(),
+                lambda x: (x == 'LAPSED_FROM_CATEGORY').mean()
+            ],
+            self.config.data_config.customer_id_column: 'nunique'
+        }).reset_index()
+        
+        zone_perf.columns = ['Zone', 'Total_Volume', 'Active_Rate', 'Lapse_Rate', 'Customer_Count']
+        
+        # ✅ FIX 3: Require minimum sample size
+        zone_perf = zone_perf[zone_perf['Customer_Count'] >= 3]
+        
+        if zone_perf.empty:
+            return current_zone
+        
+        # Merge consistency
+        zone_perf = zone_perf.merge(
+            hist_consistency[['Zone', 'green_flag_rate']],
+            on='Zone',
+            how='left'
+        ).fillna(0)
+        
+        # Normalize each metric to 0-1 scale
+        zone_perf['Volume_Norm'] = zone_perf['Total_Volume'] / zone_perf['Total_Volume'].max()
+        zone_perf['Active_Norm'] = zone_perf['Active_Rate']  # Already 0-1
+        zone_perf['GreenFlag_Norm'] = zone_perf['green_flag_rate']  # Already 0-1
+        zone_perf['Retention_Norm'] = 1 - zone_perf['Lapse_Rate']  # Already 0-1
 
+        # 🚨 EMERGENCY MODE: Volume is KING!
+        # 🚨 VOLUME IS KING (60%), quality metrics equal (40% split 3 ways)
+        zone_perf['Score'] = (
+            zone_perf['Volume_Norm'] * 0.60 +          # VOLUME: 60%
+            zone_perf['Active_Norm'] * (0.40/3) +      # Active: 13.33%
+            zone_perf['GreenFlag_Norm'] * (0.40/3) +   # Green Flag: 13.33%
+            zone_perf['Retention_Norm'] * (0.40/3)     # Retention: 13.33%
+        )
+        
+        best_zone = int(zone_perf.loc[zone_perf['Score'].idxmax(), 'Zone'])
+        
+        # Never recommend going UP
+        if best_zone > current_zone:
+            return current_zone
+        
+        return best_zone
 # ============================================================================
 # DASHBOARD GENERATORS
 # ============================================================================
-def create_executive_summary(recommendations: List[Dict], 
-                            yoy_metrics: Optional[Dict] = None,
-                            config: Optional[FoodserviceConfig] = None) -> Dict:
+
+def create_dashboard_guide() -> pd.DataFrame:
+    """
+    Create a user guide explaining how to read this dashboard.
+    
+    8th Grade Explanation:
+    "This is your instruction manual. It explains what each tab means and 
+    how to use this report to make pricing decisions."
+    """
+    
+    guide_content = [
+        {'Section': 'ABOUT THIS REPORT', 'Content': ''},
+        {'Section': 'Purpose', 'Content': 'This dashboard analyzes historical sales data to find pricing zones that will grow volume, win back customers, and increase margin. Every recommendation is backed by your actual sales data.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'HOW TO USE THIS REPORT', 'Content': ''},
+        {'Section': 'Step 1', 'Content': 'Start with Tab 1 (EXECUTIVE_SUMMARY) to see the big picture'},
+        {'Section': 'Step 2', 'Content': 'Review Tab 2 (TOP_5_MOVES) - these are your quick wins to implement first'},
+        {'Section': 'Step 3', 'Content': 'Check Tab 10 (FINANCIAL_IMPACT) to see the dollar value of each move'},
+        {'Section': 'Step 4', 'Content': 'Use Tab 5 (TIMELINE) to plan your implementation schedule'},
+        {'Section': 'Step 5', 'Content': 'Track progress using Tab 8 (YOY_CUSTOMERS) in your next run'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'TAB-BY-TAB GUIDE', 'Content': ''},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 1: EXECUTIVE_SUMMARY', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'High-level metrics: how many opportunities found, volume at stake, financial impact, year-over-year trends'},
+        {'Section': 'Key metrics explained', 'Content': '"Distinct Customers This Year" = How many different restaurants bought this category in the last 8 weeks this year (each customer counted once, even if they have 100 transactions)'},
+        {'Section': '', 'Content': '"Retention Rate" = What % of last year\'s customers are still buying (80%+ is healthy, <70% means we\'re losing customers)'},
+        {'Section': '', 'Content': '"Lapsed Customers" = Restaurants that stopped buying THIS category but are still buying OTHER items from us (HIGH recovery opportunity!)'},
+        {'Section': 'Action', 'Content': 'Share this page in executive meetings to show the scale of opportunity'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 2: TOP_5_MOVES', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'The 5 highest-priority zone changes ranked by impact and ease of implementation'},
+        {'Section': 'Key columns explained', 'Content': '"Move_To_Zone" = The zone we recommend changing TO (always equals or lower than current - we never suggest price increases without approval)'},
+        {'Section': '', 'Content': '"YoY_Customer_Change" = How many customers we gained/lost in the last 8 weeks vs same period last year (negative = losing customers)'},
+        {'Section': '', 'Content': '"Problem" = Why this needs fixing in plain English'},
+        {'Section': '', 'Content': '"Expected_Result" = What we predict will happen (conservative estimate based on historical patterns)'},
+        {'Section': '', 'Content': '"Timeline" = How fast you\'ll see results (⚡ 2-4 weeks = quick wins, 📅 4-6 weeks = standard)'},
+        {'Section': 'Action', 'Content': 'Implement these 5 moves first. They have the best chance of quick wins.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 3: RECOVERY_OPPORTUNITIES', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Every combo where customers stopped buying this category but are still active with the company'},
+        {'Section': 'Key metrics', 'Content': '"Lapsed_Customers" = Count of restaurants that stopped buying but are still ordering other items (GOLD MINE for recovery!)'},
+        {'Section': '', 'Content': '"Lapsed_Rate" = % of total customers who lapsed (30%+ is a red flag that pricing is too high)'},
+        {'Section': '', 'Content': '"Expected_Recovery" = How many we predict will come back if we fix pricing (60% success rate assumption)'},
+        {'Section': 'Action', 'Content': 'Sales team can call these customers with the new pricing. They already have a relationship!'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 4: REACTIVE_ALERTS', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Times when we overpriced, lost customers, then panic-dropped the zone. The lower zone looks good but only because we killed business at the higher zone first.'},
+        {'Section': 'Why this matters', 'Content': 'If Detroit Bar & Grill is at Zone 2 and looks great, but we dropped from Zone 4 after losing customers, the REAL optimal is probably Zone 3 (not 2 or 4)'},
+        {'Section': 'Key columns', 'Content': '"High_Zone_Used" = The zone where we lost customers. "Panic_Drop_To" = Where we moved it. "Likely_True_Optimal" = Where it should probably be.'},
+        {'Section': 'Action', 'Content': 'Be skeptical of these zones. Test the middle ground between high/low.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 5: TIMELINE', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Week-by-week implementation plan'},
+        {'Section': 'How to use', 'Content': 'Week 1-2: Make the changes. Week 3-4: Monitor early results. Week 5-8: Measure full impact. Week 8+: Run this analysis again to see what worked.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 6: LEARNING_TRACKER', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Tracks recommendations over time so the system learns what works'},
+        {'Section': 'Note', 'Content': 'This will be empty on first run. After you implement recommendations and re-run the analysis, this tab shows which predictions were accurate.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 7: ALL_RECOMMENDATIONS', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Complete list of all recommended zone changes, sorted by priority'},
+        {'Section': 'How to use', 'Content': 'After implementing Top 5, come here to see what to do next. Lower priority moves = smaller impact but still worth doing over time.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 8: YOY_CUSTOMERS', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Year-over-year customer counts by combo (NOT by zone). Shows which categories are growing or shrinking overall.'},
+        {'Section': 'Important note', 'Content': 'This compares the LAST 8 WEEKS this year vs SAME 8 WEEKS last year. It\'s not the full year. Use this to spot trends.'},
+        {'Section': 'Key columns', 'Content': '"Retained_Customers" = Bought in both years (good!). "New_Customers" = Bought this year but not last year (growth!). "Lost_Customers" = Bought last year but not this year (problem!).'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 9: VOLUME_DECLINES', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Biggest volume losses by combo AND zone. Shows exactly where pounds are bleeding.'},
+        {'Section': 'Difference from Tab 8', 'Content': 'Tab 8 shows customers by COMBO only. Tab 9 shows volume by COMBO + ZONE. This is more tactical - tells you which specific zone is the problem.'},
+        {'Section': 'Key insight', 'Content': 'If Detroit Bar & Grill_Z4 lost 33,000 lbs but Detroit Bar & Grill_Z2 gained 5,000 lbs, the problem is Zone 4 specifically (not the category overall).'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 10: FINANCIAL_IMPACT', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Dollar value of each recommendation using your actual Net Sales per LB and Margin per LB data'},
+        {'Section': 'Three scenarios', 'Content': 'LOW = Conservative (if only 60% of predictions work). EXPECTED = Most likely outcome. HIGH = Optimistic (if 80%+ of predictions work).'},
+        {'Section': 'Important', 'Content': '8-Week Impact = First cycle results. Annual Impact = Ongoing value if we keep the zone there (multiplied across 52 weeks).'},
+        {'Section': 'Confidence levels', 'Content': 'HIGH = Lapsed customer recovery (proven pattern). MEDIUM = Reactive corrections or green flag zones. LOW = Standard adjustments.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Tab 11: ZONE_STICKINESS', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Which zones keep customers coming back week after week (the "green flag" metric)'},
+        {'Section': 'Green Flag Rate', 'Content': '% of customers who buy consistently (75%+ of weeks). High rate = sticky zone that works. Low rate = customers try once and leave.'},
+        {'Section': 'How to use', 'Content': 'If Zone 2 has 60% green flag rate and Zone 4 has 20%, that\'s proof Zone 2 works better at keeping customers engaged.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'KEY DEFINITIONS', 'Content': ''},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Distinct Customers', 'Content': 'Each customer counted ONCE, even if they have 100 transactions. This is the count of unique restaurants, not transaction count.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Lapsed Customer', 'Content': 'A restaurant that STOPPED buying this specific category (e.g. groundfish) BUT is still buying other items from us. HIGH recovery opportunity because relationship still exists!'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Lost Customer', 'Content': 'A restaurant that hasn\'t bought ANYTHING from us in 9+ weeks. Lower recovery potential - relationship may be gone.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Reactive Pricing', 'Content': 'When we overprice, lose customers, then panic and drop the zone. The lower zone looks good in data, but only because we killed business at the higher zone first. Be skeptical of these patterns.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Green Flag / Zone Stickiness', 'Content': 'Customers who buy week after week at a specific zone. High stickiness = zone works well. Low stickiness = customers try once and leave (sign of overpricing).'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Pounds CY vs PY', 'Content': 'CY = Current Year (the fiscal year you\'re analyzing). PY = Previous Year (same time period last year for comparison). Each row has BOTH years on it for easy comparison.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'COMMON QUESTIONS', 'Content': ''},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Q: Why 8 weeks for YoY?', 'Content': 'A: 8 weeks = 2 months, enough to smooth out weekly volatility but recent enough to spot trends. You can change this in the config (YOY_LOOKBACK_WEEKS).'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Q: Why never suggest Zone 1→0?', 'Content': 'A: Zone 0 gives away margin. If Zone 1 is too high and Zone 0 is optimal, we FLAG it for management approval (needs fractional zones like 0.5 or 0.75).'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Q: How often should we run this?', 'Content': 'A: First run: Implement top 20-30 moves. Week 4-6: Check early results. Week 8-12: Full results. Next run: Re-analyze with new data, implement next batch. Repeat quarterly.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Q: What if recommendations don\'t work?', 'Content': 'A: The system learns! Tab 6 (LEARNING_TRACKER) tracks predictions vs actuals. Over time, the system gets smarter about what works in your business.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'Q: Can I trust the financial projections?', 'Content': 'A: They use YOUR actual Net Sales and Margin per LB data (not guesses). The EXPECTED column is conservative. The LOW column is very conservative (60% success rate). Results may vary but are based on real historical patterns.'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'NEXT STEPS', 'Content': ''},
+        {'Section': '1', 'Content': 'Review Tab 2 (TOP_5_MOVES) with your team'},
+        {'Section': '2', 'Content': 'Check Tab 10 (FINANCIAL_IMPACT) to prioritize by ROI'},
+        {'Section': '3', 'Content': 'Make the zone changes in your pricing system'},
+        {'Section': '4', 'Content': 'Alert sales team about which customers may see new pricing'},
+        {'Section': '5', 'Content': 'Track results weekly using your BI tools'},
+        {'Section': '6', 'Content': 'Re-run this analysis in 8-12 weeks to measure actual impact'},
+        {'Section': '', 'Content': ''},
+        
+        {'Section': 'SUPPORT', 'Content': ''},
+        {'Section': 'Questions?', 'Content': 'Contact your pricing analyst or data team'},
+        {'Section': 'Report Date', 'Content': datetime.now().strftime('%Y-%m-%d %H:%M')},
+    ]
+    
+    return pd.DataFrame(guide_content)
+
+def create_executive_summary(recommendations, yoy_metrics=None, reactive_flags=None, financial_summary=None, config=None):
     """One-page summary with company name."""
     
     high_priority = [r for r in recommendations if r['implementation_priority'] >= 70]
@@ -2233,22 +2473,21 @@ def create_executive_summary(recommendations: List[Dict],
         'first_action': high_priority[0]['stakeholder_message'] if high_priority else 'No immediate actions'
     }
     
-    # Add filter info (ENHANCED WITH NAME!)
-    if config:
-        filter_info = []
+
+    filter_info = []
         
-        # Get company name from recommendations if filtered
-        if config.FILTER_BY_company_number and recommendations:
-            company_name = recommendations[0].get('company_name', config.FILTER_BY_company_number)
-            filter_info.append(f"Company: {company_name} (ID: {config.FILTER_BY_company_number})")
-        elif config.FILTER_BY_company_number:
-            filter_info.append(f"Company Number: {config.FILTER_BY_company_number}")
-        
-        if config.FILTER_BY_company_region_id:
-            filter_info.append(f"Region: {config.FILTER_BY_company_region_id}")
-        
-        summary['scope'] = ', '.join(filter_info) if filter_info else 'All Companies & Regions'
-        summary['yoy_lookback_window'] = f"{config.YOY_LOOKBACK_WEEKS} weeks"
+    # Get company name from recommendations if filtered
+    if config and config.FILTER_BY_company_number and recommendations:  # ✅ FIXED - attribute access
+        company_name = recommendations[0].get('company_name', config.FILTER_BY_company_number)
+        filter_info.append(f"Company: {company_name} (ID: {config.FILTER_BY_company_number})")
+    elif config and config.FILTER_BY_company_number:  # ✅ Add safety check
+        filter_info.append(f"Company Number: {config.FILTER_BY_company_number}")
+
+    if config and config.FILTER_BY_company_region_id:  # ✅ Add safety check
+        filter_info.append(f"Region: {config.FILTER_BY_company_region_id}")
+
+    summary['scope'] = ', '.join(filter_info) if filter_info else 'All Companies & Regions'
+    summary['yoy_lookback_window'] = f"{config.YOY_LOOKBACK_WEEKS} weeks" if config else "8 weeks"  # ✅ Add fallback
     
     # Add YoY metrics
     if yoy_metrics:
@@ -2262,8 +2501,39 @@ def create_executive_summary(recommendations: List[Dict],
             'new_customers_gained': f"{yoy_metrics['new_customers']:,}",
             'customers_lost': f"{yoy_metrics['lost_customers']:,}"
         })
+
+        # ✅ ADD FINANCIAL SECTION
+    if financial_summary:
+        summary.update({
+            '': '',  # Spacer
+            'FINANCIAL IMPACT (TOP 10 MOVES)': '',
+            'revenue_8wk_range': f"${financial_summary['top10_revenue_8wk_low']:,.0f} - ${financial_summary['top10_revenue_8wk_high']:,.0f}",
+            'revenue_8wk_expected': f"${financial_summary['top10_revenue_8wk_expected']:,.0f}",
+            'margin_8wk_range': f"${financial_summary['top10_margin_8wk_low']:,.0f} - ${financial_summary['top10_margin_8wk_high']:,.0f}",
+            'margin_8wk_expected': f"${financial_summary['top10_margin_8wk_expected']:,.0f}",
+            'annualized_revenue_all_moves': f"${financial_summary['all_revenue_annual_expected']:,.0f}",
+            'annualized_margin_all_moves': f"${financial_summary['all_margin_annual_expected']:,.0f}",
+            'confidence_breakdown': f"High: {financial_summary['high_confidence_count']}, Medium: {financial_summary['medium_confidence_count']}, Low: {financial_summary['low_confidence_count']}"
+        })
+    # ADD THESE DEBUG LINES:
+    print(f"\n🐛 DEBUG create_executive_summary():")
+    print(f"   financial_summary = {financial_summary}")
+    print(f"   financial_summary is None? {financial_summary is None}")
+    print(f"   financial_summary is empty? {not financial_summary if financial_summary else 'N/A'}")
     
-    return summary
+    if financial_summary:
+        print(f"   ✅ INSIDE financial_summary block!")
+        print(f"   Keys: {list(financial_summary.keys()) if isinstance(financial_summary, dict) else 'Not a dict'}")
+        summary.update({
+            '': '',  # Spacer
+            'FINANCIAL IMPACT (TOP 10 MOVES)': '',
+            'revenue_8wk_range': f"${financial_summary['top10_revenue_8wk_low']:,.0f} - ${financial_summary['top10_revenue_8wk_high']:,.0f}",
+            # ... rest of your financial code
+        })
+    else:
+        print(f"   ❌ SKIPPING financial_summary block (it's None or empty)")
+    
+    return pd.DataFrame([summary])  
 
 
 def create_quick_wins_dashboard(recommendations: List[Dict], 
@@ -2419,6 +2689,564 @@ def create_zone_stickiness_report(consistency_analysis: pd.DataFrame) -> pd.Data
     # Format percentages
     display['GREEN FLAG Rate'] = display['GREEN FLAG Rate'].apply(lambda x: f"{x:.1%}")
     display['Avg Consistency'] = display['Avg Consistency'].apply(lambda x: f"{x:.1%}")
+    
+    return display
+
+def create_volume_decline_dashboard(df: pd.DataFrame, 
+                                    config: FoodserviceConfig,
+                                    top_n: int = 50) -> pd.DataFrame:
+    """Show biggest volume losses by combo + zone with correct customer counts."""
+    
+    df = df.copy()
+    
+    print(f"\n📉 Analyzing volume declines by combo + zone...")
+    
+    # Ensure numeric
+    df['Pounds_CY'] = pd.to_numeric(df['Pounds_CY'], errors='coerce').fillna(0)
+    df['Pounds_PY'] = pd.to_numeric(df['Pounds_PY'], errors='coerce').fillna(0)
+    df['Zone_Suffix_Numeric'] = pd.to_numeric(df['Zone_Suffix_Numeric'], errors='coerce')
+    
+    # Drop invalid zones
+    df = df.dropna(subset=['Zone_Suffix_Numeric'])
+    df = df[df['Zone_Suffix_Numeric'].between(0, 5)]
+    
+    # Group by combo + zone and count DISTINCT customers
+    combo_zone = df.groupby(
+        ['Company_Combo_Key', 'Zone_Suffix_Numeric'], 
+        dropna=False
+    ).agg({
+        'Pounds_CY': 'sum',
+        'Pounds_PY': 'sum',
+        config.data_config.customer_id_column: 'nunique'  # Total distinct customers at this combo+zone
+    }).reset_index()
+    
+    # Get CY customers only (where they actually bought CY)
+    cy_only = df[df['Pounds_CY'] > 0].groupby(
+        ['Company_Combo_Key', 'Zone_Suffix_Numeric'],
+        dropna=False
+    )[config.data_config.customer_id_column].nunique().reset_index()
+    cy_only.columns = ['Company_Combo_Key', 'Zone_Suffix_Numeric', 'Customers_CY']
+    
+    # Get PY customers only (where they actually bought PY)
+    py_only = df[df['Pounds_PY'] > 0].groupby(
+        ['Company_Combo_Key', 'Zone_Suffix_Numeric'],
+        dropna=False
+    )[config.data_config.customer_id_column].nunique().reset_index()
+    py_only.columns = ['Company_Combo_Key', 'Zone_Suffix_Numeric', 'Customers_PY']
+    
+    # Merge
+    combo_zone = combo_zone.merge(cy_only, on=['Company_Combo_Key', 'Zone_Suffix_Numeric'], how='left')
+    combo_zone = combo_zone.merge(py_only, on=['Company_Combo_Key', 'Zone_Suffix_Numeric'], how='left')
+    
+    combo_zone['Customers_CY'] = combo_zone['Customers_CY'].fillna(0).astype(int)
+    combo_zone['Customers_PY'] = combo_zone['Customers_PY'].fillna(0).astype(int)
+    
+    # Drop the third customer column (total) - we only want CY and PY separately
+    combo_zone = combo_zone.drop(config.data_config.customer_id_column, axis=1)
+    
+    # Calculate changes
+    combo_zone['Volume_Change_Lbs'] = combo_zone['Pounds_CY'] - combo_zone['Pounds_PY']
+    combo_zone['Volume_Change_Pct'] = (combo_zone['Volume_Change_Lbs'] / combo_zone['Pounds_PY'].replace(0, 1)) * 100
+    combo_zone['Customer_Change'] = combo_zone['Customers_CY'] - combo_zone['Customers_PY']
+    combo_zone['Customer_Change_Pct'] = (combo_zone['Customer_Change'] / combo_zone['Customers_PY'].replace(0, 1)) * 100
+    
+    # Filter to declines only
+    declines = combo_zone[combo_zone['Volume_Change_Lbs'] < 0].copy()
+    declines = declines.sort_values('Volume_Change_Lbs', ascending=True)
+    
+    if top_n:
+        declines = declines.head(top_n)
+    
+    # Format display
+    declines['Combo_Zone'] = declines['Company_Combo_Key'] + '_Z' + declines['Zone_Suffix_Numeric'].astype(int).astype(str)
+    
+    display = declines[[
+        'Combo_Zone', 'Pounds_CY', 'Pounds_PY', 'Volume_Change_Lbs', 'Volume_Change_Pct',
+        'Customers_CY', 'Customers_PY', 'Customer_Change', 'Customer_Change_Pct'
+    ]].copy()
+    
+    display.columns = [
+        'Combo + Zone', 'Pounds This Year', 'Pounds Last Year', 'Volume Change (lbs)', 'Volume Change %',
+        'Customers This Year', 'Customers Last Year', 'Customer Change', 'Customer Change %'
+    ]
+    
+    # Format
+    display['Pounds This Year'] = display['Pounds This Year'].apply(lambda x: f"{x:,.0f}")
+    display['Pounds Last Year'] = display['Pounds Last Year'].apply(lambda x: f"{x:,.0f}")
+    display['Volume Change (lbs)'] = display['Volume Change (lbs)'].apply(lambda x: f"{x:+,.0f}")
+    display['Volume Change %'] = display['Volume Change %'].apply(lambda x: f"{x:+.1f}%")
+    display['Customer Change'] = display['Customer Change'].apply(lambda x: f"{x:+,}")
+    display['Customer Change %'] = display['Customer Change %'].apply(lambda x: f"{x:+.1f}%")
+    
+    print(f"   ✅ Found {len(declines)} combo-zone pairs with volume declines")
+    
+    return display
+
+def generate_high_value_leads(recommendations: List[Dict],
+                              current_df: pd.DataFrame,
+                              config: FoodserviceConfig,
+                              output_path: str) -> pd.DataFrame:
+    """
+    Generate a leads file for FinalCat.py with high-value customers to target.
+    
+    8th Grade Explanation:
+    "Create a list of specific customers the sales team should call about 
+    the new pricing. Focus on customers most likely to buy more."
+    
+    Args:
+        recommendations: List of zone recommendations
+        historical_df: Full historical data
+        current_df: Current period data (has Customer_Status)
+        config: Configuration object
+        output_path: Where to save the CSV
+    
+    Returns:
+        DataFrame of leads
+    """
+    
+    print(f"\n🎯 Generating high-value leads for FinalCat.py...")
+    
+    # Get config values
+    min_revenue_threshold = config.LEADS_MIN_REVENUE_THRESHOLD
+    
+    # Check if filtering by company
+    filter_company = getattr(config.data_config, 'FILTER_BY_COMPANY_NUMBER', None)
+    
+    if filter_company:
+        # Filtering by specific company - use filtered lead count
+        top_n = config.LEADS_N_FOR_FILTERED_COMPANY
+        print(f"   🏢 Filtering to Company Number: {filter_company}")
+        print(f"   📊 Generating {top_n} leads for this company only")
+    else:
+        # No company filter - use broad lead count across all companies
+        top_n = config.LEADS_TOP_N_ALL_COMPANIES
+        print(f"   🌐 Generating top {top_n} leads across ALL companies")
+    
+    # Filter recommendations by company if needed
+    if filter_company:
+        filtered_recs = [
+            rec for rec in recommendations 
+            if rec.get('company_number') == filter_company or 
+               rec.get('company_name', '').startswith(filter_company)
+        ]
+        print(f"   📋 Found {len(filtered_recs)} recommendations for Company {filter_company}")
+    else:
+        filtered_recs = recommendations
+    
+    # Filter to high-priority recommendations only
+    high_priority_recs = sorted(
+        filtered_recs, 
+        key=lambda x: x.get('implementation_priority', 0), 
+        reverse=True
+    )[:top_n]
+    
+    print(f"   ✅ Selected top {len(high_priority_recs)} recommendations")
+    
+    leads_data = []
+    total_customers_identified = 0
+    
+    for rec in high_priority_recs:
+        combo = rec['company_combo']
+        current_zone = rec['current_zone']
+        recommended_zone = rec['recommended_zone']
+        
+        # Get customers for this combo from CURRENT data (has Customer_Status)
+        combo_data = current_df[current_df['Company_Combo_Key'] == combo].copy()
+        
+        if combo_data.empty:
+            continue
+        
+        # Ensure numeric columns
+        combo_data['Net_Sales_CY'] = pd.to_numeric(combo_data.get('Net_Sales_CY', 0), errors='coerce').fillna(0)
+        combo_data['Pounds_CY'] = pd.to_numeric(combo_data['Pounds_CY'], errors='coerce').fillna(0)
+        combo_data['Pounds_PY'] = pd.to_numeric(combo_data.get('Pounds_PY', 0), errors='coerce').fillna(0)
+        
+        # Check if Customer_Status exists
+        has_customer_status = 'Customer_Status' in combo_data.columns
+        has_last_invoice = 'Last_Invoice_Date' in combo_data.columns
+        
+        # Build aggregation dict dynamically
+        agg_dict = {
+            'Net_Sales_CY': 'sum',
+            'Pounds_CY': 'sum',
+            'Pounds_PY': 'sum',
+            'Customer Name': 'first'
+        }
+        
+        if has_customer_status:
+            agg_dict['Customer_Status'] = 'first'
+        
+        if has_last_invoice:
+            agg_dict['Last_Invoice_Date'] = 'max'
+        
+        # Get customer-level aggregates
+        customer_summary = combo_data.groupby(config.data_config.customer_id_column).agg(agg_dict).reset_index()
+        
+        # If Customer_Status is missing, create a default
+        if not has_customer_status:
+            # Classify based on volume
+            customer_summary['Customer_Status'] = customer_summary.apply(
+                lambda row: 'LAPSED_FROM_CATEGORY' if row['Pounds_CY'] == 0 and row['Pounds_PY'] > 0 
+                else 'ACTIVE_BUYER', 
+                axis=1
+            )
+        
+        # If Last_Invoice_Date is missing, use a placeholder
+        if not has_last_invoice:
+            customer_summary['Last_Invoice_Date'] = 'N/A'
+        
+        # Annualize revenue (multiply 8 weeks by 6.5 to get annual estimate)
+        customer_summary['Estimated_Annual_Revenue'] = customer_summary['Net_Sales_CY'] * 6.5
+        
+        # Filter to high-value customers only
+        high_value_customers = customer_summary[
+            customer_summary['Estimated_Annual_Revenue'] >= min_revenue_threshold
+        ].copy()
+        
+        if high_value_customers.empty:
+            continue
+        
+        # Prioritize lapsed customers (highest recovery potential)
+        lapsed = high_value_customers[
+            high_value_customers['Customer_Status'] == 'LAPSED_FROM_CATEGORY'
+        ].copy()
+        
+        active = high_value_customers[
+            high_value_customers['Customer_Status'] == 'ACTIVE_BUYER'
+        ].copy()
+        
+        # Create leads for lapsed customers (TOP PRIORITY)
+        for _, cust in lapsed.iterrows():
+            leads_data.append({
+                'Lead_Type': 'LAPSED_RECOVERY',
+                'Priority': 'HIGH',
+                'Company_Combo': combo,
+                'Company_Name': rec.get('company_name', ''),
+                'Current_Zone': current_zone,
+                'Recommended_Zone': recommended_zone,
+                'Customer_ID': cust[config.data_config.customer_id_column],
+                'Customer_Name': cust['Customer Name'],
+                'Customer_Status': cust['Customer_Status'],
+                'Last_Invoice_Date': cust['Last_Invoice_Date'],
+                'Pounds_CY': cust['Pounds_CY'],
+                'Pounds_PY': cust['Pounds_PY'],
+                'Est_Annual_Revenue': cust['Estimated_Annual_Revenue'],
+                'Reason': f"Stopped buying {combo} but still active. Win back at Zone {recommended_zone}.",
+                'Sales_Talking_Point': f"We're adjusting pricing on {combo} to be more competitive. You stopped ordering this but we'd love to earn your business back.",
+                'Expected_Action': 'Call customer, mention new zone pricing, ask for trial order'
+            })
+        
+        # Create leads for active customers (MEDIUM PRIORITY - upsell opportunity)
+        for _, cust in active.head(10).iterrows():  # Top 10 active per combo
+            leads_data.append({
+                'Lead_Type': 'UPSELL_OPPORTUNITY',
+                'Priority': 'MEDIUM',
+                'Company_Combo': combo,
+                'Company_Name': rec.get('company_name', ''),
+                'Current_Zone': current_zone,
+                'Recommended_Zone': recommended_zone,
+                'Customer_ID': cust[config.data_config.customer_id_column],
+                'Customer_Name': cust['Customer Name'],
+                'Customer_Status': cust['Customer_Status'],
+                'Last_Invoice_Date': cust['Last_Invoice_Date'],
+                'Pounds_CY': cust['Pounds_CY'],
+                'Pounds_PY': cust['Pounds_PY'],
+                'Est_Annual_Revenue': cust['Estimated_Annual_Revenue'],
+                'Reason': f"Active buyer. New pricing at Zone {recommended_zone} could increase volume.",
+                'Sales_Talking_Point': f"You're already buying {combo}. We've improved pricing to help you increase volume and save money.",
+                'Expected_Action': 'Call customer, mention improved pricing, ask for larger or more frequent orders'
+            })
+        
+        total_customers_identified += len(lapsed) + min(10, len(active))
+    
+    leads_df = pd.DataFrame(leads_data)
+    
+    if leads_df.empty:
+        print("   ⚠️  No high-value leads identified")
+        return leads_df
+    
+    # Sort by priority and revenue
+    priority_map = {'HIGH': 3, 'MEDIUM': 2, 'LOW': 1}
+    leads_df['Priority_Rank'] = leads_df['Priority'].map(priority_map)
+    leads_df = leads_df.sort_values(
+        ['Priority_Rank', 'Est_Annual_Revenue'], 
+        ascending=[False, False]
+    )
+    leads_df = leads_df.drop('Priority_Rank', axis=1)
+    
+    # Format currency
+    leads_df['Est_Annual_Revenue'] = leads_df['Est_Annual_Revenue'].apply(lambda x: f"${x:,.0f}")
+    
+    # Save to CSV
+    leads_df.to_csv(output_path, index=False)
+    
+    print(f"   ✅ Generated {len(leads_df):,} high-value leads")
+    print(f"   📊 Breakdown:")
+    print(f"      • LAPSED_RECOVERY (High Priority): {len(leads_df[leads_df['Lead_Type']=='LAPSED_RECOVERY']):,}")
+    print(f"      • UPSELL_OPPORTUNITY (Medium Priority): {len(leads_df[leads_df['Lead_Type']=='UPSELL_OPPORTUNITY']):,}")
+    print(f"   💾 Saved to: {output_path}")
+    print(f"   🎯 Total unique customers identified: {total_customers_identified:,}")
+    
+    return leads_df
+
+def calculate_financial_impact(recommendations: List[Dict],
+                              historical_df: pd.DataFrame,
+                              config: FoodserviceConfig) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Calculate financial impact using ACTUAL Net Sales and Margin data.
+    Conservative estimates with confidence ranges.
+    
+    8th Grade Explanation:
+    "If we do these zone changes, how much revenue and profit do we gain?
+    We use your actual pricing data, not guesses. We show low/expected/high 
+    scenarios so you know the range of outcomes."
+    """
+    
+    print("\n💰 Calculating financial impact...")
+    
+    financial_data = []
+    
+    for rec in recommendations:
+        combo = rec['company_combo']
+        combo_data = historical_df[
+            (historical_df['Company_Combo_Key'] == combo) & 
+            (historical_df['Pounds_CY'] > 0)
+        ]
+        
+        if combo_data.empty:
+            continue
+        
+        # Use ACTUAL data from your trusted columns
+        total_sales_cy = combo_data['Net_Sales_CY'].sum()
+        total_pounds_cy = combo_data['Pounds_CY'].sum()
+        total_margin_cy = combo_data['Margin_CY'].sum()
+        
+        # Calculate weighted averages
+        avg_net_sales_per_lb = (total_sales_cy / total_pounds_cy) if total_pounds_cy > 0 else 0
+        avg_margin_per_lb = (total_margin_cy / total_pounds_cy) if total_pounds_cy > 0 else 0
+
+        # ==========================================
+        # LAYER 1: Per-Pound Price Changes
+        # ==========================================
+        if config.has_per_lb_rates:
+            per_lb_cy = combo_data[config.data_config.net_sales_per_lb_cy_column].replace(r'[\$,]', '', regex=True).astype(float).mean()
+            per_lb_py = combo_data[config.data_config.net_sales_per_lb_py_column].replace(r'[\$,]', '', regex=True).astype(float).mean()
+            per_lb_change_pct = ((per_lb_cy - per_lb_py) / per_lb_py * 100) if per_lb_py > 0 else 0
+        else:
+            per_lb_change_pct = 0
+        
+        # ==========================================
+        # LAYER 2: Margin Percentage Changes
+        # ==========================================
+        if config.has_margin_pct:
+            margin_pct_cy = combo_data[config.data_config.margin_pct_cy_column].str.replace(r'[\%,]', '', regex=True).astype(float).mean()
+            margin_pct_py = combo_data[config.data_config.margin_pct_py_column].str.replace(r'[\%,]', '', regex=True).astype(float).mean()
+            margin_pct_change = margin_pct_cy - margin_pct_py
+        else:
+            margin_pct_change = 0
+        
+        # ==========================================
+        # LAYER 3: Build Diagnostic Flags
+        # ==========================================
+        customers_lost = rec.get('customer_change', 0) < 0
+        price_increased = per_lb_change_pct > 5
+        
+        flags = []
+        if customers_lost and price_increased:
+            flags.append("🚨 OVERPRICED")
+        if margin_pct_change < -2:
+            flags.append("📉 MARGIN COMPRESSION")
+        if margin_pct_change > 2 and not customers_lost:
+            flags.append("✅ MARGIN EXPANSION")
+        
+        diagnostic_flag = " | ".join(flags) if flags else "—"
+        
+        # Conservative volume lift estimates based on recommendation type
+        if rec['recommendation_type'] == 'HIGH_RECOVERY_POTENTIAL':
+            # Lapsed customers coming back - high confidence
+            volume_lift_low = rec['total_volume'] * 0.15      # 15% (conservative)
+            volume_lift_expected = rec['total_volume'] * 0.25  # 25% (realistic)
+            volume_lift_high = rec['total_volume'] * 0.35     # 35% (optimistic)
+            confidence = 'HIGH'
+            
+        elif rec['recommendation_type'] == 'REACTIVE_CORRECTION':
+            # Fix overpricing - medium confidence
+            volume_lift_low = rec['total_volume'] * 0.12
+            volume_lift_expected = rec['total_volume'] * 0.20
+            volume_lift_high = rec['total_volume'] * 0.28
+            confidence = 'MEDIUM'
+            
+        elif rec['recommendation_type'] == 'GREEN_FLAG_ZONE':
+            # Match proven zones - medium confidence
+            volume_lift_low = rec['total_volume'] * 0.10
+            volume_lift_expected = rec['total_volume'] * 0.15
+            volume_lift_high = rec['total_volume'] * 0.22
+            confidence = 'MEDIUM'
+            
+        else:
+            # Standard adjustment - lower confidence
+            volume_lift_low = rec['total_volume'] * 0.08
+            volume_lift_expected = rec['total_volume'] * 0.12
+            volume_lift_high = rec['total_volume'] * 0.18
+            confidence = 'LOW'
+        
+        # Calculate financial impact for each scenario
+        revenue_low = volume_lift_low * avg_net_sales_per_lb
+        revenue_expected = volume_lift_expected * avg_net_sales_per_lb
+        revenue_high = volume_lift_high * avg_net_sales_per_lb
+        
+        margin_low = volume_lift_low * avg_margin_per_lb
+        margin_expected = volume_lift_expected * avg_margin_per_lb
+        margin_high = volume_lift_high * avg_margin_per_lb
+        
+        # Timeline adjustment (faster results = higher near-term value)
+        weeks_to_result = 6  # Default
+        if '2-4 weeks' in rec['timeline']:
+            weeks_to_result = 3
+        elif '4-6 weeks' in rec['timeline']:
+            weeks_to_result = 5
+        
+        # Annualized impact (52 weeks)
+        annualized_multiplier = 52 / weeks_to_result
+        
+        financial_data.append({
+            'combo': rec['company_combo'],
+            'company': rec['company_name'],
+            'current_zone': rec['current_zone'],
+            'recommended_zone': rec['recommended_zone'],
+            'recommendation_type': rec['recommendation_type'],
+            'priority': rec['implementation_priority'],
+            
+            # Volume data
+            'current_volume_lbs': rec['total_volume'],
+            'volume_lift_low_lbs': volume_lift_low,
+            'volume_lift_expected_lbs': volume_lift_expected,
+            'volume_lift_high_lbs': volume_lift_high,
+            
+            # Pricing data
+            'avg_net_sales_per_lb': avg_net_sales_per_lb,
+            'avg_margin_per_lb': avg_margin_per_lb,
+            'price_per_lb_change_pct': per_lb_change_pct,
+            'margin_pct_change': margin_pct_change,
+            'diagnostic_flag': diagnostic_flag,
+            
+            # 8-Week Impact (first cycle)
+            'revenue_gain_8wk_low': revenue_low,
+            'revenue_gain_8wk_expected': revenue_expected,
+            'revenue_gain_8wk_high': revenue_high,
+            'margin_gain_8wk_low': margin_low,
+            'margin_gain_8wk_expected': margin_expected,
+            'margin_gain_8wk_high': margin_high,
+            
+            # Annualized Impact (ongoing value)
+            'revenue_gain_annual_expected': revenue_expected * annualized_multiplier,
+            'margin_gain_annual_expected': margin_expected * annualized_multiplier,
+            
+            'confidence': confidence,
+            'timeline_weeks': weeks_to_result
+        })
+    
+    df = pd.DataFrame(financial_data)
+    
+    if df.empty:
+        return df, {}
+    
+    # Sort by expected revenue gain (biggest impact first)
+    df = df.sort_values('revenue_gain_8wk_expected', ascending=False)
+    
+    # Calculate summary totals
+    summary = {
+        'total_recommendations': len(df),
+        'high_confidence_count': len(df[df['confidence'] == 'HIGH']),
+        'medium_confidence_count': len(df[df['confidence'] == 'MEDIUM']),
+        'low_confidence_count': len(df[df['confidence'] == 'LOW']),
+        
+        # Top 10 moves (highest impact)
+        'top10_revenue_8wk_low': df.head(10)['revenue_gain_8wk_low'].sum(),
+        'top10_revenue_8wk_expected': df.head(10)['revenue_gain_8wk_expected'].sum(),
+        'top10_revenue_8wk_high': df.head(10)['revenue_gain_8wk_high'].sum(),
+        'top10_margin_8wk_low': df.head(10)['margin_gain_8wk_low'].sum(),
+        'top10_margin_8wk_expected': df.head(10)['margin_gain_8wk_expected'].sum(),
+        'top10_margin_8wk_high': df.head(10)['margin_gain_8wk_high'].sum(),
+        
+        # All moves
+        'all_revenue_8wk_expected': df['revenue_gain_8wk_expected'].sum(),
+        'all_margin_8wk_expected': df['margin_gain_8wk_expected'].sum(),
+        'all_revenue_annual_expected': df['revenue_gain_annual_expected'].sum(),
+        'all_margin_annual_expected': df['margin_gain_annual_expected'].sum(),
+    }
+    
+    print(f"   ✅ Calculated financial impact for {len(df)} recommendations")
+    print(f"   💰 Top 10 moves expected impact:")
+    print(f"      Revenue (8 weeks): ${summary['top10_revenue_8wk_low']:,.0f} - ${summary['top10_revenue_8wk_high']:,.0f}")
+    print(f"      Margin (8 weeks): ${summary['top10_margin_8wk_low']:,.0f} - ${summary['top10_margin_8wk_high']:,.0f}")
+    
+    return df, summary
+
+
+def create_financial_impact_dashboard(financial_df: pd.DataFrame, 
+                                      summary: Dict) -> pd.DataFrame:
+    """Format financial impact for stakeholder dashboard."""
+    
+    if financial_df.empty:
+        return pd.DataFrame([{'Message': 'No financial data calculated'}])
+    
+    display = financial_df[[
+        'company',
+        'current_zone',
+        'recommended_zone',
+        'recommendation_type',
+        'current_volume_lbs',
+        'volume_lift_expected_lbs',
+        'avg_net_sales_per_lb',
+        'avg_margin_per_lb',
+        'revenue_gain_8wk_low',
+        'revenue_gain_8wk_expected',
+        'revenue_gain_8wk_high',
+        'margin_gain_8wk_low',
+        'margin_gain_8wk_expected',
+        'margin_gain_8wk_high',
+        'revenue_gain_annual_expected',
+        'margin_gain_annual_expected',
+        'confidence',
+        'timeline_weeks'
+    ]].copy()
+    
+    display.columns = [
+        'Company',
+        'Current Zone',
+        'Move To Zone',
+        'Type',
+        'Current Volume (lbs)',
+        'Expected Volume Gain (lbs)',
+        'Avg Price/LB',
+        'Avg Margin/LB',
+        'Revenue Gain (8wk Low)',
+        'Revenue Gain (8wk Expected)',
+        'Revenue Gain (8wk High)',
+        'Margin Gain (8wk Low)',
+        'Margin Gain (8wk Expected)',
+        'Margin Gain (8wk High)',
+        'Revenue Gain (Annual)',
+        'Margin Gain (Annual)',
+        'Confidence',
+        'Timeline (weeks)'
+    ]
+    
+    # Format currency
+    currency_cols = [
+        'Avg Price/LB', 'Avg Margin/LB',
+        'Revenue Gain (8wk Low)', 'Revenue Gain (8wk Expected)', 'Revenue Gain (8wk High)',
+        'Margin Gain (8wk Low)', 'Margin Gain (8wk Expected)', 'Margin Gain (8wk High)',
+        'Revenue Gain (Annual)', 'Margin Gain (Annual)'
+    ]
+    
+    for col in currency_cols:
+        display[col] = display[col].apply(lambda x: f"${x:,.0f}")
+    
+    # Format volume
+    display['Current Volume (lbs)'] = display['Current Volume (lbs)'].apply(lambda x: f"{x:,.0f}")
+    display['Expected Volume Gain (lbs)'] = display['Expected Volume Gain (lbs)'].apply(lambda x: f"{x:,.0f}")
     
     return display
 
@@ -2850,9 +3678,9 @@ def _format_excel_sheets(writer):
                     ws.cell(row, col).fill = alert_fill
         
         # ==========================================
-        # STEP 6: Add filters to data rows
+        # STEP 6: Add filters to data rows (except HOW_TO_USE)
         # ==========================================
-        if ws.max_row > 1:
+        if ws.max_row > 1 and '0_HOW_TO_USE' not in sheet_name:
             ws.auto_filter.ref = ws.dimensions
         
         # ==========================================
@@ -2870,15 +3698,283 @@ def _format_excel_sheets(writer):
         # ==========================================
         ws.sheet_view.zoomScale = 90  # Slightly zoomed out
 
+        # ==========================================
+        # HOW TO USE GUIDE TAB
+        # ==========================================
+        if 'HOW_TO_USE' in sheet_name:
+            continue  # Skip HOW_TO_USE - it has custom formatting already!
+
+
+def create_how_to_use_tab(writer, recommendations_count, high_priority_count, volume_at_stake):
+    """
+    Create a beautiful, engaging HOW_TO_USE guide tab as the FIRST tab.
+    Uses colors, emojis, and clear sections to make it inviting and easy to understand.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    
+    wb = writer.book
+    
+    # Create or get the sheet (make it the FIRST tab)
+    if "0_HOW_TO_USE" in wb.sheetnames:
+        ws = wb["0_HOW_TO_USE"]
+    else:
+        ws = wb.create_sheet("0_HOW_TO_USE", 0)  # Insert as first sheet
+    
+    # ========================================
+    # COLOR PALETTE (Vibrant & Professional)
+    # ========================================
+    SYSCO_BLUE = "0066CC"
+    HEADER_BLUE = "4472C4"
+    ACCENT_GREEN = "70AD47"
+    ACCENT_ORANGE = "F4B183"
+    ACCENT_RED = "E74C3C"
+    LIGHT_BLUE = "D9E2F3"
+    LIGHT_GREEN = "E2EFDA"
+    LIGHT_YELLOW = "FFF4CC"
+
+    
+    # ========================================
+    # FONT STYLES
+    # ========================================
+    body_font = Font(name="Calibri", size=11)
+    bold_body = Font(name="Calibri", size=11, bold=True)
+    
+    # ========================================
+    # FILL STYLES
+    # ========================================
+    header_fill = PatternFill(start_color=HEADER_BLUE, end_color=HEADER_BLUE, fill_type="solid")
+    light_blue_fill = PatternFill(start_color=LIGHT_BLUE, end_color=LIGHT_BLUE, fill_type="solid")
+    light_green_fill = PatternFill(start_color=LIGHT_GREEN, end_color=LIGHT_GREEN, fill_type="solid")
+    light_yellow_fill = PatternFill(start_color=LIGHT_YELLOW, end_color=LIGHT_YELLOW, fill_type="solid")
+    
+    # ========================================
+    # HELPER FUNCTIONS
+    # ========================================
+    def add_section_header(row, text, emoji=""):
+        """Add a colored section header with WHITE font"""
+        ws.merge_cells(f"A{row}:H{row}")
+        cell = ws.cell(row, 1, value=f"{emoji} {text}")
+        cell.font = Font(name="Calibri", size=16, bold=True, color="FFFFFF")  # ← WHITE font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='left', vertical='center')
+        ws.row_dimensions[row].height = 25
+        return row + 1
+        
+    def add_text(row, text, indent=0, bold=False):
+        """Add body text with optional indent"""
+        indent_text = "   " * indent + text
+        ws.merge_cells(f"A{row}:H{row}")
+        cell = ws.cell(row, 1, value=indent_text)
+        cell.font = bold_body if bold else body_font
+        cell.alignment = Alignment(horizontal='left', vertical='top', wrap_text=True)
+        ws.row_dimensions[row].height = 18
+        return row + 1
+    
+    def add_callout_box(row, text, fill_color):
+        """Add a highlighted callout box"""
+        ws.merge_cells(f"A{row}:H{row}")
+        cell = ws.cell(row, 1, value=text)
+        cell.font = bold_body
+        cell.fill = fill_color
+        cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+        ws.row_dimensions[row].height = 30
+        return row + 1
+    
+    # ========================================
+    # SET COLUMN WIDTHS
+    # ========================================
+    ws.column_dimensions['A'].width = 80
+    for col in ['B', 'C', 'D', 'E', 'F', 'G', 'H']:
+        ws.column_dimensions[col].width = 5
+    
+    # ========================================
+    # BUILD THE GUIDE
+    # ========================================
+    row = 1
+    
+    # === MAIN TITLE (merged into one row with white font) ===
+    ws.merge_cells(f"A{row}:H{row}")
+    cell = ws.cell(row, 1, value="🎯 PRICING ZONE OPTIMIZATION GUIDE - Your roadmap to winning back customers and growing volume")
+    cell.font = Font(name="Calibri", size=20, bold=True, color="FFFFFF")  # ← WHITE font
+    cell.fill = PatternFill(start_color=SYSCO_BLUE, end_color=SYSCO_BLUE, fill_type="solid")
+    cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    ws.row_dimensions[row].height = 50
+    row += 2
+    
+    # === QUICK STATS BOX ===
+    row = add_callout_box(row, 
+        f"📊 THIS REPORT FOUND: {recommendations_count} opportunities | "
+        f"{high_priority_count} high-priority moves | "
+        f"{volume_at_stake:,.0f} lbs at stake",
+        light_blue_fill)
+    row += 2
+    
+    # === SECTION 1: WHAT IS THIS? ===
+    row = add_section_header(row, "WHAT IS THIS REPORT?", "📖")
+    row = add_text(row, "This report analyzes your historical sales to find pricing zones that are losing customers.", 1)
+    row = add_text(row, "It recommends LOWER pricing zones (never higher) to win back customers who:", 1)
+    row = add_text(row, "• Stopped buying this category but are still active Sysco customers", 2)
+    row = add_text(row, "• Were overcharged, left, and we panicked and dropped the zone (reactive pricing)", 2)
+    row = add_text(row, "• Are buying less than they used to because the price is too high", 2)
+    row += 1
+    row = add_callout_box(row, "💡 KEY INSIGHT: We only suggest LOWER prices. Never higher.", light_green_fill)
+    row += 2
+    
+    # === SECTION 2: HOW TO READ THIS ===
+    row = add_section_header(row, "HOW TO READ THIS DASHBOARD", "🔍")
+    
+    tabs = [
+        ("Tab 1: Executive Summary", "Big picture - total opportunities, customer wins/losses, financial impact"),
+        ("Tab 2: Top 5 Moves", "START HERE! The 5 most important zone changes to make right now"),
+        ("Tab 3: Recovery Opportunities", "Customers who stopped buying but are still active - easiest wins!"),
+        ("Tab 4: Reactive Alerts", "⚠️ Places where we already dropped zones reactively (data may be messy)"),
+        ("Tab 5: Timeline", "Week-by-week schedule for implementing changes"),
+        ("Tab 6: Learning Tracker", "(Empty first time) Tracks how accurate our predictions were"),
+        ("Tab 7: All Recommendations", "Complete list of every suggested zone change"),
+        ("Tab 8: YoY Customers", "How many customers we kept, gained, or lost compared to last year"),
+        ("Tab 9: Volume Declines", "Biggest volume drops by zone - shows where we're bleeding"),
+        ("Tab 10: Financial Impact", "Dollar projections - revenue and margin estimates for changes"),
+        ("Tab 11: Zone Stickiness", "Which zones keep customers engaged week after week")
+    ]
+    
+    for tab_name, description in tabs:
+        row = add_text(row, f"{tab_name}:", 1, bold=True)
+        row = add_text(row, description, 2)
+    row += 2
+    
+    # === SECTION 3: KEY TERMS ===
+    row = add_section_header(row, "KEY TERMS EXPLAINED (8TH GRADE LEVEL)", "📚")
+    
+    terms = [
+        ("Pricing Zone", "A number (0-4) that determines the price customers pay. Lower number = lower price."),
+        ("Combo", "A unique combination like 'Detroit + Seafood + CPA'. We recommend zones for each combo."),
+        ("Lapsed Customer", "Someone who USED TO buy this category but stopped. Still buying other stuff from us though!"),
+        ("YoY (Year-over-Year)", "Comparing this year to last year. Are we growing or shrinking?"),
+        ("Reactive Pricing", "❌ BAD: We charged too much → lost customers → panicked and dropped the zone."),
+        ("Green Flag Zone", "✅ GOOD: A zone where customers keep coming back week after week (75%+ consistency)."),
+        ("Volume at Stake", "Total pounds we could win back if we fix the pricing zones."),
+        ("Pounds CY/PY", "Current Year pounds vs Previous Year pounds. Shows if we're growing or losing volume."),
+        ("Last Invoice Date", "Last time this customer bought ANYTHING from us (not just this category)."),
+        ("Implementation Priority", "A score (1-100) that tells you which changes to make first.")
+    ]
+    
+    for term, definition in terms:
+        row = add_text(row, f"• {term}:", 1, bold=True)
+        row = add_text(row, definition, 2)
+    row += 2
+    
+    # === SECTION 4: WHAT TO DO NEXT ===
+    row = add_section_header(row, "WHAT TO DO NEXT (ACTION STEPS)", "✅")
+    
+    steps = [
+        ("STEP 1: Look at Tab 2 (Top 5 Moves)", "These are your highest-impact changes. Focus here first."),
+        ("STEP 2: Check Tab 3 (Recovery Opportunities)", "These are the easiest wins - customers who just need a better price to come back."),
+        ("STEP 3: Review Tab 10 (Financial Impact)", "See how much revenue and margin you'll gain from these changes."),
+        ("STEP 4: Make the changes in your system", "Implement the recommended zone changes for the top combos."),
+        ("STEP 5: Run this report again in 8 weeks", "See if the changes worked! Tab 6 will track your accuracy over time.")
+    ]
+    
+    for step, description in steps:
+        row = add_text(row, step, 1, bold=True)
+        row = add_text(row, description, 2)
+    row += 2
+    
+    row = add_callout_box(row, "⏱️ TIMELINE: Expect to see results in 4-8 weeks after making changes", light_yellow_fill)
+    row += 2
+    
+    # === SECTION 5: TRAFFIC LIGHT GUIDE ===
+    row = add_section_header(row, "TRAFFIC LIGHT GUIDE (WHAT THE COLORS MEAN)", "🚦")
+    
+    row = add_text(row, "Throughout this dashboard, we use colors to help you prioritize:", 1)
+    row += 1
+    
+    # Red box
+    ws.merge_cells(f"A{row}:H{row}")
+    cell = ws.cell(row, 1, value="🔴 RED = HIGH PRIORITY / URGENT - Do these first!")
+    cell.font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+    cell.fill = PatternFill(start_color=ACCENT_RED, end_color=ACCENT_RED, fill_type="solid")
+    cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[row].height = 25
+    row += 1
+    
+    # Yellow box
+    ws.merge_cells(f"A{row}:H{row}")
+    cell = ws.cell(row, 1, value="🟡 YELLOW = MEDIUM PRIORITY - Important but not urgent")
+    cell.font = Font(name="Calibri", size=12, bold=True, color="000000")  # ← BLACK text for yellow background
+    cell.fill = PatternFill(start_color=ACCENT_ORANGE, end_color=ACCENT_ORANGE, fill_type="solid")
+    cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[row].height = 25
+    row += 1
+    
+    # Green box
+    ws.merge_cells(f"A{row}:H{row}")
+    cell = ws.cell(row, 1, value="🟢 GREEN = GOOD / SUCCESS - Keep doing this!")
+    cell.font = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
+    cell.fill = PatternFill(start_color=ACCENT_GREEN, end_color=ACCENT_GREEN, fill_type="solid")
+    cell.alignment = Alignment(horizontal='center', vertical='center')
+    ws.row_dimensions[row].height = 25
+    row += 2
+    
+    # === SECTION 6: IMPORTANT RULES ===
+    row = add_section_header(row, "IMPORTANT RULES WE FOLLOW", "⚖️")
+    
+    rules = [
+        "✅ We NEVER suggest raising prices (going to a higher zone number)",
+        "✅ We NEVER suggest Zone 1 → Zone 0 without flagging it for fractional zones",
+        "✅ We only recommend changes that have strong historical data backing them",
+        "✅ We prioritize winning back LAPSED customers (stopped buying but still active)",
+        "✅ We flag REACTIVE pricing situations where data might be contaminated",
+        "✅ We focus on volume AND margin together (not just one or the other)"
+    ]
+    
+    for rule in rules:
+        row = add_text(row, rule, 1, bold=True)
+    row += 2
+    
+    # === SECTION 7: QUESTIONS? ===
+    row = add_section_header(row, "QUESTIONS?", "❓")
+    row = add_text(row, "If you have questions about this report or need help implementing changes:", 1)
+    row = add_text(row, "• Contact your Analytics team", 2)
+    row = add_text(row, "• Review the detailed tabs for more context", 2)
+    row = add_text(row, "• Run the report again after making changes to track progress", 2)
+    row += 2
+    
+    # === FINAL CALLOUT ===
+    row = add_callout_box(row, 
+        "🎉 YOU'RE READY! Go to Tab 2 (Top 5 Moves) and start winning back customers!",
+        light_green_fill)
+    
+    # ========================================
+    # IMPORTANT: Remove auto-filter from this sheet
+    # ========================================
+    if ws.auto_filter.ref:
+        ws.auto_filter.ref = None
+    
+    print("   ✅ HOW_TO_USE tab created with beautiful formatting!")
+    return ws
 
 def write_stakeholder_excel(recommendations: List[Dict], 
                            reactive_flags: Dict,
                            output_path: str,
                            learning_engine: Optional[LearningEngine] = None,
-                           optimization_engine: Optional['FoodserviceZoneEngine'] = None):
-    """Create Excel with YoY customer tracking."""
+                           optimization_engine: Optional['FoodserviceZoneEngine'] = None,
+                           historical_df: Optional[pd.DataFrame] = None,
+                           current_df: Optional[pd.DataFrame] = None):  
     
     from pandas import ExcelWriter
+    
+    print("\n📊 Creating stakeholder dashboard...")
+    print("   ⚙️  Formatting for immediate readability...")
+    
+    # ADD THESE DEBUG LINES:
+    print(f"\n🐛 DEBUG write_stakeholder_excel():")
+    print(f"   optimization_engine = {optimization_engine}")
+    print(f"   optimization_engine is None? {optimization_engine is None}")
+    if optimization_engine:
+        print(f"   Has current_df? {hasattr(optimization_engine, 'current_df')}")
+        if hasattr(optimization_engine, 'current_df'):
+            print(f"   current_df shape: {optimization_engine.current_df.shape}")
+    
     
     print("\n📊 Creating stakeholder dashboard...")
     print("   ⚙️  Formatting for immediate readability...")
@@ -2888,33 +3984,80 @@ def write_stakeholder_excel(recommendations: List[Dict],
     if optimization_engine and hasattr(optimization_engine, 'yoy_customer_metrics'):
         yoy_metrics = optimization_engine.yoy_customer_metrics
     
+    # Calculate summary stats for the guide
+    recommendations_count = len(recommendations)
+    high_priority_count = sum(1 for r in recommendations if r.get('recommendation_type') == 'HIGH_RECOVERY_POTENTIAL')
+    volume_at_stake = sum(r.get('total_volume', 0) for r in recommendations)
+    
     with ExcelWriter(output_path, engine='openpyxl') as writer:
         
         # ==========================================
-        # TAB 1: Executive Summary (with YoY!)
+        # CALCULATE FINANCIAL IMPACT FIRST (using current_df which has CY/PY data!)
+        # ==========================================
+        financial_summary = None
+        financial_df = None
+        
+        # Use current_df from the optimization_engine 
+        if current_df is not None and not current_df.empty and optimization_engine:
+            print("   💰 Calculating financial impact using current data (has CY/PY columns)...")
+            try:
+                financial_df, financial_summary = calculate_financial_impact(
+                    recommendations,
+                    current_df,  # ← NEW - use the parameter!
+                    optimization_engine.config
+                )
+                print(f"      ✅ Financial calculations complete!")
+                if financial_summary:
+                    print(f"      📊 Top 10 Expected Revenue (8wk): ${financial_summary.get('top10_revenue_8wk_expected', 0):,.0f}")
+                    print(f"      📊 Top 10 Expected Margin (8wk): ${financial_summary.get('top10_margin_8wk_expected', 0):,.0f}")
+            except Exception as e:
+                print(f"      ⚠️ Financial calculations failed: {e}")
+                import traceback
+                traceback.print_exc()
+                financial_summary = None
+                financial_df = None
+        else:
+            print("   ⚠️ Skipping financial calculations (no current_df)")  
+        
+        # ==========================================
+        # TAB 0: HOW_TO_USE (FIRST TAB - BEAUTIFUL!)
+        # ==========================================
+        print("   📄 Tab 0: HOW_TO_USE (Beautiful Guide)")
+        create_how_to_use_tab(writer, recommendations_count, high_priority_count, volume_at_stake)
+        
+        # ==========================================
+        # TAB 1: Executive Summary (WITH FINANCIAL DATA!)
         # ==========================================
         print("   📄 Tab 1: Executive Summary")
-        exec_summary = create_executive_summary(recommendations, yoy_metrics)
-        
+        if financial_summary:
+            print(f"      💰 Including financial projections in Executive Summary")
+        exec_summary = create_executive_summary(recommendations, yoy_metrics, reactive_flags, financial_summary, optimization_engine.config)
+
         # Convert to vertical layout
         exec_rows = [
-            {'Metric': 'Total Opportunities Found', 'Value': exec_summary['total_opportunities']},
-            {'Metric': 'High Priority Moves (Do This Week)', 'Value': exec_summary['high_priority_moves']},
-            {'Metric': 'Easy Wins - Lapsed Customer Recovery', 'Value': exec_summary['easy_wins_lapsed_recovery']},
-            {'Metric': 'Customers We Can Win Back', 'Value': exec_summary['customers_to_win_back']},
-            {'Metric': 'Total Volume at Stake', 'Value': exec_summary['total_volume_at_stake']},
+            {'Metric': 'Total Opportunities Found', 'Value': exec_summary['total_opportunities'].iloc[0]},
+            {'Metric': 'High Priority Moves (Do This Week)', 'Value': exec_summary['high_priority_moves'].iloc[0]},
+            {'Metric': 'Easy Wins - Lapsed Customer Recovery', 'Value': exec_summary['easy_wins_lapsed_recovery'].iloc[0]},
+            {'Metric': 'Fractional Zones Needed', 'Value': exec_summary['fractional_zones_needed'].iloc[0]},
+            {'Metric': 'Total Volume at Stake', 'Value': exec_summary['total_volume_at_stake'].iloc[0]},
+            {'Metric': 'Customers We Can Win Back', 'Value': exec_summary['customers_to_win_back'].iloc[0]},
             {'Metric': '', 'Value': ''},  # Spacer
             {'Metric': 'YEAR-OVER-YEAR CUSTOMER METRICS', 'Value': ''},
-            {'Metric': 'Distinct Customers This Year', 'Value': exec_summary.get('distinct_customers_this_year', 'N/A')},
-            {'Metric': 'Distinct Customers Last Year', 'Value': exec_summary.get('distinct_customers_last_year', 'N/A')},
-            {'Metric': 'Customer Change', 'Value': exec_summary.get('customer_change_count', 'N/A')},
-            {'Metric': 'Customer Change %', 'Value': exec_summary.get('customer_change_percent', 'N/A')},
-            {'Metric': 'Customer Retention Rate', 'Value': exec_summary.get('customer_retention_rate', 'N/A')},
-            {'Metric': 'New Customers Gained', 'Value': exec_summary.get('new_customers_gained', 'N/A')},
-            {'Metric': 'Customers Lost', 'Value': exec_summary.get('customers_lost', 'N/A')},
+            {'Metric': 'Distinct Customers This Year', 'Value': exec_summary.get('distinct_customers_this_year', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Distinct Customers Last Year', 'Value': exec_summary.get('distinct_customers_last_year', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Customers Retained', 'Value': exec_summary.get('customers_retained', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'New Customers Gained', 'Value': exec_summary.get('new_customers_gained', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Customers Lost', 'Value': exec_summary.get('customers_lost', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Customer Change', 'Value': exec_summary.get('customer_change_count', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Customer Change %', 'Value': exec_summary.get('customer_change_percent', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Customer Retention Rate', 'Value': exec_summary.get('customer_retention_rate', pd.Series(['N/A'])).iloc[0]},
             {'Metric': '', 'Value': ''},  # Spacer
-            {'Metric': 'Expected Timeframe for Results', 'Value': exec_summary['expected_timeframe']},
-            {'Metric': 'First Action to Take', 'Value': exec_summary['first_action']}
+            {'Metric': 'Scope', 'Value': exec_summary['scope'].iloc[0]},
+            {'Metric': 'YoY Lookback Window', 'Value': exec_summary['yoy_lookback_window'].iloc[0]},
+            {'Metric': 'Comparison Period', 'Value': exec_summary['yoy_comparison_period'].iloc[0]},
+            {'Metric': '', 'Value': ''},  # Spacer
+            {'Metric': 'Expected Timeframe for Results', 'Value': exec_summary['expected_timeframe'].iloc[0]},
+            {'Metric': 'First Action to Take', 'Value': exec_summary['first_action'].iloc[0]}
         ]
         exec_df = pd.DataFrame(exec_rows)
         exec_df.to_excel(writer, sheet_name='1_EXECUTIVE_SUMMARY', index=False)
@@ -2968,20 +4111,18 @@ def write_stakeholder_excel(recommendations: List[Dict],
         # ==========================================
         print("   📄 Tab 7: All Recommendations (detailed)")
         all_recs = pd.DataFrame(recommendations)
-        
-        # Select key columns only
+
         key_cols = [
             'company_name', 'cuisine', 'attribute_group', 'current_zone',
             'recommended_zone', 'recommendation_type', 'stakeholder_message',
             'expected_result', 'timeline', 'risk_level', 'total_volume',
             'lapsed_customers', 'implementation_priority'
         ]
-        
+
         display_cols = [col for col in key_cols if col in all_recs.columns]
         if display_cols:
             all_recs_display = all_recs[display_cols].copy()
             
-            # Simplify column names
             all_recs_display.columns = [
                 'OpCo', 'Cuisine', 'Attribute Group', 'Current Zone',
                 'Recommended Zone', 'Type', 'Explanation',
@@ -2989,17 +4130,44 @@ def write_stakeholder_excel(recommendations: List[Dict],
                 'Lapsed Customers', 'Priority Score'
             ]
             
+            # Sort by Volume descending
+            all_recs_display = all_recs_display.sort_values('Volume (lbs)', ascending=False)
+            
             all_recs_display.to_excel(writer, sheet_name='7_ALL_RECOMMENDATIONS', index=False)
             
+            # ADD NOTE about Priority Score
+            ws = writer.sheets['7_ALL_RECOMMENDATIONS']
+            note_col = 14  # Column N (next to M which is Priority Score)
+            
+            ws.cell(1, note_col, value="ℹ️ HOW PRIORITY SCORE IS CALCULATED:")
+            ws.cell(1, note_col).font = Font(bold=True, size=10, color="0066CC")
+            
+            ws.cell(2, note_col, value="Score (0-100) combines:")
+            ws.cell(3, note_col, value="• Volume at stake (40%)")
+            ws.cell(4, note_col, value="• Lapsed customers (30%)")
+            ws.cell(5, note_col, value="• Recovery potential (20%)")
+            ws.cell(6, note_col, value="• Risk level (10%)")
+            ws.cell(7, note_col, value="Higher score = Do this first!")
+            
+            for i in range(2, 8):
+                ws.cell(i, note_col).font = Font(size=9)
+                ws.cell(i, note_col).alignment = Alignment(wrap_text=True, vertical='top')
+            
+            # Make column N wider
+            ws.column_dimensions['N'].width = 35
+                    
         # ==========================================
-        # TAB 8: YoY Customer Tracking (NEW!)
+        # TAB 8: YoY Customer Tracking 
         # ==========================================
         if yoy_metrics:
             print("   📄 Tab 8: Year-over-Year Customer Tracking")
             yoy_dashboard = create_yoy_customer_dashboard(yoy_metrics)
             if not yoy_dashboard.empty:
+                # ✅ SORT by Lost Customers descending
+                if 'Customers_Lost' in yoy_dashboard.columns:
+                    yoy_dashboard = yoy_dashboard.sort_values('Customers_Lost', ascending=False)
                 yoy_dashboard.to_excel(writer, sheet_name='8_YOY_CUSTOMERS', index=False)
-        
+                
         # ==========================================
         # TAB 9: Zone Stickiness Report
         # ==========================================
@@ -3008,8 +4176,72 @@ def write_stakeholder_excel(recommendations: List[Dict],
                 print("   📄 Tab 9: Zone Stickiness Report")
                 stickiness = create_zone_stickiness_report(optimization_engine.consistency_analysis)
                 if not stickiness.empty:
+                    # Debug: print column names to see exact spelling
+                    print(f"      Stickiness columns: {list(stickiness.columns)}")
+                    
+                    # Try to find the Consistent Buyers column (might have different name)
+                    consistent_col = None
+                    for col in stickiness.columns:
+                        if 'consistent' in col.lower() and 'buyer' in col.lower():
+                            consistent_col = col
+                            break
+                    
+                    # Sort by Consistent Buyers descending
+                    if consistent_col:
+                        stickiness = stickiness.sort_values(consistent_col, ascending=False)
+                        print(f"      ✅ Sorted by '{consistent_col}' descending")
+                    else:
+                        print(f"      ⚠️ Could not find Consistent Buyers column")
+                    
                     stickiness.to_excel(writer, sheet_name='9_ZONE_STICKINESS', index=False)
-                
+                    
+                    # ADD NOTE about what Stickiness means
+                    ws = writer.sheets['9_ZONE_STICKINESS']
+                    note_col = stickiness.shape[1] + 2  # Two columns after last data column
+                    
+                    ws.cell(1, note_col, value="ℹ️ WHAT IS ZONE STICKINESS?")
+                    ws.cell(1, note_col).font = Font(bold=True, size=11, color="0066CC")
+                    
+                    ws.cell(2, note_col, value="'Consistent Buyers' = Customers who buy")
+                    ws.cell(3, note_col, value="in 75%+ of weeks")
+                    ws.cell(4, note_col, value="")
+                    ws.cell(5, note_col, value="HIGH (>75%) = GOOD!")
+                    ws.cell(6, note_col, value="Price is right, customers loyal")
+                    ws.cell(7, note_col, value="")
+                    ws.cell(8, note_col, value="LOW (<50%) = WARNING!")
+                    ws.cell(9, note_col, value="Customers sporadic, may shop around")
+                    ws.cell(10, note_col, value="")
+                    ws.cell(11, note_col, value="Use this to validate GREEN FLAG zones")
+                    
+                    for i in range(2, 12):
+                        ws.cell(i, note_col).font = Font(size=10)
+                        ws.cell(i, note_col).alignment = Alignment(wrap_text=True, vertical='top')
+                    
+                    # Make note column wider
+                    col_letter = ws.cell(1, note_col).column_letter
+                    ws.column_dimensions[col_letter].width = 40
+        # ==========================================
+        # TAB 10: Volume Decline Analysis 
+        # ==========================================
+        print("   📄 Tab 10: Volume Decline by Combo + Zone")
+        volume_declines = create_volume_decline_dashboard(
+            historical_df if historical_df is not None else current_df, 
+            optimization_engine.config,
+            top_n=50  # Show top 50 worst performers
+        )
+        if not volume_declines.empty:
+            volume_declines.to_excel(writer, sheet_name='10_VOLUME_DECLINES', index=False)
+
+        # ==========================================
+        # TAB 10: Financial Impact (NEEDS historical_df!)
+        # ==========================================
+        if financial_df is not None and not financial_df.empty:
+            print("   📄 Tab 1: Financial Impact Projections")
+            financial_display = create_financial_impact_dashboard(financial_df, financial_summary)
+            financial_display.to_excel(writer, sheet_name='11_FINANCIAL_IMPACT', index=False)
+        else:
+            print("   ⚠️ Skipping Tab 1: No financial data available")
+        
         # ==========================================
         # Apply formatting to ALL sheets
         # ==========================================
@@ -3019,6 +4251,68 @@ def write_stakeholder_excel(recommendations: List[Dict],
     print(f"   ✅ Dashboard complete and ready to open!")
     print(f"   📁 Saved to: {output_path}")
 
+
+# ========================================
+# NOTE: You'll also need to update create_executive_summary_tab()
+# ========================================
+# Make sure your create_executive_summary_tab function signature looks like this:
+#
+# def create_executive_summary_tab(recommendations, yoy_metrics, reactive_flags, financial_summary=None):
+#     """Create executive summary with optional financial projections."""
+#     # ... your existing code ...
+#     
+#     # Add section for financial summary if available:
+#     if financial_summary:
+#         summary_dict['Expected_Revenue_Lift_8wk'] = financial_summary.get('expected_revenue_8wk', 0)
+#         summary_dict['Expected_Margin_Lift_8wk'] = financial_summary.get('expected_margin_8wk', 0)
+#         summary_dict['Expected_Revenue_Annual'] = financial_summary.get('expected_revenue_annual', 0)
+#         summary_dict['Expected_Margin_Annual'] = financial_summary.get('expected_margin_annual', 0)
+#     
+#     return pd.DataFrame([summary_dict])
+
+
+# ========================================
+# IMPORTANT: HOW TO CALL THIS FUNCTION
+# ========================================
+# In your main run_foodservice_analysis() function:
+#
+# write_stakeholder_excel(
+#     recommendations, 
+#     reactive_flags, 
+#     excel_path, 
+#     learning_engine, 
+#     engine,
+#     historical_df=historical_df  # ← KEEP THIS! Will be None on first run, that's OK!
+# )
+#
+# On FIRST RUN: historical_df is None, but financial calcs still work (uses current_df)
+# On FUTURE RUNS: historical_df has data, learning tracker works
+
+
+# ========================================
+# TROUBLESHOOTING: If financial data isn't showing
+# ========================================
+# 1. Check console output - it should print:
+#    "💰 Calculating financial impact using current data (has CY/PY columns)..."
+#    "✅ Financial calculations complete!"
+#    "💰 Including financial projections in Executive Summary"
+#
+# 2. If you see "⚠️ Skipping financial calculations", then optimization_engine.current_df doesn't exist
+#
+# 3. Make sure your current_df has these columns (normalized names):
+#    - Net_Sales_CY and Net_Sales_PY
+#    - Margin_CY and Margin_PY
+#    - Pounds_CY and Pounds_PY
+#
+# 4. Make sure the keys match what you're expecting in create_executive_summary_tab():
+#    financial_summary should have keys like:
+#    - 'top10_revenue_8wk_expected'
+#    - 'top10_margin_8wk_expected'
+#    - 'all_revenue_annual_expected'
+#    etc.
+#
+# 5. The calculate_financial_impact() function should use the CY/PY columns
+#    from current_df (which has both years of data in one file!)
 
 def create_comparison_export(recommendations: List[Dict], 
                              output_path: str,
@@ -3267,7 +4561,24 @@ def run_foodservice_zone_optimization(
     )
     
     # Write Excel (with perfect formatting)
-    write_stakeholder_excel(recommendations, reactive_flags, excel_path, learning_engine, engine)
+    write_stakeholder_excel(recommendations, reactive_flags, excel_path, learning_engine, engine, historical_df, current_df)                                                                                                        
+
+    # ==========================================
+    # GENERATE LEADS FILE (if enabled)
+    # ==========================================
+    if config.GENERATE_LEADS_FILE:
+        print("\n" + "="*50)
+        print("🎯 GENERATING SALES LEADS FILE")
+        print("="*50)
+        
+        leads_df = generate_high_value_leads(
+            recommendations=recommendations,
+            current_df=current_df,
+            config=config,
+            output_path=config.LEADS_OUTPUT_PATH
+        )
+        
+        print(f"\n✅ Leads file ready for FinalCat.py: {config.LEADS_OUTPUT_PATH}")
     
     # Create comparison export
     create_comparison_export(recommendations, comparison_path, learning_engine)
@@ -3279,14 +4590,14 @@ def run_foodservice_zone_optimization(
     
     exec_summary = create_executive_summary(recommendations)
     print(f"\n📈 KEY FINDINGS:")
-    print(f"   • Total Opportunities: {exec_summary['total_opportunities']}")
-    print(f"   • High Priority Moves: {exec_summary['high_priority_moves']}")
-    print(f"   • Easy Wins (Lapsed Recovery): {exec_summary['easy_wins_lapsed_recovery']}")
-    print(f"   • Volume at Stake: {exec_summary['total_volume_at_stake']}")
-    print(f"   • Customers to Win Back: {exec_summary['customers_to_win_back']:,}")
+    print(f"   • Total Opportunities: {exec_summary['total_opportunities'].iloc[0]}")
+    print(f"   • High Priority Moves: {exec_summary['high_priority_moves'].iloc[0]}")
+    print(f"   • Easy Wins (Lapsed Recovery): {exec_summary['easy_wins_lapsed_recovery'].iloc[0]}")
+    print(f"   • Volume at Stake: {exec_summary['total_volume_at_stake'].iloc[0]}")
+    print(f"   • Customers to Win Back: {exec_summary['customers_to_win_back'].iloc[0]:,}")
     print(f"\n🎯 FIRST ACTION:")
-    print(f"   {exec_summary['first_action']}")
-    print(f"\n📅 EXPECTED TIMEFRAME: {exec_summary['expected_timeframe']}")
+    print(f"   {exec_summary['first_action'].iloc[0]:}")
+    print(f"\n📅 EXPECTED TIMEFRAME: {exec_summary['expected_timeframe'].iloc[0]:}")
     
     print(f"\n📁 FILES CREATED:")
     print(f"   • Dashboard: {excel_path}")
