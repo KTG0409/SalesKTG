@@ -2243,8 +2243,7 @@ class FoodserviceZoneEngine:
                     'implementation_priority': 85
                 })
 
-            elif reactive_rate >= 0.20 and current_zone > optimal_zone:
-                # ✅ ADD: For high consistency zones, require STRONGER reactive evidence
+            elif not is_reactive and reactive_rate >= 0.20 and current_zone > optimal_zone:
                 min_reactive_threshold = 0.30 if high_consistency_zone else 0.20
                 
                 if reactive_rate >= min_reactive_threshold:
@@ -2327,7 +2326,7 @@ class FoodserviceZoneEngine:
         # Aggregate performance by zone
         zone_perf = hist.groupby(self.config.data_config.zone_column).agg({
             'Pounds_CY': 'sum',
-            'Computer Margin $ Per LB CY': 'mean',  # ✅ ADD MARGIN
+            'Computer Margin $ Per LB CY': 'mean',
             'Customer_Status': [
                 lambda x: (x == 'ACTIVE_BUYER').mean(),
                 lambda x: (x == 'LAPSED_FROM_CATEGORY').mean()
@@ -2352,7 +2351,19 @@ class FoodserviceZoneEngine:
         
         # Normalize each metric to 0-1 scale
         zone_perf['Volume_Norm'] = zone_perf['Total_Volume'] / zone_perf['Total_Volume'].max()
-        zone_perf['Margin_Norm'] = zone_perf['Avg_Margin'] / zone_perf['Avg_Margin'].max()  # ✅ ADD THIS
+        
+        # ✅ IMPROVED: Safely handle negative/zero margins
+        max_margin = zone_perf['Avg_Margin'].max()
+        min_margin = zone_perf['Avg_Margin'].min()
+        
+        if max_margin > min_margin:  # Has variation
+            # Min-max scaling (handles negatives correctly)
+            zone_perf['Margin_Norm'] = (
+                (zone_perf['Avg_Margin'] - min_margin) / (max_margin - min_margin)
+            )
+        else:  # All margins are the same
+            zone_perf['Margin_Norm'] = 0.5  # Neutral score
+        
         zone_perf['Active_Norm'] = zone_perf['Active_Rate']
         zone_perf['GreenFlag_Norm'] = zone_perf['green_flag_rate']
         zone_perf['Retention_Norm'] = 1 - zone_perf['Lapse_Rate']
@@ -2360,7 +2371,7 @@ class FoodserviceZoneEngine:
         # Weighted scoring: Volume 50%, Margin 25%, Quality 25%
         zone_perf['Score'] = (
             zone_perf['Volume_Norm'] * 0.50 +       # Volume: 50%
-            zone_perf['Margin_Norm'] * 0.25 +       # Margin: 25% ✅ ADDED
+            zone_perf['Margin_Norm'] * 0.25 +       # Margin: 25%
             zone_perf['Active_Norm'] * 0.10 +       # Active: 10%
             zone_perf['GreenFlag_Norm'] * 0.10 +    # Green Flag: 10%
             zone_perf['Retention_Norm'] * 0.05      # Retention: 5%
@@ -2372,7 +2383,7 @@ class FoodserviceZoneEngine:
         if best_zone > current_zone:
             return current_zone
         
-        return best_zone  # ✅ Return the best zone found
+        return best_zone
 # ============================================================================
 # DASHBOARD GENERATORS
 # ============================================================================
