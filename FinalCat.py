@@ -130,41 +130,45 @@ def send_email_with_attachments(subject: str, body: str, attachments: list[str])
 BASE_PATH = r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis"
 
 DEFAULTS = {
-    "source": None,  # ← Or leave as None since Power Automate will always provide it
+    "source": None,
     "alignment": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Config\Shrimp_Prawns\Alignment550.csv",
     "outdir": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Outputs\Shrimp_Prawns",
     "watch_dir": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\SBC Analytics - Category Analysis\Category_Inputs\Shrimp_Prawns",
-
     
     # SITE FILTERING 
-    "company": '',  # ← Confirm: Site 37 only? Or None for all sites?
+    "company": '',
     
     # Category filtering
-    "attr_groups": None,  # All categories in the 550 file
-    "vendors": None,  # All vendors
+    "attr_groups": None,
+    "attr_groups": None,
+    "vendors": None,
     
-    # Forecast method for weekly projections
+    # Forecast method
     "forecast_method": "linear",
     
-    # ========== SALES LEADS CONFIGURATION ==========
-    "leads_company": None,  # Uses company filter above (Site 37)
-    "leads_acct_types": 'TRS,LCC',  # TRS + LCC accounts
-    "min_ytd_per_week": 20,  # 20 lbs/week minimum
+    # Sales leads config...
+    "leads_company": None,
+    "leads_acct_types": 'TRS,LCC',
+    "min_ytd_per_week": 20,
     
-    # ========== VENDOR LEAD SPLITS CONFIGURATION ==========
-    "vendor_leads_active": "Y",  # Yes, create vendor CSVs
-    "vendor_leads_respect_site_filter": "N",  # Vendors see ALL sites (not just 37)
+    # Vendor leads config...
+    "vendor_leads_active": "Y",
+    "vendor_leads_respect_site_filter": "N",
     
-    # ========== WIN-BACK TARGETS CONFIGURATION ==========
-    "active_customer_weeks": 8,  # 8 weeks = "active"
+    # Win-back targets...
+    "active_customer_weeks": 8,
     
-    # ========== PRESENTATION CONFIGURATION ==========
-    "create_powerpoint": "Y",  # Yes, create PowerPoint
-    "ppt_top_n_targets": 10,  # Top 10 targets on slide
-
-    # ========== TERRITORY ROUTES ==========
+    # Presentation...
+    "create_powerpoint": "Y",
+    "ppt_top_n_targets": 10,
+    
+    # Territory routes...
     "create_territory_routes": "Y",
     "territory_routes_top_n_dsms": 10,
+    
+    # ========== PRICE ZONE LEADS (NEW!) ==========
+    "use_price_zone_leads": "N",  # ← Set to "Y" to enable
+    "price_zone_leads_path": r"C:\Users\kmor6669\OneDrive - Sysco Corporation\Desktop\Pricing\leads_guide.csv",
 }
 
 # ---------------------------- Config Loader ----------------------------
@@ -454,6 +458,50 @@ def load_and_prepare(source_path, alignment_path, company=None, attr_groups=None
     g["IsAlignedItem"] = (g.get("Item Number", "").map(_clean_str) == g["SUPC"].map(_clean_str)).astype(int)
     g["IsAlignedVendor"] = (g.get("True Vendor Number", "").map(_clean_str) == g["SUVC"].map(_clean_str)).astype(int)
 
+    # ==========================================
+    # EXTRACT PRICE ZONE SUFFIX (NEW!)
+    # ==========================================
+    if 'Price Zone ID' in g.columns:
+        print("   🔧 Extracting zone suffix from Price Zone ID...")
+        
+        # Format: "001-1" where 001=company, 1=zone
+        g['Zone_Suffix'] = g['Price Zone ID'].astype(str).str.split('-').str[-1]
+        g['Zone_Suffix_Numeric'] = pd.to_numeric(g['Zone_Suffix'], errors='coerce')
+        
+        print(f"      ✅ Extracted zones: {g['Zone_Suffix_Numeric'].nunique()} unique zones")
+    else:
+        print("   ⚠️  'Price Zone ID' column not found - zone analysis unavailable")
+        g['Zone_Suffix_Numeric'] = None
+    
+    # ==========================================
+    # CREATE COMPANY COMBO KEY (NEW!)
+    # Must match PZone format for merging
+    # ==========================================
+    if 'Company Name' in g.columns and 'Attribute Group ID' in g.columns:
+        print("   🔧 Creating Company_Combo_Key...")
+        
+        # Get company prefix from alignment (same logic as PZone)
+        # Assuming you have "Sysco Company Prefix Code" or similar
+        if 'Sysco Company Prefix Code' in g.columns:
+            g['Company_Prefix'] = g['Sysco Company Prefix Code'].astype(str).str.strip()
+        else:
+            # Fallback: use first 3 chars of Company Name
+            g['Company_Prefix'] = g['Company Name'].astype(str).str[:3].str.upper()
+        
+        # Create combo key: CompanyName_AttributeGroup_Prefix
+        # Example: "Detroit_CD Bar & Grill_538_CPA"
+        g['Company_Combo_Key'] = (
+            g['Company Name'].astype(str).str.strip() + '_' +
+            g.get('NPD Cuisine Type', g.get('Customer Account Type Code', '')).astype(str).str.strip() + '_' +
+            g['Attribute Group ID'].astype(str).str.strip() + '_' +
+            g['Company_Prefix'].astype(str).str.strip()
+        )
+        
+        print(f"      ✅ Created combo keys: {g['Company_Combo_Key'].nunique()} unique combos")
+    else:
+        print("   ⚠️  Cannot create Company_Combo_Key - missing required columns")
+        g['Company_Combo_Key'] = None
+    
     return g, vendors
 
 def compute_windows(df):
