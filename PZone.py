@@ -1219,17 +1219,14 @@ def track_customer_zone_journeys(df: pd.DataFrame, config: FoodserviceConfig) ->
                     'evidence': best_change['evidence'],
                     'zone_transitions': len(zone_changes)
                 })
-        
-        # Check if currently lapsed (using weeks)
-        weeks_since_purchase = max_week - last_purchase_week
-        
-        if weeks_since_purchase >= 8:
-            # Still active buyer elsewhere? (they bought something recently overall)
-            # This would need overall Last Invoice Date across all categories
-            # For now, just flag as lapsed
-            if journey_records:  # If we have records for this customer
-                journey_records[-1]['customer_type'] = 'RED_FLAG_LAPSED_ACTIVE_ELSEWHERE'
-                journey_records[-1]['alert'] = f"Lapsed from category {int(weeks_since_purchase)} weeks ago"
+                
+                # ✅ MOVED INSIDE: Check if currently lapsed (only for records we just appended)
+                weeks_since_purchase = max_week - last_purchase_week
+                
+                if weeks_since_purchase >= 8:
+                    # Update the record we JUST appended (guaranteed to be this customer)
+                    journey_records[-1]['customer_type'] = 'RED_FLAG_LAPSED_ACTIVE_ELSEWHERE'
+                    journey_records[-1]['alert'] = f"Lapsed from category {int(weeks_since_purchase)} weeks ago"
     
     journey_df = pd.DataFrame(journey_records)
     
@@ -2384,6 +2381,115 @@ class FoodserviceZoneEngine:
             return current_zone
         
         return best_zone
+    
+# ============================================================================
+# TERRITORY SCORING (NEW!)
+# ============================================================================
+def apply_territory_relative_scoring(recommendations: List[Dict]) -> List[Dict]:
+    """
+    Score recommendations relative to each territory (OpCo).
+    
+    8th Grade Explanation:
+    "A 400 lb opportunity is 'small' for Detroit but 'huge' for Arkansas.
+    This function ranks each recommendation within its own territory so every
+    sales rep knows what THEIR top priorities are."
+    """
+    
+    print("\n📊 Applying territory-relative scoring...")
+    
+    if not recommendations:
+        return recommendations
+    
+    # Group by territory (OpCo)
+    by_territory = {}
+    for rec in recommendations:
+        territory = rec['company_name']
+        if territory not in by_territory:
+            by_territory[territory] = []
+        by_territory[territory].append(rec)
+    
+    print(f"   📍 Found {len(by_territory)} unique territories")
+    
+    # Score within each territory
+    for territory, territory_recs in by_territory.items():
+        
+        if not territory_recs:
+            continue
+        
+        # Find max values IN THIS TERRITORY
+        max_volume = max(r['total_volume'] for r in territory_recs)
+        max_customers = max(r['total_customers'] for r in territory_recs)
+        max_lapsed = max(r['lapsed_customers'] for r in territory_recs)
+        
+        # Calculate percentiles within territory
+        for rec in territory_recs:
+            
+            # Volume percentile (0-1)
+            rec['territory_volume_pct'] = (
+                rec['total_volume'] / max_volume if max_volume > 0 else 0
+            )
+            
+            # Customer percentile (0-1)
+            rec['territory_customer_pct'] = (
+                rec['total_customers'] / max_customers if max_customers > 0 else 0
+            )
+            
+            # Lapsed customer percentile (0-1)
+            rec['territory_lapsed_pct'] = (
+                rec['lapsed_customers'] / max_lapsed if max_lapsed > 0 else 0
+            )
+            
+            # Combined territory priority (weighted average)
+            rec['territory_priority_score'] = (
+                rec['territory_volume_pct'] * 0.40 +      # 40% volume
+                rec['territory_customer_pct'] * 0.30 +    # 30% customers
+                rec['territory_lapsed_pct'] * 0.30        # 30% recovery potential
+            )
+            
+            # Assign territory-specific flags
+            if rec['territory_priority_score'] >= 0.75:
+                rec['territory_flag'] = '🎯 TOP PRIORITY'
+                rec['territory_rank'] = 'TOP 25%'
+                rec['rep_guidance'] = f"Your #1 opportunity in {territory} - do this first!"
+                
+            elif rec['territory_priority_score'] >= 0.50:
+                rec['territory_flag'] = '⭐ MEDIUM PRIORITY'
+                rec['territory_rank'] = 'TOP 50%'
+                rec['rep_guidance'] = f"Solid opportunity for your territory"
+                
+            elif rec['territory_priority_score'] >= 0.25:
+                rec['territory_flag'] = '📦 BUNDLE'
+                rec['territory_rank'] = 'TOP 75%'
+                rec['rep_guidance'] = f"Mention while visiting for higher priorities"
+                
+            else:
+                rec['territory_flag'] = '⏸️ DEFER'
+                rec['territory_rank'] = 'BOTTOM 25%'
+                rec['rep_guidance'] = f"Focus on bigger wins in your territory first"
+            
+            # Add context for small territories
+            territory_size = len(territory_recs)
+            if territory_size <= 3:
+                rec['territory_context'] = f"⚠️ Small territory ({territory_size} opportunities total) - every move matters!"
+            elif territory_size >= 10:
+                rec['territory_context'] = f"📊 Large territory ({territory_size} opportunities) - focus on top 25%"
+            else:
+                rec['territory_context'] = f"Territory has {territory_size} total opportunities"
+    
+    # Sort by territory priority within each territory
+    sorted_recs = []
+    for territory in sorted(by_territory.keys()):
+        territory_recs = by_territory[territory]
+        territory_recs.sort(key=lambda x: x['territory_priority_score'], reverse=True)
+        sorted_recs.extend(territory_recs)
+    
+    print(f"   ✅ Territory scoring complete")
+    print(f"   📊 Breakdown by territory:")
+    for territory, recs in by_territory.items():
+        top_priority = sum(1 for r in recs if r['territory_flag'] == '🎯 TOP PRIORITY')
+        print(f"      • {territory}: {len(recs)} opportunities ({top_priority} top priority)")
+    
+    return sorted_recs
 # ============================================================================
 # DASHBOARD GENERATORS
 # ============================================================================
@@ -2406,8 +2512,7 @@ def create_dashboard_guide() -> pd.DataFrame:
         {'Section': 'Step 1', 'Content': 'Start with Tab 1 (EXECUTIVE_SUMMARY) to see the big picture'},
         {'Section': 'Step 2', 'Content': 'Review Tab 2 (TOP_5_MOVES) - these are your quick wins to implement first'},
         {'Section': 'Step 3', 'Content': 'Check Tab 10 (FINANCIAL_IMPACT) to see the dollar value of each move'},
-        {'Section': 'Step 4', 'Content': 'Use Tab 5 (TIMELINE) to plan your implementation schedule'},
-        {'Section': 'Step 5', 'Content': 'Track progress using Tab 8 (YOY_CUSTOMERS) in your next run'},
+        {'Section': 'Step 4', 'Content': 'Track progress using Tab 8 (YOY_CUSTOMERS) in your next run'},
         {'Section': '', 'Content': ''},
         
         {'Section': 'TAB-BY-TAB GUIDE', 'Content': ''},
@@ -2421,14 +2526,20 @@ def create_dashboard_guide() -> pd.DataFrame:
         {'Section': 'Action', 'Content': 'Share this page in executive meetings to show the scale of opportunity'},
         {'Section': '', 'Content': ''},
         
-        {'Section': 'Tab 2: TOP_5_MOVES', 'Content': ''},
-        {'Section': 'What it shows', 'Content': 'The 5 highest-priority zone changes ranked by impact and ease of implementation'},
-        {'Section': 'Key columns explained', 'Content': '"Move_To_Zone" = The zone we recommend changing TO (always equals or lower than current - we never suggest price increases without approval)'},
-        {'Section': '', 'Content': '"YoY_Customer_Change" = How many customers we gained/lost in the last 8 weeks vs same period last year (negative = losing customers)'},
-        {'Section': '', 'Content': '"Problem" = Why this needs fixing in plain English'},
-        {'Section': '', 'Content': '"Expected_Result" = What we predict will happen (conservative estimate based on historical patterns)'},
-        {'Section': '', 'Content': '"Timeline" = How fast you\'ll see results (⚡ 2-4 weeks = quick wins, 📅 4-6 weeks = standard)'},
-        {'Section': 'Action', 'Content': 'Implement these 5 moves first. They have the best chance of quick wins.'},
+        {'Section': 'Tab 2: WAR_ROOM', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'All-in-one dashboard for your pricing meeting. Everything you need on one screen: executive summary, top 10 actions, timeline, territory breakdown, and risk flags.'},
+        {'Section': 'Key sections explained', 'Content': 'Section 1: AT A GLANCE - Quick KPIs (opportunities, volume at stake, YoY customer trends)'},
+        {'Section': '', 'Content': 'Section 2: TOP 10 IMMEDIATE ACTIONS - What to implement this week, with zone moves, impact, and YoY customer changes'},
+        {'Section': '', 'Content': 'Section 3: IMPLEMENTATION TIMELINE - Week-by-week plan (Week 1-2: high-recovery moves, Week 3-4: monitor, Week 5-8: reactive corrections)'},
+        {'Section': '', 'Content': 'Section 4: TERRITORY BREAKDOWN - Which sales reps need to act and how many opportunities they have'},
+        {'Section': '', 'Content': 'Section 5: RISK FLAGS - Reactive pricing patterns, low stickiness zones, and declining territories to watch'},
+        {'Section': 'Why use this', 'Content': 'Instead of flipping through 11 tabs, run your pricing meeting from this ONE tab. Print it or share your screen - everything is here.'},
+        {'Section': 'Key columns in Top 10 table', 'Content': '"Zone Move" = Z3→Z2 means drop from Zone 3 to Zone 2 (we never suggest price increases)'},
+        {'Section': '', 'Content': '"Impact" = Volume at stake + how many lapsed customers (e.g. "5,816 lbs, 26 lapsed")'},
+        {'Section': '', 'Content': '"YoY Customers" = Change in last 8 weeks vs same period last year (negative = losing customers)'},
+        {'Section': '', 'Content': '"Zone Health" = 🟢 HIGH = sticky customers buy consistently | 🔴 LOW = customers sporadic'},
+        {'Section': '', 'Content': '"Action" = ✅ Execute now (proven), 🧪 Test (unproven), ⚠️ Fix overpricing, 📊 Standard move'},
+        {'Section': 'Action', 'Content': 'Use this tab for your weekly pricing meetings. Review Top 10, assign territories to reps, monitor risks.'},
         {'Section': '', 'Content': ''},
         
         {'Section': 'Tab 3: RECOVERY_OPPORTUNITIES', 'Content': ''},
@@ -2446,44 +2557,39 @@ def create_dashboard_guide() -> pd.DataFrame:
         {'Section': 'Action', 'Content': 'Be skeptical of these zones. Test the middle ground between high/low.'},
         {'Section': '', 'Content': ''},
         
-        {'Section': 'Tab 5: TIMELINE', 'Content': ''},
-        {'Section': 'What it shows', 'Content': 'Week-by-week implementation plan'},
-        {'Section': 'How to use', 'Content': 'Week 1-2: Make the changes. Week 3-4: Monitor early results. Week 5-8: Measure full impact. Week 8+: Run this analysis again to see what worked.'},
-        {'Section': '', 'Content': ''},
-        
-        {'Section': 'Tab 6: LEARNING_TRACKER', 'Content': ''},
-        {'Section': 'What it shows', 'Content': 'Tracks recommendations over time so the system learns what works'},
-        {'Section': 'Note', 'Content': 'This will be empty on first run. After you implement recommendations and re-run the analysis, this tab shows which predictions were accurate.'},
-        {'Section': '', 'Content': ''},
-        
-        {'Section': 'Tab 7: ALL_RECOMMENDATIONS', 'Content': ''},
+        {'Section': 'Tab 5: ALL_RECOMMENDATIONS', 'Content': ''},
         {'Section': 'What it shows', 'Content': 'Complete list of all recommended zone changes, sorted by priority'},
         {'Section': 'How to use', 'Content': 'After implementing Top 5, come here to see what to do next. Lower priority moves = smaller impact but still worth doing over time.'},
         {'Section': '', 'Content': ''},
         
-        {'Section': 'Tab 8: YOY_CUSTOMERS', 'Content': ''},
+        {'Section': 'Tab 6: YOY_CUSTOMERS', 'Content': ''},
         {'Section': 'What it shows', 'Content': 'Year-over-year customer counts by combo (NOT by zone). Shows which categories are growing or shrinking overall.'},
         {'Section': 'Important note', 'Content': 'This compares the LAST 8 WEEKS this year vs SAME 8 WEEKS last year. It\'s not the full year. Use this to spot trends.'},
         {'Section': 'Key columns', 'Content': '"Retained_Customers" = Bought in both years (good!). "New_Customers" = Bought this year but not last year (growth!). "Lost_Customers" = Bought last year but not this year (problem!).'},
         {'Section': '', 'Content': ''},
         
-        {'Section': 'Tab 9: VOLUME_DECLINES', 'Content': ''},
+        {'Section': 'Tab 7: ZONE_STICKINESS', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Which zones keep customers coming back week after week (the "green flag" metric)'},
+        {'Section': 'Green Flag Rate', 'Content': '% of customers who buy consistently (75%+ of weeks). High rate = sticky zone that works. Low rate = customers try once and leave.'},
+        {'Section': 'How to use', 'Content': 'If Zone 2 has 60% green flag rate and Zone 4 has 20%, that\'s proof Zone 2 works better at keeping customers engaged.'},
+        {'Section': '', 'Content': ''},
+
+        {'Section': 'Tab 8: VOLUME_DECLINES', 'Content': ''},
         {'Section': 'What it shows', 'Content': 'Biggest volume losses by combo AND zone. Shows exactly where pounds are bleeding.'},
         {'Section': 'Difference from Tab 8', 'Content': 'Tab 8 shows customers by COMBO only. Tab 9 shows volume by COMBO + ZONE. This is more tactical - tells you which specific zone is the problem.'},
         {'Section': 'Key insight', 'Content': 'If Detroit Bar & Grill_Z4 lost 33,000 lbs but Detroit Bar & Grill_Z2 gained 5,000 lbs, the problem is Zone 4 specifically (not the category overall).'},
         {'Section': '', 'Content': ''},
         
-        {'Section': 'Tab 10: FINANCIAL_IMPACT', 'Content': ''},
+        {'Section': 'Tab 9: FINANCIAL_IMPACT', 'Content': ''},
         {'Section': 'What it shows', 'Content': 'Dollar value of each recommendation using your actual Net Sales per LB and Margin per LB data'},
         {'Section': 'Three scenarios', 'Content': 'LOW = Conservative (if only 60% of predictions work). EXPECTED = Most likely outcome. HIGH = Optimistic (if 80%+ of predictions work).'},
         {'Section': 'Important', 'Content': '8-Week Impact = First cycle results. Annual Impact = Ongoing value if we keep the zone there (multiplied across 52 weeks).'},
         {'Section': 'Confidence levels', 'Content': 'HIGH = Lapsed customer recovery (proven pattern). MEDIUM = Reactive corrections or green flag zones. LOW = Standard adjustments.'},
         {'Section': '', 'Content': ''},
-        
-        {'Section': 'Tab 11: ZONE_STICKINESS', 'Content': ''},
-        {'Section': 'What it shows', 'Content': 'Which zones keep customers coming back week after week (the "green flag" metric)'},
-        {'Section': 'Green Flag Rate', 'Content': '% of customers who buy consistently (75%+ of weeks). High rate = sticky zone that works. Low rate = customers try once and leave.'},
-        {'Section': 'How to use', 'Content': 'If Zone 2 has 60% green flag rate and Zone 4 has 20%, that\'s proof Zone 2 works better at keeping customers engaged.'},
+
+        {'Section': 'Tab 10: LEARNING_TRACKER', 'Content': ''},
+        {'Section': 'What it shows', 'Content': 'Tracks recommendations over time so the system learns what works'},
+        {'Section': 'Note', 'Content': 'This will be empty on first run. After you implement recommendations and re-run the analysis, this tab shows which predictions were accurate.'},
         {'Section': '', 'Content': ''},
         
         {'Section': 'KEY DEFINITIONS', 'Content': ''},
@@ -2541,7 +2647,7 @@ def create_dashboard_guide() -> pd.DataFrame:
     
     return pd.DataFrame(guide_content)
 
-def create_executive_summary(recommendations, yoy_metrics=None, reactive_flags=None, financial_summary=None, config=None):
+def create_executive_summary(recommendations, yoy_metrics=None, financial_summary=None, config=None):
     """One-page summary with company name."""
     
     high_priority = [r for r in recommendations if r['implementation_priority'] >= 70]
@@ -2551,6 +2657,40 @@ def create_executive_summary(recommendations, yoy_metrics=None, reactive_flags=N
     total_volume = sum(r['total_volume'] for r in high_priority)
     total_lapsed = sum(r['lapsed_customers'] for r in recovery_opps)
     
+    # Build strategic first action message
+    if high_priority:
+        # Get top 3-5 recommendations by volume
+        top_moves = sorted(high_priority, key=lambda x: x['total_volume'], reverse=True)[:5]
+        
+        # Group by company
+        top_companies = {}
+        for rec in top_moves:
+            company = rec['company_name']
+            if company not in top_companies:
+                top_companies[company] = {'volume': 0, 'customers': 0, 'count': 0}
+            top_companies[company]['volume'] += rec['total_volume']
+            top_companies[company]['customers'] += rec['lapsed_customers']
+            top_companies[company]['count'] += 1
+        
+        # Build strategic message
+        if len(top_companies) == 1:
+            # Single company focus
+            company = list(top_companies.keys())[0]
+            data = top_companies[company]
+            first_action = f"Focus on {company}: {data['count']} zone changes will recover {data['customers']} customers and {data['volume']:,.0f} lbs"
+        elif len(top_companies) <= 3:
+            # List specific companies
+            company_list = ', '.join(list(top_companies.keys()))
+            total_vol = sum(d['volume'] for d in top_companies.values())
+            first_action = f"Prioritize {len(top_companies)} territories: {company_list} ({total_vol:,.0f} lbs total opportunity)"
+        else:
+            # Multiple companies - general message
+            total_vol = sum(d['volume'] for d in top_companies.values())
+            total_cust = sum(d['customers'] for d in top_companies.values())
+            first_action = f"Implement top 5 moves across {len(top_companies)} territories to recover {total_cust} customers and {total_vol:,.0f} lbs"
+    else:
+        first_action = 'No immediate actions needed - current zones are optimal'
+
     summary = {
         'total_opportunities': len(recommendations),
         'high_priority_moves': len(high_priority),
@@ -2559,9 +2699,8 @@ def create_executive_summary(recommendations, yoy_metrics=None, reactive_flags=N
         'total_volume_at_stake': f"{total_volume:,.0f} lbs",
         'customers_to_win_back': int(total_lapsed),
         'expected_timeframe': '2-8 weeks',
-        'first_action': high_priority[0]['stakeholder_message'] if high_priority else 'No immediate actions'
-    }
-    
+        'first_action': first_action
+    }    
 
     filter_info = []
         
@@ -2603,25 +2742,7 @@ def create_executive_summary(recommendations, yoy_metrics=None, reactive_flags=N
             'annualized_revenue_all_moves': f"${financial_summary['all_revenue_annual_expected']:,.0f}",
             'annualized_margin_all_moves': f"${financial_summary['all_margin_annual_expected']:,.0f}",
             'confidence_breakdown': f"High: {financial_summary['high_confidence_count']}, Medium: {financial_summary['medium_confidence_count']}, Low: {financial_summary['low_confidence_count']}"
-        })
-    # ADD THESE DEBUG LINES:
-    print(f"\n🐛 DEBUG create_executive_summary():")
-    print(f"   financial_summary = {financial_summary}")
-    print(f"   financial_summary is None? {financial_summary is None}")
-    print(f"   financial_summary is empty? {not financial_summary if financial_summary else 'N/A'}")
-    
-    if financial_summary:
-        print(f"   ✅ INSIDE financial_summary block!")
-        print(f"   Keys: {list(financial_summary.keys()) if isinstance(financial_summary, dict) else 'Not a dict'}")
-        summary.update({
-            '': '',  # Spacer
-            'FINANCIAL IMPACT (TOP 10 MOVES)': '',
-            'revenue_8wk_range': f"${financial_summary['top10_revenue_8wk_low']:,.0f} - ${financial_summary['top10_revenue_8wk_high']:,.0f}",
-            # ... rest of your financial code
-        })
-    else:
-        print(f"   ❌ SKIPPING financial_summary block (it's None or empty)")
-    
+        })    
     return pd.DataFrame([summary])  
 
 
@@ -3020,6 +3141,9 @@ def generate_high_value_leads(recommendations: List[Dict],
                 'Pounds_CY': cust['Pounds_CY'],
                 'Pounds_PY': cust['Pounds_PY'],
                 'Est_Annual_Revenue': cust['Estimated_Annual_Revenue'],
+                'Territory_Flag': rec.get('territory_flag', 'N/A'),
+                'Territory_Rank': rec.get('territory_rank', 'N/A'),
+                'Territory_Priority_Score': rec.get('territory_priority_score', 0),
                 'Reason': f"Stopped buying {combo} but still active. Win back at Zone {recommended_zone}.",
                 'Sales_Talking_Point': f"We're adjusting pricing on {combo} to be more competitive. You stopped ordering this but we'd love to earn your business back.",
                 'Expected_Action': 'Call customer, mention new zone pricing, ask for trial order'
@@ -3041,6 +3165,9 @@ def generate_high_value_leads(recommendations: List[Dict],
                 'Pounds_CY': cust['Pounds_CY'],
                 'Pounds_PY': cust['Pounds_PY'],
                 'Est_Annual_Revenue': cust['Estimated_Annual_Revenue'],
+                'Territory_Flag': rec.get('territory_flag', 'N/A'),
+                'Territory_Rank': rec.get('territory_rank', 'N/A'),
+                'Territory_Priority_Score': rec.get('territory_priority_score', 0),
                 'Reason': f"Active buyer. New pricing at Zone {recommended_zone} could increase volume.",
                 'Sales_Talking_Point': f"You're already buying {combo}. We've improved pricing to help you increase volume and save money.",
                 'Expected_Action': 'Call customer, mention improved pricing, ask for larger or more frequent orders'
@@ -3338,7 +3465,75 @@ def create_financial_impact_dashboard(financial_df: pd.DataFrame,
     display['Expected Volume Gain (lbs)'] = display['Expected Volume Gain (lbs)'].apply(lambda x: f"{x:,.0f}")
     
     return display
-
+def add_financial_data_source_legend(config: FoodserviceConfig) -> pd.DataFrame:
+    """
+    Show which original columns were used for financial calculations.
+    
+    8th Grade Explanation:
+    "Our data has lots of margin columns. This shows exactly which ones 
+    I used, so you know where the numbers came from. 
+    I have also added other column origins used within this report"
+    """
+    
+    legend_rows = [
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '═══════════════════════════════════', 'Original Column Name in Your File': '═══════════════════════════════════'},
+        {'Column Purpose': 'DATA SOURCE LEGEND', 'Original Column Name in Your File': 'Which columns we used from your file'},
+        {'Column Purpose': '═══════════════════════════════════', 'Original Column Name in Your File': '═══════════════════════════════════'},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Volume
+        {'Column Purpose': '📦 VOLUME (Pounds)', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Current Year Pounds', 'Original Column Name in Your File': config.data_config.pounds_cy_column},
+        {'Column Purpose': '  Prior Year Pounds', 'Original Column Name in Your File': config.data_config.pounds_py_column},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Extended Totals (if used)
+        {'Column Purpose': '💰 EXTENDED TOTALS', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Margin Current Year', 'Original Column Name in Your File': config.data_config.margin_cy_column if config.data_config.has_margin_data else 'NOT USED'},
+        {'Column Purpose': '  Margin Prior Year', 'Original Column Name in Your File': config.data_config.margin_py_column if config.data_config.has_margin_data else 'NOT USED'},
+        {'Column Purpose': '  Net Sales Current Year', 'Original Column Name in Your File': config.data_config.net_sales_cy_column if config.data_config.has_net_sales_data else 'NOT USED'},
+        {'Column Purpose': '  Net Sales Prior Year', 'Original Column Name in Your File': config.data_config.net_sales_py_column if config.data_config.has_net_sales_data else 'NOT USED'},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Per-Pound Rates (if used)
+        {'Column Purpose': '📊 PER-POUND RATES', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Margin per LB Current Year', 'Original Column Name in Your File': config.data_config.margin_per_lb_cy_column if config.data_config.has_per_lb_rates else 'NOT USED'},
+        {'Column Purpose': '  Margin per LB Prior Year', 'Original Column Name in Your File': config.data_config.margin_per_lb_py_column if config.data_config.has_per_lb_rates else 'NOT USED'},
+        {'Column Purpose': '  Net Sales per LB Current Year', 'Original Column Name in Your File': config.data_config.net_sales_per_lb_cy_column if config.data_config.has_per_lb_rates else 'NOT USED'},
+        {'Column Purpose': '  Net Sales per LB Prior Year', 'Original Column Name in Your File': config.data_config.net_sales_per_lb_py_column if config.data_config.has_per_lb_rates else 'NOT USED'},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Margin Percentage (if used)
+        {'Column Purpose': '📈 MARGIN PERCENTAGE', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Margin % Current Year', 'Original Column Name in Your File': config.data_config.margin_pct_cy_column if config.data_config.has_margin_pct else 'NOT USED'},
+        {'Column Purpose': '  Margin % Prior Year', 'Original Column Name in Your File': config.data_config.margin_pct_py_column if config.data_config.has_margin_pct else 'NOT USED'},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Other Key Columns
+        {'Column Purpose': '🔑 OTHER KEY COLUMNS', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Company Name', 'Original Column Name in Your File': config.data_config.company_column},
+        {'Column Purpose': '  Customer ID', 'Original Column Name in Your File': config.data_config.customer_id_column},
+        {'Column Purpose': '  Fiscal Week', 'Original Column Name in Your File': config.data_config.fiscal_week_column},
+        {'Column Purpose': '  Last Invoice Date', 'Original Column Name in Your File': config.data_config.last_invoice_date_column},
+        {'Column Purpose': '  Price Zone', 'Original Column Name in Your File': config.data_config.zone_column},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Grouping Columns (optional)
+        {'Column Purpose': '📂 GROUPING COLUMNS (if enabled)', 'Original Column Name in Your File': ''},
+        {'Column Purpose': '  Cuisine Type', 'Original Column Name in Your File': config.data_config.cuisine_column if config.data_config.use_cuisine else 'NOT USED'},
+        {'Column Purpose': '  Attribute Group', 'Original Column Name in Your File': config.data_config.attribute_group_column if config.data_config.use_attribute_group else 'NOT USED'},
+        {'Column Purpose': '  Business Center', 'Original Column Name in Your File': config.data_config.business_center_column if config.data_config.use_business_center else 'NOT USED'},
+        {'Column Purpose': '  Item Group', 'Original Column Name in Your File': config.data_config.item_group_column if config.data_config.use_item_group else 'NOT USED'},
+        {'Column Purpose': '  Price Source', 'Original Column Name in Your File': config.data_config.price_source_column if config.data_config.use_price_source else 'NOT USED'},
+        {'Column Purpose': '', 'Original Column Name in Your File': ''},
+        
+        # Note
+        {'Column Purpose': '💡 NOTE:', 'Original Column Name in Your File': 'If you want to use different margin columns,'},
+        {'Column Purpose': '', 'Original Column Name in Your File': 'update the DataConfiguration at the top of PZone.py'},
+    ]
+    
+    return pd.DataFrame(legend_rows)
 def create_customer_recovery_tracker(recommendations: List[Dict]) -> pd.DataFrame:
     """Show recovery opportunity by combo."""
     
@@ -3426,6 +3621,426 @@ def create_implementation_timeline(recommendations: List[Dict]) -> pd.DataFrame:
     
     return pd.DataFrame(timeline)
 
+def create_war_room_dashboard(recommendations: List[Dict], 
+                              yoy_metrics: Optional[Dict] = None,
+                              reactive_flags: Optional[Dict] = None,
+                              consistency_analysis: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Create a single "War Room" tab with everything executives need.
+    
+    8th Grade Explanation:
+    "This is the one-page view for your pricing meeting. Everything you need
+    to make decisions: what to do, who does it, when to do it, what to watch."
+    """
+    
+    war_room_rows = []
+    
+    # ═══════════════════════════════════════════════════════════
+    # SECTION 1: EXECUTIVE SNAPSHOT
+    # ═══════════════════════════════════════════════════════════
+    
+    war_room_rows.extend([
+        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '🎯 WAR ROOM - PRICING ZONE OPTIMIZATION', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        
+        {'Col1': '📊 AT A GLANCE:', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': f"   • Total Opportunities: {len(recommendations)}", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': f"   • High Priority (Do This Week): {sum(1 for r in recommendations if r['implementation_priority'] >= 85)}", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': f"   • Volume at Stake: {sum(r['total_volume'] for r in recommendations):,.0f} lbs", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': f"   • Customers to Win Back: {sum(r['lapsed_customers'] for r in recommendations):,}", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+    
+    # Add YoY metrics if available
+    if yoy_metrics:
+        war_room_rows.extend([
+            {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': '📈 YEAR-OVER-YEAR TREND:', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': f"   • Customer Change: {yoy_metrics['customer_change']:+,} ({yoy_metrics['customer_change_pct']:+.1f}%)", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': f"   • Retention Rate: {yoy_metrics['retention_rate']:.1f}%", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        ])
+    
+    war_room_rows.append({'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''})
+    
+    # ═══════════════════════════════════════════════════════════
+    # SECTION 2: TOP 10 IMMEDIATE ACTIONS
+    # ═══════════════════════════════════════════════════════════
+    
+    war_room_rows.extend([
+        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '🚀 TOP 10 IMMEDIATE ACTIONS (Implement This Week)', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+    
+    # Header row for top 10
+    war_room_rows.append({
+        'Col1': '#',
+        'Col2': 'Territory',
+        'Col3': 'Category',
+        'Col4': 'Zone Move',
+        'Col5': 'Impact',
+        'Col6': 'YoY Customers',
+        'Col7': 'Zone Health',
+        'Col8': 'Action'
+    })
+    
+    # Get YoY data by combo
+    yoy_by_combo = {}
+    if yoy_metrics and 'by_combo' in yoy_metrics:
+        for _, row in yoy_metrics['by_combo'].iterrows():
+            yoy_by_combo[row['Company_Combo_Key']] = row
+    
+    # Get consistency data by combo+zone
+    consistency_lookup = {}
+    if consistency_analysis is not None and not consistency_analysis.empty:
+        for _, row in consistency_analysis.iterrows():
+            key = (row['Company_Combo_Key'], row['Zone'])
+            consistency_lookup[key] = {
+                'consistent_buyers': row['consistent_buyers'],
+                'green_flag_rate': row['green_flag_rate']
+            }
+    
+    # Top 10 by implementation priority
+    # Top 10 by COMPOSITE SCORE (priority + actual impact)
+    for rec in recommendations:
+        # Calculate composite score: priority + volume impact + customer recovery
+        volume_score = rec['total_volume'] * 0.5  # Volume weighted 50%
+        customer_score = rec['lapsed_customers'] * 100 * 0.3  # Lapsed customers 30%
+        priority_score = rec['implementation_priority'] * 10 * 0.2  # Priority 20%
+        
+        rec['war_room_score'] = volume_score + customer_score + priority_score
+
+    # Filter out tiny opportunities AND those with 0 consistent buyers
+    war_room_candidates = [
+        r for r in recommendations 
+        if (r['total_volume'] >= 500 or r['lapsed_customers'] >= 5)  # Meaningful impact
+        and r.get('consistent_buyers', 0) > 0  # Must have SOME sticky customers
+    ]
+
+    # If filtering removed everything, keep at least some recommendations
+    if len(war_room_candidates) < 10:
+        war_room_candidates = recommendations
+
+    # Sort by composite score
+    top_10 = sorted(war_room_candidates, key=lambda x: x['war_room_score'], reverse=True)[:10]
+  
+    for i, rec in enumerate(top_10, 1):
+        combo = rec['company_combo']
+        current_zone = rec['current_zone']
+        
+        # Get YoY data
+        yoy_data = yoy_by_combo.get(combo, {})
+        cy_cust = yoy_data.get('distinct_customers_cy', 'N/A')
+        py_cust = yoy_data.get('distinct_customers_py', 'N/A')
+        change = yoy_data.get('customer_change', 0)
+        
+        if isinstance(change, (int, float)) and py_cust != 'N/A' and py_cust > 0:
+            yoy_status = f"{change:+,} ({change/py_cust*100:+.1f}%)"
+        else:
+            yoy_status = 'N/A'
+        
+        # Get consistency data
+        consistency_key = (combo, current_zone)
+        consistency = consistency_lookup.get(consistency_key, {})
+        consistent_buyers = consistency.get('consistent_buyers', 0)
+        green_flag_rate = consistency.get('green_flag_rate', 0)
+        
+        if green_flag_rate >= 0.50:
+            zone_health = f"🟢 {consistent_buyers} sticky"
+        elif green_flag_rate >= 0.30:
+            zone_health = f"🟡 {consistent_buyers} buyers"
+        else:
+            zone_health = f"🔴 {consistent_buyers} buyers"
+        
+        # Simplify action
+        if 'PROVEN WIN' in rec['stakeholder_message']:
+            action = '✅ Execute now'
+        elif 'TEST' in rec['stakeholder_message']:
+            action = '🧪 Test & monitor'
+        elif 'REACTIVE' in rec['recommendation_type']:
+            action = '⚠️ Fix overpricing'
+        else:
+            action = '📊 Standard move'
+        
+        war_room_rows.append({
+            'Col1': i,
+            'Col2': rec['company_name'],
+            'Col3': f"{rec.get('cuisine', 'N/A')} - AG{rec.get('attribute_group', 'N/A')}",
+            'Col4': f"Z{current_zone}→Z{rec['recommended_zone']}",
+            'Col5': f"{rec['total_volume']:,.0f} lbs, {rec['lapsed_customers']} lapsed",
+            'Col6': yoy_status,
+            'Col7': zone_health,
+            'Col8': action
+        })
+    
+    war_room_rows.append({'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''})
+    
+    # ═══════════════════════════════════════════════════════════
+    # SECTION 3: IMPLEMENTATION TIMELINE
+    # ═══════════════════════════════════════════════════════════
+    
+    war_room_rows.extend([
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '📅 IMPLEMENTATION TIMELINE', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+    
+    # Week 1-2: High recovery moves
+    week_1_2 = [r for r in recommendations if '2-4 weeks' in r.get('timeline', '')][:5]
+    if week_1_2:
+        total_vol_w12 = sum(r['total_volume'] * 0.3 for r in week_1_2)
+        war_room_rows.extend([
+            {'Col1': '⚡ WEEK 1-2: Implement High-Recovery Moves', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': f"   {len(week_1_2)} changes • Expected lift: +{total_vol_w12:,.0f} lbs • Focus: Easy wins - lapsed customer recovery", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        ])
+    
+    # Week 3-4: Monitor
+    war_room_rows.extend([
+        {'Col1': '📊 WEEK 3-4: Monitor Week 1-2 Moves', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '   Track customer reactivation • Confirm volume gains', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+
+    # Week 5-8: Reactive + peer consensus
+    week_5_8 = [r for r in recommendations if '4-6 weeks' in r.get('timeline', '')][:10]
+    if week_5_8:
+        total_vol_w58 = sum(r['total_volume'] * 0.15 for r in week_5_8)
+        war_room_rows.extend([
+            {'Col1': '🔧 WEEK 5-8: Implement Reactive Corrections + Peer Consensus', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+            {'Col1': f"   {len(week_5_8)} changes • Expected lift: +{total_vol_w58:,.0f} lbs • Focus: Finding optimal zones", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        ])
+    
+    war_room_rows.append({'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''})
+    
+    # ═══════════════════════════════════════════════════════════
+    # SECTION 4: TERRITORY BREAKDOWN
+    # ═══════════════════════════════════════════════════════════
+    
+    war_room_rows.extend([
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '🗺️ TERRITORY BREAKDOWN (Which Sales Reps Need to Act)', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+    
+    # Group by territory
+    by_territory = {}
+    for rec in recommendations:
+        territory = rec['company_name']
+        if territory not in by_territory:
+            by_territory[territory] = []
+        by_territory[territory].append(rec)
+    
+    # Show top 10 territories by volume
+    territory_summary = []
+    for territory, recs in by_territory.items():
+        territory_summary.append({
+            'territory': territory,
+            'count': len(recs),
+            'total_volume': sum(r['total_volume'] for r in recs),
+            'lapsed': sum(r['lapsed_customers'] for r in recs),
+            'top_priority': sum(1 for r in recs if r.get('territory_flag') == '🎯 TOP PRIORITY')
+        })
+    
+    territory_summary.sort(key=lambda x: x['total_volume'], reverse=True)
+    
+    war_room_rows.append({
+        'Col1': 'Territory',
+        'Col2': 'Opportunities',
+        'Col3': 'Top Priority',
+        'Col4': 'Volume at Stake',
+        'Col5': 'Lapsed Customers',
+        'Col6': '', 'Col7': '', 'Col8': ''
+    })
+    
+    for t in territory_summary[:10]:
+        war_room_rows.append({
+            'Col1': t['territory'],
+            'Col2': t['count'],
+            'Col3': t['top_priority'],
+            'Col4': f"{t['total_volume']:,.0f} lbs",
+            'Col5': t['lapsed'],
+            'Col6': '', 'Col7': '', 'Col8': ''
+        })
+    
+    war_room_rows.append({'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''})
+    
+    # ═══════════════════════════════════════════════════════════
+    # SECTION 5: RISK FLAGS
+    # ═══════════════════════════════════════════════════════════
+    
+    war_room_rows.extend([
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '⚠️ RISK FLAGS (What to Watch)', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+    ])
+    
+    # Count reactive flags
+    reactive_count = len(reactive_flags) if reactive_flags else 0
+    if reactive_count > 0:
+        war_room_rows.append({
+            'Col1': f"🚨 {reactive_count} Reactive Pricing Patterns Detected",
+            'Col2': '→ These zones may need fractional adjustments (e.g. 1.5, 2.5)',
+            'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''
+        })
+    
+    # Low consistency zones
+    low_consistency = [r for r in recommendations if r.get('green_flag_rate', 0) < 0.30]
+    if low_consistency:
+        war_room_rows.append({
+            'Col1': f"⚠️ {len(low_consistency)} Zones with Low Customer Stickiness",
+            'Col2': '→ Customers not buying consistently - may indicate deeper issues',
+            'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''
+        })
+    
+    # YoY declining territories
+    if yoy_metrics and 'by_combo' in yoy_metrics:
+        declining = yoy_metrics['by_combo'][yoy_metrics['by_combo']['customer_change'] < -20]
+        if len(declining) > 0:
+            war_room_rows.append({
+                'Col1': f"📉 {len(declining)} Combos Losing 20+ Customers YoY",
+                'Col2': '→ These need immediate attention beyond just pricing',
+                'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''
+            })
+    
+    return pd.DataFrame(war_room_rows)
+
+def format_war_room_tab(worksheet, war_room_df):
+    """
+    Make the War Room tab visually engaging with colors, fonts, and structure.
+    
+    8th Grade Explanation:
+    "Make it look like a professional dashboard, not a boring spreadsheet.
+    Use colors to show what's important, bold text for headers, and spacing
+    so executives can scan it in 30 seconds."
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    
+    # Color palette
+    HEADER_BLUE = "1F4E78"      # Dark blue for main sections
+    ACCENT_GREEN = "70AD47"     # Green for positive/actions
+    ACCENT_ORANGE = "F4B183"    # Orange for warnings
+    ACCENT_RED = "C00000"       # Red for risks
+    LIGHT_GRAY = "F2F2F2"       # Light background
+    
+    # Find section headers (rows with ═══)
+    section_rows = []
+    data_start_rows = []
+    
+    for idx, row in enumerate(war_room_df.iterrows(), start=1):  # Excel rows start at 2 (1 is headers)
+        row_data = row[1]
+        first_col = str(row_data.get('Col1', ''))
+        
+        if '═══' in first_col:
+            section_rows.append(idx)
+        elif first_col and first_col.startswith('🎯') or first_col.startswith('🚀') or first_col.startswith('📅') or first_col.startswith('🗺️') or first_col.startswith('⚠️'):
+            data_start_rows.append(idx)
+    
+    # Format section headers (the ═══ rows and title rows)
+    header_font = Font(name='Calibri', size=16, bold=True, color='FFFFFF')
+    header_fill = PatternFill(start_color=HEADER_BLUE, end_color=HEADER_BLUE, fill_type='solid')
+    
+    for row_num in section_rows + data_start_rows:
+        for col in range(1, 9):  # Columns A-H
+            cell = worksheet.cell(row_num, col)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='left', vertical='center')
+        
+        # Merge cells for section titles
+        worksheet.merge_cells(f'A{row_num}:H{row_num}')
+    
+    # Format the "AT A GLANCE" section (rows 6-10)
+    glance_fill = PatternFill(start_color=LIGHT_GRAY, end_color=LIGHT_GRAY, fill_type='solid')
+    glance_font = Font(name='Calibri', size=13, bold=True)
+    
+    for row_num in range(5, 10):
+        for col in range(1, 9):
+            cell = worksheet.cell(row_num, col)
+            cell.fill = glance_fill
+            cell.font = glance_font
+        worksheet.merge_cells(f'A{row_num}:H{row_num}')
+    
+    # Format Top 10 table header row
+    # Find the row with "#, Territory, Category..." headers
+    for idx, row in enumerate(war_room_df.iterrows(), start=2):
+        row_data = row[1]
+        if row_data.get('Col1') == '#':  # This is the header row
+            table_header_row = idx
+            
+            # Style the header
+            for col in range(1, 9):
+                cell = worksheet.cell(table_header_row, col)
+                cell.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
+                cell.fill = PatternFill(start_color=ACCENT_GREEN, end_color=ACCENT_GREEN, fill_type='solid')
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Style the data rows (next 10 rows)
+            for data_row in range(table_header_row + 1, table_header_row + 11):
+                for col in range(1, 9):
+                    cell = worksheet.cell(data_row, col)
+                    cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+                    
+                    # Zebra striping for readability
+                    if (data_row - table_header_row) % 2 == 0:
+                        cell.fill = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
+                    else:
+                        cell.fill = PatternFill(start_color='F9F9F9', end_color='F9F9F9', fill_type='solid')
+            
+            break
+    
+    # Format RISK FLAGS section
+    # Find risk flags section (look for ⚠️ RISK FLAGS)
+    for idx, row in enumerate(war_room_df.iterrows(), start=2):
+        row_data = row[1]
+        if '⚠️ RISK FLAGS' in str(row_data.get('Col1', '')):
+            risk_section_start = idx
+            
+            # Color the next ~5 rows as risks (yellow highlight for visibility)
+            warning_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+            warning_font = Font(name='Calibri', size=11, bold=True, color='D35400')  # Orange text
+            
+            for risk_row in range(risk_section_start + 2, risk_section_start + 7):
+                cell_a = worksheet.cell(risk_row, 1)
+                if cell_a.value and ('🚨' in str(cell_a.value) or '⚠️' in str(cell_a.value) or '📉' in str(cell_a.value)):
+                    # Apply to columns A-C (more visible)
+                    for col in range(1, 4):
+                        cell = worksheet.cell(risk_row, col)
+                        cell.fill = warning_fill
+                        cell.font = warning_font
+            break
+
+    # Set column widths for readability
+    worksheet.column_dimensions['A'].width = 35
+    worksheet.column_dimensions['B'].width = 30
+    worksheet.column_dimensions['C'].width = 35
+    worksheet.column_dimensions['D'].width = 15
+    worksheet.column_dimensions['E'].width = 25
+    worksheet.column_dimensions['F'].width = 20
+    worksheet.column_dimensions['G'].width = 20
+    worksheet.column_dimensions['H'].width = 20
+    
+    # Set row heights
+    for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row):
+        worksheet.row_dimensions[row[0].row].height = 18
+    
+    # Make section header rows taller
+    for row_num in section_rows + data_start_rows:
+        worksheet.row_dimensions[row_num].height = 25
+    
+    # Freeze the top section (so when scrolling, headers stay visible)
+    worksheet.freeze_panes = 'A14'  # Freeze everything above row 15
+
+    # Remove auto-filter (not helpful in War Room)
+    if worksheet.auto_filter.ref:
+        worksheet.auto_filter.ref = None
 
 def create_learning_tracker_tab(learning_engine: LearningEngine) -> pd.DataFrame:
     """Show what we've learned."""
@@ -3914,16 +4529,15 @@ def create_how_to_use_tab(writer, recommendations_count, high_priority_count, vo
     
     tabs = [
         ("Tab 1: Executive Summary", "Big picture - total opportunities, customer wins/losses, financial impact"),
-        ("Tab 2: Top 5 Moves", "START HERE! The 5 most important zone changes to make right now"),
+        ("Tab 2: War Room", "START HERE! All-in-one decision dashboard"),
         ("Tab 3: Recovery Opportunities", "Customers who stopped buying but are still active - easiest wins!"),
         ("Tab 4: Reactive Alerts", "⚠️ Places where we already dropped zones reactively (data may be messy)"),
-        ("Tab 5: Timeline", "Week-by-week schedule for implementing changes"),
-        ("Tab 6: Learning Tracker", "(Empty first time) Tracks how accurate our predictions were"),
-        ("Tab 7: All Recommendations", "Complete list of every suggested zone change"),
-        ("Tab 8: YoY Customers", "How many customers we kept, gained, or lost compared to last year"),
-        ("Tab 9: Volume Declines", "Biggest volume drops by zone - shows where we're bleeding"),
-        ("Tab 10: Financial Impact", "Dollar projections - revenue and margin estimates for changes"),
-        ("Tab 11: Zone Stickiness", "Which zones keep customers engaged week after week")
+        ("Tab 5: All Recommendations", "Complete list of every suggested zone change"),
+        ("Tab 6: YoY Customers", "How many customers we kept, gained, or lost compared to last year"),
+        ("Tab 7: Zone Stickiness", "Which zones keep customers..."),
+        ("Tab 8: Volume Declines", "Biggest losses..."),
+        ("Tab 9: Financial Impact", "Dollar projections"),
+        ("Tab 10: Learning Tracker", "(Empty first time) Tracks how accurate our predictions were")
     ]
     
     for tab_name, description in tabs:
@@ -4120,7 +4734,7 @@ def write_stakeholder_excel(recommendations: List[Dict],
         print("   📄 Tab 1: Executive Summary")
         if financial_summary:
             print(f"      💰 Including financial projections in Executive Summary")
-        exec_summary = create_executive_summary(recommendations, yoy_metrics, reactive_flags, financial_summary, optimization_engine.config)
+        exec_summary = create_executive_summary(recommendations, yoy_metrics, financial_summary, optimization_engine.config)
 
         # Convert to vertical layout
         exec_rows = [
@@ -4152,12 +4766,21 @@ def write_stakeholder_excel(recommendations: List[Dict],
         exec_df.to_excel(writer, sheet_name='1_EXECUTIVE_SUMMARY', index=False)
         
         # ==========================================
-        # TAB 2: Top 5 Quick Wins (with YoY!)
+        # TAB 2: WAR ROOM (REPLACES TOP 5 MOVES)
         # ==========================================
-        print("   📄 Tab 2: Top 5 Quick Wins")
-        quick_wins = create_quick_wins_dashboard(recommendations, yoy_metrics)
-        if not quick_wins.empty:
-            quick_wins.to_excel(writer, sheet_name='2_TOP_5_MOVES', index=False)
+        print("   📄 Tab 2: War Room Dashboard")
+        war_room = create_war_room_dashboard(
+            recommendations,
+            yoy_metrics=optimization_engine.yoy_customer_metrics if optimization_engine else None,
+            reactive_flags=reactive_flags,
+            consistency_analysis=optimization_engine.consistency_analysis if optimization_engine else None
+        )
+        if not war_room.empty:
+            war_room.to_excel(writer, sheet_name='2_WAR_ROOM', index=False, header=False)
+            
+            # Apply engaging formatting
+            ws_war_room = writer.sheets['2_WAR_ROOM']
+            format_war_room_tab(ws_war_room, war_room)
         
         # ==========================================
         # TAB 3: Customer Recovery Tracker
@@ -4177,28 +4800,10 @@ def write_stakeholder_excel(recommendations: List[Dict],
             if not alerts.empty:
                 alerts.to_excel(writer, sheet_name='4_REACTIVE_ALERTS', index=False)
         
-        
         # ==========================================
-        # TAB 5: Implementation Timeline
+        # TAB 5: All Recommendations (detailed backup)
         # ==========================================
-        print("   📄 Tab 5: Implementation Timeline")
-        timeline = create_implementation_timeline(recommendations)
-        if not timeline.empty:
-            timeline.to_excel(writer, sheet_name='5_TIMELINE', index=False)
-        
-        # ==========================================
-        # TAB 6: Learning Tracker (if available)
-        # ==========================================
-        if learning_engine:
-            print("   📄 Tab 6: Learning Tracker")
-            learning_df = create_learning_tracker_tab(learning_engine)
-            if not learning_df.empty:
-                learning_df.to_excel(writer, sheet_name='6_LEARNING_TRACKER', index=False)
-        
-        # ==========================================
-        # TAB 7: All Recommendations (detailed backup)
-        # ==========================================
-        print("   📄 Tab 7: All Recommendations (detailed)")
+        print("   📄 Tab 5: All Recommendations (detailed)")
         all_recs = pd.DataFrame(recommendations)
 
         key_cols = [
@@ -4212,20 +4817,27 @@ def write_stakeholder_excel(recommendations: List[Dict],
         if display_cols:
             all_recs_display = all_recs[display_cols].copy()
             
+            # Add territory columns to display
+            if 'territory_flag' in all_recs.columns:
+                display_cols.extend(['territory_flag', 'territory_rank', 'rep_guidance'])
+
+            all_recs_display = all_recs[display_cols].copy()
+
             all_recs_display.columns = [
                 'OpCo', 'Cuisine', 'Attribute Group', 'Current Zone',
                 'Recommended Zone', 'Type', 'Explanation',
                 'Expected Result', 'Timeline', 'Risk', 'Volume (lbs)',
-                'Lapsed Customers', 'Priority Score'
+                'Lapsed Customers', 'Priority Score', 'Territory Flag', 
+                'Territory Rank', 'Rep Guidance'
             ]
             
             # Sort by Volume descending
             all_recs_display = all_recs_display.sort_values('Volume (lbs)', ascending=False)
             
-            all_recs_display.to_excel(writer, sheet_name='7_ALL_RECOMMENDATIONS', index=False)
+            all_recs_display.to_excel(writer, sheet_name='5_ALL_RECOMMENDATIONS', index=False)
             
             # ADD NOTE about Priority Score
-            ws = writer.sheets['7_ALL_RECOMMENDATIONS']
+            ws = writer.sheets['5_ALL_RECOMMENDATIONS']
             note_col = 14  # Column N (next to M which is Priority Score)
             
             ws.cell(1, note_col, value="ℹ️ HOW PRIORITY SCORE IS CALCULATED:")
@@ -4246,23 +4858,23 @@ def write_stakeholder_excel(recommendations: List[Dict],
             ws.column_dimensions['N'].width = 35
                     
         # ==========================================
-        # TAB 8: YoY Customer Tracking 
+        # TAB 6: YoY Customer Tracking 
         # ==========================================
         if yoy_metrics:
-            print("   📄 Tab 8: Year-over-Year Customer Tracking")
+            print("   📄 Tab 6: Year-over-Year Customer Tracking")
             yoy_dashboard = create_yoy_customer_dashboard(yoy_metrics)
             if not yoy_dashboard.empty:
                 # ✅ SORT by Lost Customers descending
                 if 'Customers_Lost' in yoy_dashboard.columns:
                     yoy_dashboard = yoy_dashboard.sort_values('Customers_Lost', ascending=False)
-                yoy_dashboard.to_excel(writer, sheet_name='8_YOY_CUSTOMERS', index=False)
+                yoy_dashboard.to_excel(writer, sheet_name='6_YOY_CUSTOMERS', index=False)
                 
         # ==========================================
-        # TAB 9: Zone Stickiness Report
+        # TAB 7: Zone Stickiness Report
         # ==========================================
         if optimization_engine and hasattr(optimization_engine, 'consistency_analysis'):
             if optimization_engine.consistency_analysis is not None:
-                print("   📄 Tab 9: Zone Stickiness Report")
+                print("   📄 Tab 7: Zone Stickiness Report")
                 stickiness = create_zone_stickiness_report(optimization_engine.consistency_analysis)
                 if not stickiness.empty:
                     # Debug: print column names to see exact spelling
@@ -4282,10 +4894,10 @@ def write_stakeholder_excel(recommendations: List[Dict],
                     else:
                         print(f"      ⚠️ Could not find Consistent Buyers column")
                     
-                    stickiness.to_excel(writer, sheet_name='9_ZONE_STICKINESS', index=False)
+                    stickiness.to_excel(writer, sheet_name='7_ZONE_STICKINESS', index=False)
                     
                     # ADD NOTE about what Stickiness means
-                    ws = writer.sheets['9_ZONE_STICKINESS']
+                    ws = writer.sheets['7_ZONE_STICKINESS']
                     note_col = stickiness.shape[1] + 2  # Two columns after last data column
                     
                     ws.cell(1, note_col, value="ℹ️ WHAT IS ZONE STICKINESS?")
@@ -4310,27 +4922,46 @@ def write_stakeholder_excel(recommendations: List[Dict],
                     col_letter = ws.cell(1, note_col).column_letter
                     ws.column_dimensions[col_letter].width = 40
         # ==========================================
-        # TAB 10: Volume Decline Analysis 
+        # TAB 8: Volume Decline Analysis 
         # ==========================================
-        print("   📄 Tab 10: Volume Decline by Combo + Zone")
+        print("   📄 Tab 8: Volume Decline by Combo + Zone")
         volume_declines = create_volume_decline_dashboard(
             historical_df if historical_df is not None else current_df, 
             optimization_engine.config,
             top_n=50  # Show top 50 worst performers
         )
         if not volume_declines.empty:
-            volume_declines.to_excel(writer, sheet_name='10_VOLUME_DECLINES', index=False)
+            volume_declines.to_excel(writer, sheet_name='8_VOLUME_DECLINES', index=False)
 
         # ==========================================
-        # TAB 10: Financial Impact (NEEDS historical_df!)
+        # TAB 9: Financial Impact (with data source legend!)
         # ==========================================
         if financial_df is not None and not financial_df.empty:
-            print("   📄 Tab 1: Financial Impact Projections")
+            print("   📄 Tab 9: Financial Impact Projections")
+            
+            # Add data source legend at the TOP (so stakeholders see it first!)
+            data_legend = add_financial_data_source_legend(optimization_engine.config)
             financial_display = create_financial_impact_dashboard(financial_df, financial_summary)
-            financial_display.to_excel(writer, sheet_name='11_FINANCIAL_IMPACT', index=False)
-        else:
-            print("   ⚠️ Skipping Tab 1: No financial data available")
+            
+            # Combine: legend FIRST + spacer + financial data
+            combined_financial = pd.concat([
+                data_legend,
+                pd.DataFrame([{'': ''} for _ in range(3)]),  # 3 blank rows as separator
+                financial_display
+            ], ignore_index=True)
+            
+            combined_financial.to_excel(writer, sheet_name='9_FINANCIAL_IMPACT', index=False)
         
+        # ==========================================
+        # TAB 10: Learning Tracker (if available)
+        # ==========================================
+        if learning_engine:
+            print("   📄 Tab 10: Learning Tracker")
+            learning_df = create_learning_tracker_tab(learning_engine)
+            if not learning_df.empty:
+                learning_df.to_excel(writer, sheet_name='10_LEARNING_TRACKER', index=False)
+
+
         # ==========================================
         # Apply formatting to ALL sheets
         # ==========================================
@@ -4580,52 +5211,44 @@ def run_foodservice_zone_optimization(
     print("\n🎯 Generating recommendations...")
     recommendations = engine.generate_recommendations(current_df, historical_df)
     print(f"   ✅ Generated {len(recommendations)} recommendations")
-    
+
+    # ✅ ADD THIS CHECK:
+    if not recommendations:
+        print("\n" + "="*60)
+        print("🎉 NO RECOMMENDATIONS NEEDED")
+        print("="*60)
+        print("\n✨ All zones are already optimal!")
+        print("\n📊 What this means:")
+        print("   • Current zones are maximizing volume, margin, and customer retention")
+        print("   • No customers are lapsing at problematic rates")
+        print("   • No reactive pricing patterns detected")
+        print("\n💡 Next steps:")
+        print("   • Continue monitoring performance")
+        print("   • Re-run analysis in 4-6 weeks to check for changes")
+        print("\n🎯 Nothing to do right now - keep doing what you're doing!")
+        return None, None
+
     # Get reactive flags
     reactive_flags = engine.reactive_flags
     print(f"   ⚠️  Found {len(reactive_flags)} reactive pricing patterns")
     # ==========================================
-    # FILTER TO HIGH-IMPACT RECOMMENDATIONS ONLY
+    # APPLY TERRITORY-RELATIVE SCORING
     # ==========================================
-    print("\n🎯 Filtering to high-impact recommendations...")
+    print("\n🎯 Applying territory-relative scoring...")
 
+    # Apply territory scoring FIRST
+    recommendations = apply_territory_relative_scoring(recommendations)
+
+    # Then filter: Keep TOP/MEDIUM/BUNDLE, remove DEFER unless high customer count
     original_count = len(recommendations)
+    recommendations = [
+        r for r in recommendations 
+        if r.get('territory_flag', '⏸️ DEFER') != '⏸️ DEFER' or r['total_customers'] >= 5
+    ]
 
-    # Define impact thresholds
-    MIN_VOLUME = 50  
-    MIN_CUSTOMERS = 3  
-    MIN_PRIORITY = 60  
-    MIN_VOLUME_PER_CUSTOMER = 150  # High-value customer threshold
-
-    high_impact = []
-
-    for rec in recommendations:
-        volume_potential = rec['total_volume']
-        if rec['lapsed_customers'] > 0:
-            volume_potential += rec['total_volume'] * 0.3  
-        
-        # Calculate volume per customer
-        total_customers = rec['total_customers']
-        volume_per_customer = volume_potential / total_customers if total_customers > 0 else 0
-        
-        # Check all criteria
-        meets_volume = volume_potential >= MIN_VOLUME
-        meets_priority = rec['implementation_priority'] >= MIN_PRIORITY
-        
-        # Need 3+ customers AND EITHER 5+ customers OR high volume per customer
-        meets_customers = (
-            rec['total_customers'] >= MIN_CUSTOMERS and
-            (rec['total_customers'] >= 5 or volume_per_customer >= MIN_VOLUME_PER_CUSTOMER)
-        )
-        
-        if meets_volume and meets_customers and meets_priority:
-            high_impact.append(rec)
-
-    print(f"   📊 Filtered from {original_count} → {len(high_impact)} recommendations")
-    print(f"   🎯 Focus: Volume ≥{MIN_VOLUME} lbs, Priority ≥{MIN_PRIORITY}, Customers ≥3 (with 5+ OR {MIN_VOLUME_PER_CUSTOMER}+ lbs/customer)")
-
-    # Replace recommendations with filtered list
-    recommendations = high_impact
+    print(f"   📊 Filtered from {original_count} → {len(recommendations)} recommendations")
+    print(f"   💡 Territory scoring: Every OpCo now has prioritized actions")
+    
     # Save to learning system
     if learning_engine:
         print("\n💾 Saving recommendations to learning system...")
@@ -4678,6 +5301,7 @@ def run_foodservice_zone_optimization(
     print("=" * 60)
     
     exec_summary = create_executive_summary(recommendations)
+    
     print(f"\n📈 KEY FINDINGS:")
     print(f"   • Total Opportunities: {exec_summary['total_opportunities'].iloc[0]}")
     print(f"   • High Priority Moves: {exec_summary['high_priority_moves'].iloc[0]}")
@@ -4696,9 +5320,8 @@ def run_foodservice_zone_optimization(
     
     print(f"\n💡 NEXT STEPS:")
     print(f"   1. Open {os.path.basename(excel_path)} - NO RESIZING NEEDED!")
-    print(f"   2. Review Tab 2 (Top 5 Moves) with stakeholders")
-    print(f"   3. Implement recommendations")
-    print(f"   4. Re-run this analysis in 4-6 weeks to track results")
+    print(f"   2. Review Tab 2 (War Room) with stakeholders")
+    print(f"   3. Check Tab 9 (Financial Impact) for ROI projections")
     
     return recommendations, reactive_flags
 
