@@ -706,6 +706,168 @@ def calculate_purchase_consistency(df: pd.DataFrame,
     
     return zone_consistency
 
+def detect_price_change_events(df: pd.DataFrame, 
+                               config: FoodserviceConfig,
+                               threshold_pct: float = 5.0) -> pd.DataFrame:
+    """
+    Detect when prices changed by analyzing Net Sales/LB week-over-week.
+    OPTIMIZED VERSION - uses vectorized operations instead of iterrows()
+    """
+    
+    print(f"   🔍 Analyzing {len(df):,} rows for price changes...")
+    
+    df = df.copy()
+    
+    # Ensure we have what we need
+    print(f"   📊 Converting columns to numeric...")
+    df['Fiscal_Week'] = pd.to_numeric(df['Fiscal_Week_Combined'], errors='coerce')
+    df['Net_Sales_Per_LB'] = pd.to_numeric(
+        df['Net Sales Ext $ Per LB CY'].str.replace(r'[\$,]', '', regex=True), 
+        errors='coerce'
+    )
+    
+    # For each combo, calculate week-over-week price changes
+    print(f"   📈 Sorting by combo and week...")
+    df = df.sort_values(['Company_Combo_Key', 'Fiscal_Week'])
+    
+    # Calculate previous week's price
+    print(f"   💰 Calculating week-over-week price changes...")
+    df['Prev_Week_Price'] = df.groupby('Company_Combo_Key')['Net_Sales_Per_LB'].shift(1)
+    
+    # Calculate % change
+    df['Price_Change_Pct'] = (
+        (df['Net_Sales_Per_LB'] - df['Prev_Week_Price']) / df['Prev_Week_Price'] * 100
+    )
+    
+    # Flag significant changes
+    df['Price_Change_Event'] = abs(df['Price_Change_Pct']) >= threshold_pct
+    
+    price_change_count = df['Price_Change_Event'].sum()
+    print(f"   ✅ Found {price_change_count:,} price change events (threshold: {threshold_pct}%)")
+    
+    # ✅ OPTIMIZED: Use groupby + transform (more robust than merge_asof)
+    print(f"   ⏱️ Marking reaction windows (FAST vectorized approach)...")
+    
+    # Initialize the weeks_since column
+    df['Weeks_Since_Price_Change'] = 999  # Default = no recent change
+    
+    def calculate_weeks_since_change(group):
+        """For each combo group, calculate weeks since last price change"""
+        group = group.sort_values('Fiscal_Week').copy()
+        
+        # Get weeks where price changed
+        change_weeks = group[group['Price_Change_Event']]['Fiscal_Week'].values
+        
+        if len(change_weeks) == 0:
+            # No price changes in this combo
+            group['Weeks_Since_Price_Change'] = 999
+            return group
+        
+        # For each row, find most recent change week using searchsorted
+        weeks = group['Fiscal_Week'].values
+        weeks_since = np.full(len(weeks), 999, dtype=float)
+        
+        for i, week in enumerate(weeks):
+            # Find the most recent change week <= current week
+            idx = np.searchsorted(change_weeks, week, side='right') - 1
+            if idx >= 0:
+                weeks_since[i] = week - change_weeks[idx]
+        
+        group['Weeks_Since_Price_Change'] = weeks_since
+        return group
+    
+    print(f"   📊 Processing {df['Company_Combo_Key'].nunique()} combos...")
+    df = df.groupby('Company_Combo_Key', group_keys=False).apply(calculate_weeks_since_change)
+    
+    # Mark "stable periods" (3+ weeks after last price change)
+    df['Is_Stable_Period'] = df['Weeks_Since_Price_Change'] >= 3
+    
+    stable_count = df['Is_Stable_Period'].sum()
+    stable_pct = (stable_count / len(df) * 100) if len(df) > 0 else 0
+    print(f"   ✅ Identified {stable_count:,} stable period rows ({stable_pct:.1f}% of data)")
+    
+    return df
+
+def calculate_price_elasticity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Measure how sensitive each combo is to price changes.
+    """
+    
+    unique_combos = df['Company_Combo_Key'].unique()
+    total_combos = len(unique_combos)
+    print(f"   📊 Calculating elasticity for {total_combos} unique combos...")
+    
+    elasticity_data = []
+    processed = 0
+    
+    for combo in unique_combos:
+        processed += 1
+        if processed % 50 == 0:  # Print every 50 combos
+            print(f"      Processed {processed}/{total_combos} combos...")
+        
+        combo_data = df[df['Company_Combo_Key'] == combo].copy()
+        combo_data = combo_data.sort_values('Fiscal_Week')
+        
+        # Find price change events
+        price_changes = combo_data[combo_data['Price_Change_Event']]
+        
+        if len(price_changes) == 0:
+            continue
+        
+        for idx, change_row in price_changes.iterrows():
+            change_week = change_row['Fiscal_Week']
+            
+            # Get "before" period (3 weeks before change)
+            before_data = combo_data[
+                combo_data['Fiscal_Week'].between(change_week - 4, change_week - 1)
+            ]
+            
+            # Get "after" period (weeks 3-5 after change = stable period)
+            after_data = combo_data[
+                combo_data['Fiscal_Week'].between(change_week + 3, change_week + 5)
+            ]
+            
+            if len(before_data) < 2 or len(after_data) < 2:
+                continue
+            
+            # Calculate averages
+            avg_price_before = before_data['Net_Sales_Per_LB'].mean()
+            avg_price_after = after_data['Net_Sales_Per_LB'].mean()
+            avg_volume_before = before_data['Pounds_CY'].mean()
+            avg_volume_after = after_data['Pounds_CY'].mean()
+            
+            # Calculate % changes
+            price_change_pct = (avg_price_after - avg_price_before) / avg_price_before
+            volume_change_pct = (avg_volume_after - avg_volume_before) / avg_volume_before
+            
+            # Elasticity = % change in volume / % change in price
+            if price_change_pct != 0:
+                elasticity = volume_change_pct / price_change_pct
+            else:
+                elasticity = 0
+            
+            elasticity_data.append({
+                'combo': combo,
+                'change_week': change_week,
+                'price_before': avg_price_before,
+                'price_after': avg_price_after,
+                'price_change_pct': price_change_pct * 100,
+                'volume_before': avg_volume_before,
+                'volume_after': avg_volume_after,
+                'volume_change_pct': volume_change_pct * 100,
+                'elasticity': elasticity,
+                'sensitivity': 'HIGH' if abs(elasticity) > 1.5 else 'MEDIUM' if abs(elasticity) > 0.8 else 'LOW'
+            })
+    
+    result_df = pd.DataFrame(elasticity_data)
+    
+    if not result_df.empty:
+        print(f"   ✅ Calculated elasticity for {result_df['combo'].nunique()} combos with price history")
+    else:
+        print(f"   ⚠️ No elasticity data calculated (no valid price changes found)")
+    
+    return result_df
+
 def calculate_simple_zone_scores(historical_df: pd.DataFrame, 
                                 config: FoodserviceConfig) -> pd.DataFrame:
     """
@@ -1374,20 +1536,41 @@ def calculate_weighted_zone_scores(journey_df: pd.DataFrame,
     
     if journey_df.empty:
         return pd.DataFrame()
-    
+
+    # ✅ ADD STABILITY WEIGHT to each row
+    if 'Is_Stable_Period' in journey_df.columns:
+        # Stable periods get full weight (1.0), volatile periods get half weight (0.5)
+        journey_df['Stability_Weight'] = journey_df['Is_Stable_Period'].apply(
+            lambda x: 1.0 if x else 0.5
+        )
+        print(f"      ✅ Applied stability weighting (stable=100%, volatile=50%)")
+    else:
+        # No stability data? Give everything equal weight
+        journey_df['Stability_Weight'] = 1.0
+        print(f"      ⚠️  No stability data available - using equal weights")
+
+    # Combine with existing weight
+    journey_df['Final_Weight'] = journey_df['weight'] * journey_df['Stability_Weight']
+
     # Group by combo and primary zone
     zone_scores = journey_df.groupby(['combo', 'primary_zone'], dropna=False).agg({
         'customer': 'nunique',
         'total_volume': 'sum',
-        'weight': 'mean',
-        'weeks_active': 'sum'
+        'Final_Weight': 'mean',  # ✅ Use weighted average
+        'weeks_active': 'sum',
+        'Stability_Weight': 'mean'  # Track how "stable" this combo's data is
     }).reset_index()
-    
+
     zone_scores.columns = ['combo', 'zone', 'customer_count', 'total_volume', 
-                           'avg_weight', 'total_weeks_active']
-    
-    # Calculate weighted volume
+                        'avg_weight', 'total_weeks_active', 'stability_score']
+
+    # Calculate weighted volume (now includes stability adjustment)
     zone_scores['weighted_volume'] = zone_scores['total_volume'] * zone_scores['avg_weight']
+
+    # ✅ ADD CONFIDENCE FLAG
+    zone_scores['confidence'] = zone_scores['stability_score'].apply(
+        lambda x: 'HIGH' if x > 0.8 else 'MEDIUM' if x > 0.6 else 'LOWER'
+    )
 
     # ADD LAPSE RATE PENALTY (NEW!)
     if lapse_penalty_df is not None and not lapse_penalty_df.empty:
@@ -3232,10 +3415,27 @@ def calculate_financial_impact(recommendations: List[Dict],
         if combo_data.empty:
             continue
         
+        #Try to get data for the RECOMMENDED zone specifically
+        recommended_zone_data = historical_df[
+            (historical_df['Company_Combo_Key'] == combo) & 
+            (historical_df['Pounds_CY'] > 0) &
+            (historical_df['Zone_Suffix_Numeric'] == rec['recommended_zone'])
+        ]
+        
+        # Use zone-specific data if we have enough samples (3+ rows)
+        if not recommended_zone_data.empty and len(recommended_zone_data) >= 3:
+            # Use TARGET zone pricing (more accurate!)
+            data_to_use = recommended_zone_data
+            pricing_source = f"Zone {rec['recommended_zone']} data"
+        else:
+            # Fall back to blended (all zones)
+            data_to_use = combo_data
+            pricing_source = "Blended (all zones)"
+        
         # Use ACTUAL data from your trusted columns
-        total_sales_cy = combo_data['Net_Sales_CY'].sum()
-        total_pounds_cy = combo_data['Pounds_CY'].sum()
-        total_margin_cy = combo_data['Margin_CY'].sum()
+        total_sales_cy = data_to_use['Net_Sales_CY'].sum()
+        total_pounds_cy = data_to_use['Pounds_CY'].sum()
+        total_margin_cy = data_to_use['Margin_CY'].sum()
         
         # Calculate weighted averages
         avg_net_sales_per_lb = (total_sales_cy / total_pounds_cy) if total_pounds_cy > 0 else 0
@@ -3321,9 +3521,10 @@ def calculate_financial_impact(recommendations: List[Dict],
             weeks_to_result = 3
         elif '4-6 weeks' in rec['timeline']:
             weeks_to_result = 5
-        
-        # Annualized impact (52 weeks)
-        annualized_multiplier = 52 / weeks_to_result
+        # Assume lift happens per 8-week measurement cycle, not continuously
+        measurement_window = 8
+        cycles_per_year = 52 / measurement_window  # 6.5 cycles per year
+        annualized_multiplier = cycles_per_year
         
         financial_data.append({
             'combo': rec['company_combo'],
@@ -3640,10 +3841,9 @@ def create_war_room_dashboard(recommendations: List[Dict],
     # ═══════════════════════════════════════════════════════════
     
     war_room_rows.extend([
-        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         {'Col1': '🎯 WAR ROOM - PRICING ZONE OPTIMIZATION', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         {'Col1': f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
-        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         
         {'Col1': '📊 AT A GLANCE:', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
@@ -3669,9 +3869,9 @@ def create_war_room_dashboard(recommendations: List[Dict],
     # ═══════════════════════════════════════════════════════════
     
     war_room_rows.extend([
-        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         {'Col1': '🚀 TOP 10 IMMEDIATE ACTIONS (Implement This Week)', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
-        {'Col1': '═══════════════════════════════════════════════════════════════════════════════', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
+        {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
         {'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''},
     ])
     
@@ -3726,14 +3926,12 @@ def create_war_room_dashboard(recommendations: List[Dict],
 
     # Sort by composite score
     top_10 = sorted(war_room_candidates, key=lambda x: x['war_room_score'], reverse=True)[:10]
-  
     for i, rec in enumerate(top_10, 1):
         combo = rec['company_combo']
         current_zone = rec['current_zone']
         
-        # Get YoY data
+        # Get YoY data (removed unused cy_cust)
         yoy_data = yoy_by_combo.get(combo, {})
-        cy_cust = yoy_data.get('distinct_customers_cy', 'N/A')
         py_cust = yoy_data.get('distinct_customers_py', 'N/A')
         change = yoy_data.get('customer_change', 0)
         
@@ -3765,6 +3963,14 @@ def create_war_room_dashboard(recommendations: List[Dict],
         else:
             action = '📊 Standard move'
         
+        # ✅ ADD ELASTICITY FLAG
+        if rec.get('price_sensitivity') == 'HIGH':
+            action_with_elasticity = f"{action} ⚡"
+        elif rec.get('price_sensitivity') == 'LOW':
+            action_with_elasticity = f"{action} 💪"
+        else:
+            action_with_elasticity = action
+        
         war_room_rows.append({
             'Col1': i,
             'Col2': rec['company_name'],
@@ -3773,7 +3979,7 @@ def create_war_room_dashboard(recommendations: List[Dict],
             'Col5': f"{rec['total_volume']:,.0f} lbs, {rec['lapsed_customers']} lapsed",
             'Col6': yoy_status,
             'Col7': zone_health,
-            'Col8': action
+            'Col8': action_with_elasticity  
         })
     
     war_room_rows.append({'Col1': '', 'Col2': '', 'Col3': '', 'Col4': '', 'Col5': '', 'Col6': '', 'Col7': '', 'Col8': ''})
@@ -4633,7 +4839,7 @@ def create_how_to_use_tab(writer, recommendations_count, high_priority_count, vo
     for rule in rules:
         row = add_text(row, rule, 1, bold=True)
     row += 2
-    
+
     # === SECTION 7: QUESTIONS? ===
     row = add_section_header(row, "QUESTIONS?", "❓")
     row = add_text(row, "If you have questions about this report or need help implementing changes:", 1)
@@ -4641,10 +4847,142 @@ def create_how_to_use_tab(writer, recommendations_count, high_priority_count, vo
     row = add_text(row, "• Review the detailed tabs for more context", 2)
     row = add_text(row, "• Run the report again after making changes to track progress", 2)
     row += 2
-    
+
+    # === NEW SECTION 8: HOW THE LOGIC WORKS ===
+    row = add_section_header(row, "HOW THE LOGIC WORKS (UNDER THE HOOD)", "🔬")
+    row = add_text(row, "Want to know HOW we make recommendations? Here's the step-by-step process:", 1)
+    row += 1
+
+    # Step 1: Data Collection
+    row = add_text(row, "STEP 1: Gather Historical Sales Data", 1, bold=True)
+    row = add_text(row, "We load your past sales data (typically 6-12 months) including:", 2)
+    row = add_text(row, "• Pounds sold per customer per week", 3)
+    row = add_text(row, "• Which pricing zone each customer was in", 3)
+    row = add_text(row, "• Net sales and margin per pound", 3)
+    row = add_text(row, "• Last time each customer bought ANYTHING (not just this category)", 3)
+    row += 1
+
+    # Step 2: Clean the Data
+    row = add_text(row, "STEP 2: Filter Out 'Price Shock' Noise", 1, bold=True)
+    row = add_text(row, "When prices change, customers react weird for 2-3 weeks (confusion, testing, adjusting).", 2)
+    row = add_text(row, "We detect price changes by looking at Net Sales/LB week-over-week.", 2)
+    row = add_text(row, "If price jumps/drops 5%+, we flag it as a 'price change event.'", 2)
+    row = add_text(row, "We then EXCLUDE the 3 weeks right after each price change.", 2)
+    row = add_text(row, "WHY? We only want to see 'stable period' customer behavior, not reaction noise.", 2)
+    row += 1
+
+    # Step 3: Classify Customers
+    row = add_text(row, "STEP 3: Classify Every Customer", 1, bold=True)
+    row = add_text(row, "For each customer, we check:", 2)
+    row = add_text(row, "• ACTIVE BUYER: Bought this category in the last 6 weeks ✅", 3)
+    row = add_text(row, "• LAPSED FROM CATEGORY: Stopped buying THIS category 6-8 weeks ago, BUT still buying other items from us 🎯", 3)
+    row = add_text(row, "• LOST CUSTOMER: Haven't bought ANYTHING in 9+ weeks ❌", 3)
+    row = add_text(row, "LAPSED customers are THE GOLD MINE - they still trust us, just stopped buying this category (probably price!)", 2)
+    row += 1
+
+    # Step 4: Measure Zone Stickiness
+    row = add_text(row, "STEP 4: Measure 'Zone Stickiness' (Green Flag Rate)", 1, bold=True)
+    row = add_text(row, "For each zone, we calculate: How many customers buy CONSISTENTLY week after week?", 2)
+    row = add_text(row, "• Consistent Buyer = Bought in 75%+ of weeks they were present at that zone", 3)
+    row = add_text(row, "• Green Flag Rate = % of customers who are consistent buyers", 3)
+    row = add_text(row, "HIGH green flag rate = 🟢 Sticky zone! Customers love it.", 2)
+    row = add_text(row, "LOW green flag rate = 🔴 Customers try once and leave (overpriced!).", 2)
+    row += 1
+
+    # Step 5: Score Each Zone
+    row = add_text(row, "STEP 5: Score Each Zone by Performance", 1, bold=True)
+    row = add_text(row, "For each combo (like 'Detroit + MS Family Style'), we score every zone (0-5) based on:", 2)
+    row = add_text(row, "• Total volume sold (more = better)", 3)
+    row = add_text(row, "• Number of distinct customers (more = better)", 3)
+    row = add_text(row, "• Total margin/profit (more = better)", 3)
+    row = add_text(row, "• Green flag rate / stickiness (higher = better)", 3)
+    row = add_text(row, "• Lapse rate penalty (how many customers stopped buying)", 3)
+    row = add_text(row, "The zone with the HIGHEST score becomes the 'optimal zone' recommendation.", 2)
+    row += 1
+
+    # Step 6: Detect Reactive Pricing
+    row = add_text(row, "STEP 6: Flag 'Reactive Pricing' Problems", 1, bold=True)
+    row = add_text(row, "Sometimes we charge too much → lose customers → panic and drop the zone.", 2)
+    row = add_text(row, "Pattern: Volume declining at Zone 4 → we drop to Zone 2 → volume recovers.", 2)
+    row = add_text(row, "Problem: Zone 2 looks good, but only because Zone 4 killed the business first!", 2)
+    row = add_text(row, "We detect this by looking for:", 2)
+    row = add_text(row, "• Volume declining 15%+ in the 6 weeks BEFORE a zone drop", 3)
+    row = add_text(row, "• Volume recovering after the drop", 3)
+    row = add_text(row, "When we find this, we recommend the MIDDLE zone (Zone 3) instead of trusting Zone 2.", 2)
+    row += 1
+
+    # Step 7: Calculate Price Elasticity
+    row = add_text(row, "STEP 7: Calculate Price Elasticity (NEW!)", 1, bold=True)
+    row = add_text(row, "Elasticity measures: 'How sensitive are customers to price changes?'", 2)
+    row = add_text(row, "• HIGH elasticity (⚡): Customers flee if price goes up 10% (price sensitive)", 3)
+    row = add_text(row, "• LOW elasticity (💪): Customers stay even if price goes up 10% (pricing power!)", 3)
+    row = add_text(row, "How we calculate it:", 2)
+    row = add_text(row, "1. Find past price changes (5%+ jump in Net Sales/LB)", 3)
+    row = add_text(row, "2. Measure volume BEFORE change (avg of 3 weeks before)", 3)
+    row = add_text(row, "3. Measure volume AFTER change (avg of weeks 3-5 after, once stable)", 3)
+    row = add_text(row, "4. Elasticity = (% change in volume) ÷ (% change in price)", 3)
+    row = add_text(row, "NOTE: This is OBSERVATION ONLY right now. We're not using it to pick zones yet.", 2)
+    row = add_text(row, "After a few cycles, we'll validate if elasticity predictions are accurate, THEN use them.", 2)
+    row += 1
+
+    # Step 8: Generate Recommendations
+    row = add_text(row, "STEP 8: Generate Recommendations", 1, bold=True)
+    row = add_text(row, "For each combo, we compare the CURRENT zone to the OPTIMAL zone.", 2)
+    row = add_text(row, "We ONLY suggest moves DOWN (lower zones = lower prices). Never suggest increases without approval.", 2)
+    row = add_text(row, "We NEVER suggest Zone 1 → Zone 0 (gives away too much margin - needs fractional zones).", 2)
+    row = add_text(row, "We prioritize based on:", 2)
+    row = add_text(row, "• How many lapsed customers can we win back? (more = higher priority)", 3)
+    row = add_text(row, "• How much volume is at stake? (more = higher priority)", 3)
+    row = add_text(row, "• Do we have proof this will work? (reactive recovery, green flag zones)", 3)
+    row += 1
+
+    # Step 9: Territory-Relative Ranking
+    row = add_text(row, "STEP 9: Rank Within Each Territory", 1, bold=True)
+    row = add_text(row, "We don't compare Detroit (huge) to Arkansas (small) directly.", 2)
+    row = add_text(row, "Instead, we rank opportunities WITHIN each territory:", 2)
+    row = add_text(row, "• Detroit's #1 opportunity might be 5,000 lbs", 3)
+    row = add_text(row, "• Arkansas's #1 opportunity might be 400 lbs", 3)
+    row = add_text(row, "Both get flagged as 'Top Priority' for THEIR territory.", 2)
+    row = add_text(row, "This ensures every sales rep gets actionable recommendations (not just big territories).", 2)
+    row += 1
+
+    # Step 10: Calculate Financial Impact
+    row = add_text(row, "STEP 10: Calculate Financial Impact", 1, bold=True)
+    row = add_text(row, "For each recommendation, we estimate revenue and margin gains:", 2)
+    row = add_text(row, "1. Use YOUR actual Net Sales/LB and Margin/LB (not guesses!)", 3)
+    row = add_text(row, "2. Estimate volume lift based on recommendation type:", 3)
+    row = add_text(row, "   • HIGH_RECOVERY (lapsed customers): 15-35% lift", 4)
+    row = add_text(row, "   • REACTIVE_CORRECTION (fixing overpricing): 12-28% lift", 4)
+    row = add_text(row, "   • STANDARD (peer consensus): 8-18% lift", 4)
+    row = add_text(row, "3. Multiply volume lift × price/LB = revenue gain", 3)
+    row = add_text(row, "4. Multiply volume lift × margin/LB = profit gain", 3)
+    row = add_text(row, "We show LOW / EXPECTED / HIGH scenarios so you know the range.", 2)
+    row = add_text(row, "Projections are CONSERVATIVE by design (better to under-promise!).", 2)
+    row += 1
+
+    # Step 11: Learning System
+    row = add_text(row, "STEP 11: Learning System (Tracks Accuracy Over Time)", 1, bold=True)
+    row = add_text(row, "After you implement recommendations, re-run this analysis in 8 weeks.", 2)
+    row = add_text(row, "The system compares:", 2)
+    row = add_text(row, "• What we PREDICTED would happen (volume lift, customer recovery)", 3)
+    row = add_text(row, "• What ACTUALLY happened (actual results)", 3)
+    row = add_text(row, "Over time, the system learns:", 2)
+    row = add_text(row, "• Which recommendation types work best", 3)
+    row = add_text(row, "• Which combos respond strongly to price changes", 3)
+    row = add_text(row, "• How accurate our elasticity predictions are", 3)
+    row = add_text(row, "This makes future recommendations MORE accurate and trustworthy!", 2)
+    row += 2
+
+    row = add_callout_box(row,
+        "💡 KEY TAKEAWAY: Every recommendation is backed by YOUR actual sales data, "
+        "analyzed using stable periods only, scored by proven metrics, and validated by customer behavior patterns. "
+        "This isn't guesswork - it's evidence-based pricing strategy!",
+        light_blue_fill)
+    row += 2
+
     # === FINAL CALLOUT ===
     row = add_callout_box(row, 
-        "🎉 YOU'RE READY! Go to Tab 2 (Top 5 Moves) and start winning back customers!",
+        "🎉 YOU'RE READY! Go to Tab 2 (War Room) and start winning back customers!",
         light_green_fill)
     
     # ========================================
@@ -4662,7 +5000,8 @@ def write_stakeholder_excel(recommendations: List[Dict],
                            learning_engine: Optional[LearningEngine] = None,
                            optimization_engine: Optional['FoodserviceZoneEngine'] = None,
                            historical_df: Optional[pd.DataFrame] = None,
-                           current_df: Optional[pd.DataFrame] = None):  
+                           current_df: Optional[pd.DataFrame] = None,
+                           elasticity_df: Optional[pd.DataFrame] = None):  
     
     from pandas import ExcelWriter
     
@@ -4760,7 +5099,15 @@ def write_stakeholder_excel(recommendations: List[Dict],
             {'Metric': 'Comparison Period', 'Value': exec_summary['yoy_comparison_period'].iloc[0]},
             {'Metric': '', 'Value': ''},  # Spacer
             {'Metric': 'Expected Timeframe for Results', 'Value': exec_summary['expected_timeframe'].iloc[0]},
-            {'Metric': 'First Action to Take', 'Value': exec_summary['first_action'].iloc[0]}
+            {'Metric': 'First Action to Take', 'Value': exec_summary['first_action'].iloc[0]}, #Spacer
+            {'Metric': 'FINANCIAL IMPACT (TOP 10 MOVES)', 'Value': ''},
+            {'Metric': 'Revenue 8-Week Range', 'Value': exec_summary.get('revenue_8wk_range', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Revenue 8-Week Expected', 'Value': exec_summary.get('revenue_8wk_expected', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Margin 8-Week Range', 'Value': exec_summary.get('margin_8wk_range', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Margin 8-Week Expected', 'Value': exec_summary.get('margin_8wk_expected', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Annualized Revenue (All Moves)', 'Value': exec_summary.get('annualized_revenue_all_moves', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Annualized Margin (All Moves)', 'Value': exec_summary.get('annualized_margin_all_moves', pd.Series(['N/A'])).iloc[0]},
+            {'Metric': 'Confidence Breakdown', 'Value': exec_summary.get('confidence_breakdown', pd.Series(['N/A'])).iloc[0]}
         ]
         exec_df = pd.DataFrame(exec_rows)
         exec_df.to_excel(writer, sheet_name='1_EXECUTIVE_SUMMARY', index=False)
@@ -4939,38 +5286,60 @@ def write_stakeholder_excel(recommendations: List[Dict],
         if financial_df is not None and not financial_df.empty:
             print("   📄 Tab 9: Financial Impact Projections")
             
-            # Add data source legend at the TOP (so stakeholders see it first!)
-            data_legend = add_financial_data_source_legend(optimization_engine.config)
             financial_display = create_financial_impact_dashboard(financial_df, financial_summary)
             
-            # Combine: legend FIRST + spacer + financial data
-            combined_financial = pd.concat([
-                data_legend,
-                pd.DataFrame([{'': ''} for _ in range(3)]),  # 3 blank rows as separator
-                financial_display
-            ], ignore_index=True)
-            
-            combined_financial.to_excel(writer, sheet_name='9_FINANCIAL_IMPACT', index=False)
-        
+            # ✅ CREATE THE LEGEND DIRECTLY (function doesn't exist!)
+            data_legend = pd.DataFrame([
+                {'Data Source': 'Column Used', 'Value': 'Description'},
+                {'Data Source': 'Margin Column', 'Value': optimization_engine.config.data_config.margin_cy_column if optimization_engine.config.data_config.has_margin_data else 'Not Available'},
+                {'Data Source': 'Net Sales Column', 'Value': optimization_engine.config.data_config.net_sales_cy_column if optimization_engine.config.data_config.has_net_sales_data else 'Not Available'},
+                {'Data Source': 'Pounds Column', 'Value': optimization_engine.config.data_config.pounds_cy_column},
+                {'Data Source': '', 'Value': ''},  # Blank spacer row
+                {'Data Source': '⬇️ FINANCIAL PROJECTIONS BELOW ⬇️', 'Value': ''}
+            ])
+
         # ==========================================
-        # TAB 10: Learning Tracker (if available)
+        # TAB 10: PRICE ELASTICITY (if calculated)
+        # ==========================================
+        if 'elasticity_df' in locals() and elasticity_df is not None and not elasticity_df.empty:
+            print("   📄 Tab 10: Price Elasticity Analysis")
+            
+            # Format for display
+            elasticity_display = elasticity_df.copy()
+            elasticity_display['price_change_pct'] = elasticity_display['price_change_pct'].apply(lambda x: f"{x:+.1f}%")
+            elasticity_display['volume_change_pct'] = elasticity_display['volume_change_pct'].apply(lambda x: f"{x:+.1f}%")
+            elasticity_display['elasticity'] = elasticity_display['elasticity'].apply(lambda x: f"{x:.2f}")
+            elasticity_display['price_before'] = elasticity_display['price_before'].apply(lambda x: f"${x:.2f}")
+            elasticity_display['price_after'] = elasticity_display['price_after'].apply(lambda x: f"${x:.2f}")
+            elasticity_display['volume_before'] = elasticity_display['volume_before'].apply(lambda x: f"{x:,.0f} lbs")
+            elasticity_display['volume_after'] = elasticity_display['volume_after'].apply(lambda x: f"{x:,.0f} lbs")
+            
+            elasticity_display.columns = [
+                'Combo', 'Week of Change', 'Price Before', 'Price After', 'Price Change %',
+                'Volume Before', 'Volume After', 'Volume Change %', 'Elasticity', 'Sensitivity'
+            ]
+            
+            elasticity_display.to_excel(writer, sheet_name='10_PRICE_ELASTICITY', index=False)
+
+        # ==========================================
+        # TAB 11: Learning Tracker (if available)
         # ==========================================
         if learning_engine:
-            print("   📄 Tab 10: Learning Tracker")
+            print("   📄 Tab 11: Learning Tracker")
             learning_df = create_learning_tracker_tab(learning_engine)
             if not learning_df.empty:
-                learning_df.to_excel(writer, sheet_name='10_LEARNING_TRACKER', index=False)
-
-
+                learning_df.to_excel(writer, sheet_name='11_LEARNING_TRACKER', index=False)
+    
         # ==========================================
         # Apply formatting to ALL sheets
         # ==========================================
         print("   🎨 Applying formatting...")
         _format_excel_sheets(writer)
+        print("   ✅ Formatting complete!")
     
-    print(f"   ✅ Dashboard complete and ready to open!")
+    # with block ends here
+    print("   💾 Workbook saved!")
     print(f"   📁 Saved to: {output_path}")
-
 
 # ========================================
 # NOTE: You'll also need to update create_executive_summary_tab()
@@ -5206,13 +5575,117 @@ def run_foodservice_zone_optimization(
     # Initialize optimization engine
     print("\n🔧 Initializing optimization engine...")
     engine = FoodserviceZoneEngine(config, learning_engine)
-    
-    # Generate recommendations
-    print("\n🎯 Generating recommendations...")
-    recommendations = engine.generate_recommendations(current_df, historical_df)
-    print(f"   ✅ Generated {len(recommendations)} recommendations")
 
-    # ✅ ADD THIS CHECK:
+    # ✅ NEW: Detect price changes and calculate elasticity
+    elasticity_df = None
+    stable_historical_df = historical_df  # Default to all data
+
+    if historical_df is not None and not historical_df.empty:
+        print("\n📊 Detecting price change events and calculating elasticity...")
+        
+        # Detect price changes
+        historical_with_flags = detect_price_change_events(historical_df, config)
+        
+        # Calculate elasticity
+        elasticity_df = calculate_price_elasticity(historical_with_flags)
+        
+        if not elasticity_df.empty:
+            print(f"   ✅ Calculated elasticity for {elasticity_df['combo'].nunique()} combos")
+            print(f"   📈 Avg elasticity: {elasticity_df['elasticity'].mean():.2f}")
+            
+            # Show sensitivity breakdown
+            sensitivity_counts = elasticity_df['sensitivity'].value_counts()
+            for sensitivity, count in sensitivity_counts.items():
+                print(f"      • {sensitivity}: {count} combos")
+        
+    # Generate recommendations using FULL historical data (with stability flags)
+    print("\n🎯 Generating recommendations...")
+
+    # Use historical_with_flags if it exists (has stability info), otherwise use historical_df
+    historical_for_scoring = historical_with_flags if 'historical_with_flags' in locals() else historical_df
+
+    recommendations = engine.generate_recommendations(current_df, historical_for_scoring)
+    print(f"   ✅ Generated {len(recommendations)} recommendations")
+    
+    # ✅✅✅ PASTE THE ENRICHMENT BLOCK HERE ✅✅✅
+    if elasticity_df is not None and not elasticity_df.empty:
+        print("\n📊 Adding elasticity insights to recommendations...")
+        
+        for rec in recommendations:
+            combo = rec['company_combo']
+            
+            # Get elasticity for this combo
+            combo_elasticity = elasticity_df[elasticity_df['combo'] == combo]
+            
+            if not combo_elasticity.empty:
+                avg_elasticity = combo_elasticity['elasticity'].mean()
+                
+                # Determine sensitivity
+                if abs(avg_elasticity) > 1.5:
+                    sensitivity = 'HIGH'
+                    lift_multiplier = 1.3
+                elif abs(avg_elasticity) > 0.8:
+                    sensitivity = 'MEDIUM'
+                    lift_multiplier = 1.0
+                else:
+                    sensitivity = 'LOW'
+                    lift_multiplier = 0.7
+                
+                # Add to recommendation
+                rec['price_elasticity'] = float(avg_elasticity)
+                rec['price_sensitivity'] = sensitivity
+                rec['price_change_count'] = len(combo_elasticity)
+                rec['elasticity_adjusted_lift'] = rec['total_volume'] * 0.20 * lift_multiplier
+                
+                # ✅ ADD DETAILED INSIGHTS
+                if sensitivity == 'HIGH':
+                    rec['elasticity_note'] = f"⚡ Price sensitive (elasticity: {avg_elasticity:.2f}) - expect strong response!"
+                    rec['elasticity_insight'] = "Price sensitive - expect strong response to decrease"
+                    
+                elif sensitivity == 'LOW':
+                    rec['elasticity_note'] = f"💪 Pricing power (elasticity: {avg_elasticity:.2f}) - could test INCREASE instead"
+                    rec['elasticity_insight'] = "Pricing power - could test INCREASE instead"
+                    
+                    # FLAG LOW SENSITIVITY + VOLUME AS UPSIDE
+                    if rec.get('total_volume', 0) > 500:
+                        rec['upside_opportunity'] = "💡 Low elasticity + volume = opportunity to RAISE price for more profit"
+                    else:
+                        rec['upside_opportunity'] = None
+                        
+                else:
+                    rec['elasticity_note'] = f"📊 Normal sensitivity (elasticity: {avg_elasticity:.2f})"
+                    rec['elasticity_insight'] = "Normal price response"
+                    rec['upside_opportunity'] = None
+                    
+            else:
+                # No elasticity data
+                rec['price_elasticity'] = None
+                rec['price_sensitivity'] = 'UNKNOWN'
+                rec['price_change_count'] = 0
+                rec['elasticity_note'] = "No price change history"
+                rec['elasticity_insight'] = "Elasticity unknown"
+                rec['upside_opportunity'] = None
+        
+        # Count by sensitivity
+        sensitivity_counts = {}
+        upside_count = 0
+        for rec in recommendations:
+            sensitivity = rec.get('price_sensitivity', 'UNKNOWN')
+            sensitivity_counts[sensitivity] = sensitivity_counts.get(sensitivity, 0) + 1
+            if rec.get('upside_opportunity'):
+                upside_count += 1
+        
+        print(f"   📈 Elasticity breakdown:")
+        for sensitivity, count in sensitivity_counts.items():
+            print(f"      • {sensitivity}: {count} combos")
+        if upside_count > 0:
+            print(f"   💡 {upside_count} upside opportunities (low elasticity + volume)")
+    
+    # Get reactive flags
+    reactive_flags = engine.reactive_flags
+    print(f"   ⚠️  Found {len(reactive_flags)} reactive pricing patterns")
+
+    # CHECK:
     if not recommendations:
         print("\n" + "="*60)
         print("🎉 NO RECOMMENDATIONS NEEDED")
@@ -5273,7 +5746,16 @@ def run_foodservice_zone_optimization(
     )
     
     # Write Excel (with perfect formatting)
-    write_stakeholder_excel(recommendations, reactive_flags, excel_path, learning_engine, engine, historical_df, current_df)                                                                                                        
+    write_stakeholder_excel(
+        recommendations, 
+        reactive_flags, 
+        excel_path, 
+        learning_engine, 
+        engine, 
+        historical_df, 
+        current_df,
+        elasticity_df=elasticity_df if 'elasticity_df' in locals() else None  
+    )                                                                                                       
 
     # ==========================================
     # GENERATE LEADS FILE (if enabled)
